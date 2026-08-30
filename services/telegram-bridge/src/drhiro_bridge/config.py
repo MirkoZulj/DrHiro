@@ -26,6 +26,7 @@ class Config:
         self.pairing_http_host: str = os.environ.get("PAIRING_HTTP_HOST", "0.0.0.0")
         self.pairing_http_port: int = int(os.environ.get("PAIRING_HTTP_PORT", "8091"))
         self.server_public_url: str = os.environ.get("DRHIRO_PUBLIC_URL", "")
+        self.pairing_service_token: str = os.environ.get("PAIRING_SERVICE_TOKEN", "")
         self.allow_http_lan: bool = os.environ.get("PAIRING_ALLOW_HTTP_LAN", "true").lower() == "true"
         self.debug: bool = os.environ.get("DRHIRO_DEBUG", "false").lower() == "true"
 

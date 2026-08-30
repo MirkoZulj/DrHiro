@@ -374,4 +374,13 @@ class PairingManager:
 def _normalize(url: str) -> str:
     p = urllib.parse.urlparse(url)
     host = (p.hostname or "").lower()
-    return f"{p.scheme}://{host}{p.path.rstrip('/')}"
+    port = p.port
+    # Strip default ports so https://host == https://host:443
+    if port is not None:
+        default = 443 if p.scheme == "https" else (80 if p.scheme == "http" else None)
+        if port == default:
+            port = None
+    netloc = host
+    if port is not None:
+        netloc = f"{host}:{port}"
+    return f"{p.scheme}://{netloc}{p.path.rstrip('/')}"

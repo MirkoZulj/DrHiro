@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .pairing import PairingManager
@@ -36,6 +37,7 @@ def _err(handler, message, status=400):
 
 class _Handler(BaseHTTPRequestHandler):
     manager: PairingManager = None  # type: ignore[assignment]
+    service_token: str = ""
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -45,15 +47,31 @@ class _Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def _require_service_auth(self) -> bool:
+        """Management endpoints (/pair/devices, /pair/revoke) require the
+        X-Service-Token header. Unauthenticated callers are refused."""
+        if not self.service_token:
+            return False
+        provided = self.headers.get("X-Service-Token", "")
+        return secrets.compare_digest(provided, self.service_token)
+
+    def _auth_fail(self):
+        _err(self, "unauthorized", 401)
+
     def do_POST(self):  # noqa: N802
         path = self.path.split("?")[0]
         body = self._read_json()
         try:
             if path == "/pair/exchange":
+                # Open to an UNPAIRED Bridge; uses a single-use token.
                 self._exchange(body)
             elif path == "/pair/verify":
                 self._verify(body)
             elif path == "/pair/revoke":
+                # Management action — must be service-authenticated.
+                if not self._require_service_auth():
+                    self._auth_fail()
+                    return
                 self._revoke(body)
             else:
                 _err(self, "not found", 404)
@@ -63,6 +81,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path.split("?")[0] == "/pair/devices":
+            # Management read — must be service-authenticated.
+            if not self._require_service_auth():
+                self._auth_fail()
+                return
             import urllib.parse
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             user = (qs.get("user") or [""])[0]
@@ -91,9 +113,17 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
-def serve(manager: PairingManager, host: str = "0.0.0.0", port: int = 8091):
-    """Run the pairing HTTP server (blocking)."""
+def serve(manager: PairingManager, host: str = "0.0.0.0", port: int = 8091,
+          service_token: str = "") -> None:
+    """Run the pairing HTTP server (blocking).
+
+    `service_token` protects the management endpoints (/pair/devices,
+    /pair/revoke). Only /pair/exchange is open to an unpaired Bridge (single-use
+    token). Host defaults to 0.0.0.0 but the container does NOT publish the port
+    to the host; remote access must be fronted by HTTPS.
+    """
     _Handler.manager = manager
+    _Handler.service_token = service_token
     server = ThreadingHTTPServer((host, port), _Handler)
     log.info("Pairing HTTP server listening on %s:%s", host, port)
     server.serve_forever()

@@ -123,6 +123,7 @@ class Bridge:
             kwargs={
                 "host": self.cfg.pairing_http_host,
                 "port": self.cfg.pairing_http_port,
+                "service_token": self.cfg.pairing_service_token,
             },
             daemon=True,
         ).start()

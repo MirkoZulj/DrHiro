@@ -155,3 +155,76 @@ def test_rate_limit_token_creation(tmp_path):
     m.create_token("user-1", "https://a.example.com")
     with pytest.raises(RateLimitedError):
         m.create_token("user-1", "https://a.example.com")
+
+
+def test_server_url_canonicalized_not_blindly_trusted(mgr):
+    """The deep-link server must be canonicalized and compared against the
+    trusted server (DRHIRO_PUBLIC_URL), not trusted verbatim. A host differing
+    only by case/port/whitespace must still match its canonical form."""
+    trusted = "https://Bridge.Example.com"
+    # Canonical: scheme + lowercased host, port stripped if default.
+    from drhiro_bridge.pairing import _normalize
+    assert _normalize("HTTPS://bridge.example.com:443") == _normalize(trusted)
+    # Different host must NOT match.
+    assert _normalize("https://evil.example.com") != _normalize(trusted)
+
+
+def test_exchange_rejects_server_not_matching_token_bound(mgr):
+    """The server URL from the deep link must equal the token's bound server
+    (which came from DRHIRO_PUBLIC_URL). A different-but-plausible host fails."""
+    r = mgr.create_token("user-1", "https://Bridge.Example.com")
+    # Same host canonicalized (case/port differs) — accepted.
+    ex = mgr.exchange(r["token"], None, "https://bridge.example.com:443", "Pixel")
+    assert ex["ok"] is True
+    # Different host — rejected.
+    r2 = mgr.create_token("user-1", "https://trusted.example.com")
+    with pytest.raises(WrongServerError):
+        mgr.exchange(r2["token"], None, "https://evil.example.com")
+
+
+def test_management_endpoints_require_service_token(tmp_path):
+    """/pair/devices and /pair/revoke must be refused without the service token;
+    only /pair/exchange is open to an unpaired Bridge."""
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from drhiro_bridge.pairing_http import _Handler, serve
+
+    m = PairingManager(tmp_path / "p3", token_ttl=600)
+    _Handler.manager = m
+    _Handler.service_token = "svc-secret"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    port = server.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+
+    def req(method, path, body=None, headers=None):
+        data = json.dumps(body or {}).encode() if body is not None else None
+        r = urllib.request.Request(base + path, data=data, method=method,
+                                   headers=headers or {"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(r, timeout=5) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    try:
+        # No token -> management refused.
+        code, _ = req("GET", "/pair/devices?user=user-1")
+        assert code == 401
+        code, _ = req("POST", "/pair/revoke", {"device_id": "x", "user": "user-1"})
+        assert code == 401
+        # With token -> allowed.
+        code, _ = req("GET", "/pair/devices?user=user-1",
+                      headers={"X-Service-Token": "svc-secret"})
+        assert code == 200
+        # exchange is open without a token (unpaired bridge).
+        tok = m.create_token("user-1", "https://bridge.example.com")
+        code, _ = req("POST", "/pair/exchange",
+                      {"token": tok["token"], "server_url": "https://bridge.example.com"})
+        assert code == 200
+    finally:
+        server.shutdown()
