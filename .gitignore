@@ -35,6 +35,9 @@ data/pairing/
 apk/
 !apk/README.md
 
+# --- Android APK build workspace (clean bridge source + keystore + built APK) ---
+apk-build/
+
 # --- OS / editors ---
 .DS_Store
 .idea/
