@@ -1,0 +1,45 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# --- Node ---
+node_modules/
+*.tsbuildinfo
+
+# --- Secrets — never commit real values ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+*.p12
+*.pfx
+
+# --- Data & runtime state ---
+data/exports/
+data/state/
+data/pairing/
+*.log
+*.sql.gz
+*.dump
+
+# --- Android Bridge APK artifact (signed binary + file_id sidecar) ---
+# The signed APK and apk.json (contains Telegram file_id) are placed on the
+# server at install time; never commit them.
+apk/
+!apk/README.md
+
+# --- Android APK build workspace (clean bridge source + keystore + built APK) ---
+apk-build/
+
+# --- OS / editors ---
+.DS_Store
+.idea/
+.vscode/
+*.swp

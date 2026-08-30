@@ -1,0 +1,129 @@
+# drHiro on TrueForge — Docker Compose stack.
+#
+# TrueForge is deployed in HOSTED mode (its official quickstart path): the
+# trueforge server plus the Postgres + Redis it requires. drHiro adds two thin
+# services on top:
+#   - drhiro-tools     the four submission MCP tools (synthetic data)
+#   - telegram-bridge  long-polling Telegram transport -> TrueForge agent loop
+#
+# Long polling is the ONLY transport; no public webhook, no exposed HTTPS.
+# Only TrueForge's UI port (8790) is published for administration.
+#
+# Secrets come from .env (created by install.sh with mode 600) — never committed.
+
+name: drhiro-trueforge
+
+services:
+  # --- TrueForge hosted-mode services ----------------------------------
+  tf-postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trueforge
+      POSTGRES_PASSWORD: trueforge
+      POSTGRES_DB: trueforge
+    volumes:
+      - tf_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trueforge -d trueforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [drhiro-net]
+
+  tf-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [drhiro-net]
+
+  trueforge:
+    # Built from the public MIT TrueForge source. install.sh clones it into
+    # ./trueforge-src (pinned tag) if it is not already present. Override the
+    # image with TRUEFORGE_IMAGE to use a prebuilt one.
+    build:
+      context: ./trueforge-src
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${TRUEFORGE_VERSION:-0.1.4}
+    image: ${TRUEFORGE_IMAGE:-truefoundry-server:latest}
+    restart: unless-stopped
+    ports:
+      - "${TRUEFORGE_PORT:-8790}:8790"
+    environment:
+      NODE_ENV: production
+      PORT: 8790
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8790}
+      POSTGRES_HOST: tf-postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: trueforge
+      POSTGRES_PASSWORD: trueforge
+      POSTGRES_DB: trueforge
+      STANDALONE: "false"
+      REDIS_URL: redis://tf-redis:6379
+    depends_on:
+      tf-postgres:
+        condition: service_healthy
+      tf-redis:
+        condition: service_healthy
+    networks: [drhiro-net]
+
+  # --- drHiro services ---------------------------------------------------
+  drhiro-tools:
+    build:
+      context: ./services/drhiro-tools
+    image: drhiro-tools:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    expose: ["3100"]
+    environment:
+      EXPORT_DIR: /data/exports
+      DRHIRO_VERSION: ${DRHIRO_VERSION:-0.1.0}
+    volumes:
+      - exports_data:/data/exports
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:3100/sse')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    networks: [drhiro-net]
+
+  telegram-bridge:
+    build:
+      context: ./services/telegram-bridge
+    image: drhiro-telegram-bridge:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set in .env}
+      TELEGRAM_ALLOWED_USERNAME: ${TELEGRAM_ALLOWED_USERNAME:?set in .env}
+      TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
+      TRUEFORGE_URL: http://trueforge:8790
+      TRUEFORGE_AGENT: ${TRUEFORGE_AGENT:-drhiro}
+      APK_DIR: /data/apk
+      APK_MAX_SIZE_MB: ${APK_MAX_SIZE_MB:-45}
+      PAIRING_STATE_DIR: /data/pairing
+      PAIRING_TTL_SECONDS: ${PAIRING_TTL_SECONDS:-600}
+      PAIRING_HTTP_PORT: ${PAIRING_HTTP_PORT:-8091}
+      PAIRING_SERVICE_TOKEN: ${PAIRING_SERVICE_TOKEN:-}
+      DRHIRO_PUBLIC_URL: ${DRHIRO_PUBLIC_URL:-}
+      PAIRING_ALLOW_HTTP_LAN: ${PAIRING_ALLOW_HTTP_LAN:-true}
+      DRHIRO_DEBUG: ${DRHIRO_DEBUG:-false}
+    volumes:
+      - ${APK_DIR:-./apk}:/data/apk
+      - pairing_state:/data/pairing
+    depends_on:
+      - trueforge
+      - drhiro-tools
+    networks: [drhiro-net]
+
+volumes:
+  tf_pgdata:
+  exports_data:
+  pairing_state:
+
+networks:
+  drhiro-net:
+    driver: bridge
