@@ -1,0 +1,35 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# --- Node ---
+node_modules/
+*.tsbuildinfo
+
+# --- Secrets — never commit real values ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+*.p12
+*.pfx
+
+# --- Data & runtime state ---
+data/exports/
+data/state/
+*.log
+*.sql.gz
+*.dump
+
+# --- OS / editors ---
+.DS_Store
+.idea/
+.vscode/
+*.swp

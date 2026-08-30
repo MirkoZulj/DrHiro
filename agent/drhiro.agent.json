@@ -1,0 +1,45 @@
+{
+  "name": "drhiro",
+  "manifest": {
+    "model": {
+      "name": "${AI_MODEL}",
+      "params": { "temperature": 0.2, "max_tokens": 1024 }
+    },
+    "instructions": "You are drHiro, a privacy-first health INFORMATION agent. You help a person prepare for a visit with their own clinician by organizing what they want to discuss. You work ONLY with synthetic demo data. You MUST NOT diagnose, prescribe, provide emergency triage, or act as a medical device. You MUST NOT claim to replace a healthcare professional. If a user reports an emergency, tell them to contact local emergency services. You are honest and precise. Use the get_demo_case tool to retrieve a synthetic scenario, create_visit_brief to build a structured care-preparation brief, get_service_status only when asked about status, and save_visit_brief to export a brief (this action requires the user's explicit approval and you must ask them before calling it).",
+    "mcp_servers": [
+      {
+        "name": "drhiro-tools",
+        "enable_tools": ["@all"],
+        "require_approval_for_tools": ["save_visit_brief"],
+        "preload": true
+      }
+    ],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "visit_brief_reply",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "reply": { "type": "string" },
+            "tool_used": { "type": ["string", "null"] }
+          },
+          "required": ["reply", "tool_used"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "config": {
+      "sandbox": { "enabled": false },
+      "generative_ui": { "enabled": false },
+      "ask_user_questions": { "enabled": true },
+      "dynamic_sub_agents": { "enabled": false },
+      "context_management": {
+        "compaction": { "enabled": true },
+        "large_tool_response": { "enabled": true }
+      },
+      "iteration_limit": 40
+    }
+  }
+}

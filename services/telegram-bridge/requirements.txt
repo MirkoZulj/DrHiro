@@ -1,0 +1,3 @@
+# The Telegram bridge is intentionally dependency-free (stdlib urllib + json),
+# so it runs in a slim container with no third-party packages to patch.
+# Kept as a manifest for clarity.
