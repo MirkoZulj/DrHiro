@@ -25,6 +25,8 @@ import time
 
 from .apk_distribution import ApkManager
 from .config import Config
+from .pairing import PairingManager
+from .pairing_http import serve as serve_pairing_http
 from .telegram_client import (
     TelegramClient,
     WebhookConflictError,
@@ -90,8 +92,14 @@ class Bridge:
         self.tg = TelegramClient(cfg.bot_token)
         self.tf = TrueForgeClient(cfg.trueforge_url, cfg.agent_name)
         self.apk = ApkManager(cfg.apk_dir, max_size_mb=cfg.apk_max_size_mb)
+        self.pairing = PairingManager(
+            cfg.pairing_state_dir,
+            token_ttl=cfg.pairing_ttl,
+            allow_http_lan=cfg.allow_http_lan,
+        )
         self._sessions: dict[int, str] = {}  # chat_id -> trueforge session_id
         self._pending_approvals: dict[int, list[dict]] = {}
+        self._pending_revoke: dict[int, str] = {}  # chat_id -> device_id awaiting confirm
         self._running = True
 
     # ------------------------------------------------------------------ #
@@ -108,7 +116,18 @@ class Bridge:
         if not self.tg.ensure_polling_only():
             raise WebhookConflictError("cannot start long polling while a webhook is set")
 
-        # 3. Confirm TrueForge is reachable (best-effort).
+        # 3. Start the device-facing pairing HTTP server (background).
+        threading.Thread(
+            target=serve_pairing_http,
+            args=(self.pairing,),
+            kwargs={
+                "host": self.cfg.pairing_http_host,
+                "port": self.cfg.pairing_http_port,
+            },
+            daemon=True,
+        ).start()
+
+        # 4. Confirm TrueForge is reachable (best-effort).
         h = self.tf.health()
         if not h.get("ok"):
             log.warning("TrueForge not reachable yet: %s — will retry per update", h.get("error"))
@@ -169,6 +188,20 @@ class Bridge:
         if not text:
             return
 
+        # Handle the /revoke confirmation reply.
+        if text.upper() == "CONFIRM" and chat_id in self._pending_revoke:
+            device_id = self._pending_revoke.pop(chat_id)
+            ok = self.pairing.revoke_device(device_id, self._chat_user_id(chat_id))
+            if ok:
+                self.tg.send_message(
+                    chat_id, f"Device `{device_id[:8]}…` revoked.", parse_mode=None
+                )
+            else:
+                self.tg.send_message(
+                    chat_id, "Device not found or not yours.", parse_mode=None
+                )
+            return
+
         # Route bot commands BEFORE the agent loop.
         if text.startswith("/"):
             if self._handle_command(chat_id, text):
@@ -225,6 +258,15 @@ class Bridge:
             if cmd == "/start":
                 self._cmd_start(chat_id)
                 return True
+            if cmd == "/pair":
+                self._cmd_pair(chat_id)
+                return True
+            if cmd == "/devices":
+                self._cmd_devices(chat_id)
+                return True
+            if cmd.startswith("/revoke"):
+                self._cmd_revoke(chat_id, text)
+                return True
         except Exception as e:  # noqa: BLE001
             log.warning("command %s failed: %s", cmd, e)
             self.tg.send_message(
@@ -234,11 +276,23 @@ class Bridge:
         return False
 
     # -- APK / status / help commands -------------------------------- #
+    def _server_public_url(self) -> str:
+        """The URL the Android Bridge uses to reach this server for pairing."""
+        if self.cfg.server_public_url:
+            return self.cfg.server_public_url
+        # Default: localhost over the pairing HTTP port (dev / LAN).
+        return f"http://localhost:{self.cfg.pairing_http_port}"
+
+    def _connect_button(self, link: str) -> dict:
+        return {"inline_keyboard": [[{"text": "🔗 Connect drHiro Bridge", "url": link}]]}
+
     def _cmd_apk(self, chat_id: int) -> None:
         # Only authorized users reach here (checked in _process_update).
         try:
             result = self.apk.send(self.tg, chat_id)
             self.tg.send_message(chat_id, result, parse_mode=None)
+            # Create a pairing token + Connect button for the requesting user.
+            self._send_pairing_link(chat_id)
         except Exception as e:  # noqa: BLE001
             log.warning("APK delivery failed: %s", e)
             self.tg.send_message(
@@ -246,6 +300,84 @@ class Bridge:
                 "Could not send the APK right now. See /apkinfo or check server logs.",
                 parse_mode=None,
             )
+
+    def _cmd_pair(self, chat_id: int) -> None:
+        """Generate a fresh pairing link without resending the APK."""
+        self._send_pairing_link(chat_id)
+
+    def _send_pairing_link(self, chat_id: int) -> None:
+        """Create a single-use pairing token bound to the requesting user and
+        post a 'Connect drHiro Bridge' inline button with the deep link."""
+        from .pairing import RateLimitedError
+
+        user_id = self._chat_user_id(chat_id)
+        server = self._server_public_url()
+        try:
+            created = self.pairing.create_token(user_id, server)
+        except RateLimitedError as e:
+            self.tg.send_message(chat_id, str(e), parse_mode=None)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("pairing token creation failed: %s", e)
+            self.tg.send_message(
+                chat_id, "Could not create a pairing link. Try again shortly.", parse_mode=None
+            )
+            return
+
+        lines = [
+            "📲 *Pair your drHiro Bridge*",
+            f"Token valid for 10 minutes (single use).",
+        ]
+        if created.get("warning"):
+            lines.append(created["warning"])
+        self.tg.send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_markup=self._connect_button(created["link"]),
+        )
+
+    def _cmd_devices(self, chat_id: int) -> None:
+        user_id = self._chat_user_id(chat_id)
+        devices = self.pairing.list_devices(user_id)
+        if not devices:
+            self.tg.send_message(chat_id, "No linked devices yet.", parse_mode=None)
+            return
+        lines = ["📱 *Linked devices*"]
+        for d in devices:
+            status = "revoked" if d["revoked"] else "active"
+            lines.append(
+                f"- {d['device_name']} (`{d['device_id'][:8]}…`) · {status}"
+            )
+        lines.append("\nTo revoke: `/revoke <device-id>`")
+        self.tg.send_message(chat_id, "\n".join(lines), parse_mode=None)
+
+    def _cmd_revoke(self, chat_id: int, text: str) -> None:
+        parts = text.split()
+        if len(parts) < 2:
+            self.tg.send_message(
+                chat_id,
+                "Usage: `/revoke <device-id>` — see /devices for your device ids.",
+                parse_mode=None,
+            )
+            return
+        device_id = parts[1].strip()
+        user_id = self._chat_user_id(chat_id)
+        # Confirm before revoking (destructive-ish).
+        self._pending_revoke[chat_id] = device_id
+        self.tg.send_message(
+            chat_id,
+            f"Revoke device `{device_id[:8]}…`? Reply `CONFIRM` to proceed.",
+            parse_mode=None,
+        )
+
+    def _chat_user_id(self, chat_id: int) -> str:
+        """Best-effort: the numeric user id for the chat. Falls back to a
+        stable per-chat id so pairing still works when the sender id is unknown."""
+        # In production the sender's numeric id is resolved at first contact and
+        # stored on cfg.allowed_user_id; use it when available.
+        if self.cfg.allowed_user_id:
+            return self.cfg.allowed_user_id
+        return f"chat:{chat_id}"
 
     def _cmd_apkinfo(self, chat_id: int) -> None:
         try:
@@ -279,8 +411,11 @@ class Bridge:
         self.tg.send_message(
             chat_id,
             "Commands:\n"
-            "/apk — download the drHiro Bridge Android app\n"
+            "/apk — download the drHiro Bridge Android app + pairing link\n"
             "/apkinfo — app version, size, and SHA-256\n"
+            "/pair — fresh pairing link (no APK resend)\n"
+            "/devices — list your linked devices\n"
+            "/revoke <device> — revoke a linked device\n"
             "/status — non-sensitive server status\n"
             "/help — this help\n\n"
             "Only install APKs sent by your own authorized drHiro bot.",

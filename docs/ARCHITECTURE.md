@@ -48,6 +48,13 @@ A dependency-free Python service (stdlib only) that:
   the signed Android companion APK. Delivery validates the SHA-256 and size, uploads once,
   persists the Telegram `file_id` (mode 600), and resends by `file_id` on later requests.
   `/apk` and `/apkinfo` are restricted to the authorized user.
+- **Secure Bridge pairing.** `/apk` and `/pair` create a single-use, time-limited pairing
+  token bound to the authorized user's Telegram id, and post a "Connect drHiro Bridge"
+  inline button carrying a `drhiro://pair` deep link. A background HTTP server
+  (`pairing_http`, port `PAIRING_HTTP_PORT`) handles `/pair/exchange`, `/pair/verify`,
+  `/pair/devices`, and `/pair/revoke`. `/devices` and `/revoke` manage the user's linked
+  devices. HTTPS is required for remote endpoints; HTTP is allowed only for trusted-LAN
+  dev mode with a visible warning.
 - **Maps conversations to persistent TrueForge sessions** (one session per Telegram chat),
   streams turns over SSE, and relays the reply.
 - **Surfaces approvals.** When TrueForge emits `tool.approval_required` (the gated
@@ -85,9 +92,24 @@ An MCP server (SSE transport on :3100) exposing exactly four tools over syntheti
 `save_visit_brief` refuses to persist a brief that is not explicitly marked `SYNTHETIC`,
 and writes only inside the `EXPORT_DIR` volume.
 
-### 4. Installer & scripts
+### 4. Secure Bridge pairing (pairing service + HTTP API)
 
-`install.sh` + `scripts/` provide a safe, repeatable install and operations surface:
+`services/telegram-bridge/src/drhiro_bridge/pairing.py` (`PairingManager`) is the server-side
+pairing service. It mints **cryptographically random, short-lived (default 10 min),
+single-use** pairing tokens, each **bound to the requesting Telegram user id and server URL**,
+and keeps a device registry (only SHA-256 hashes of device secrets). A background
+`pairing_http` server exposes the device-facing API:
+
+- `POST /pair/exchange` — exchange a one-time token for a device-specific credential.
+- `POST /pair/verify` — verify a stored device credential.
+- `GET /pair/devices?user=<id>` — list a user's devices.
+- `POST /pair/revoke` — revoke a device.
+
+URL policy: **HTTPS required** for remote endpoints; **HTTP allowed only** for trusted-LAN
+dev mode (localhost / private ranges / `.local`) with a visible warning. Token creation and
+exchange attempts are rate-limited.
+
+### 5. Installer & scripts
 
 - `install.sh` — validates OS/privileges, installs Docker, prompts for five inputs, writes
   a protected `.env`, validates the Telegram token (without exposing it), detects webhook
@@ -100,12 +122,16 @@ and writes only inside the `EXPORT_DIR` volume.
 - `scripts/update.sh` — refresh TrueForge source, rebuild, re-check.
 - `scripts/backup.sh` — export a redacted env-key reference and a TrueForge DB dump.
 - `scripts/uninstall.sh` — destructive teardown with explicit confirmation.
+- `scripts/create-pairing-token.sh` / `list-paired-devices.sh` / `revoke-device.sh` /
+  `regenerate-pairing-link.sh` — pairing-token and device management.
+- `scripts/apk-verify.sh` / `apk-register.sh` / `apk-info.sh` — APK distribution.
 
 ## Data & state
 
 - **Synthetic only.** The tools read from an in-code synthetic fixture store. No real
   health data, database, or user data ships.
 - **Exports** go to a named Docker volume (`exports_data`) mounted at `EXPORT_DIR`.
+- **Pairing state** (tokens + device registry) lives in the `pairing_state` volume.
 - **TrueForge state** lives in the `tf_pgdata` Postgres volume and its Redis.
 - **Secrets** live only in `.env` (mode 600), never in the repository.
 

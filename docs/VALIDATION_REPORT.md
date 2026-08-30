@@ -15,7 +15,7 @@ python -m pytest tests/ -v
 ## Result (2026-08-30)
 
 ```
-42 passed in ~15s
+52 passed in ~16s
 ```
 
 ## Test coverage by requirement
@@ -76,6 +76,18 @@ python -m pytest tests/ -v
 - `test_failed_first_upload_does_not_save_false_file_id` — a failed upload persists nothing.
 - `test_later_apk_reuses_stored_file_id` — no re-upload; stored `file_id` is reused.
 - `test_start_and_help_commands` / `test_resolved_user_id_authorizes_apk`
+
+### 10. Secure Bridge pairing
+- `test_successful_device_link` — valid token exchanges for a device credential.
+- `test_expired_token` — expired token rejected.
+- `test_reused_token` — single-use; reuse rejected.
+- `test_wrong_telegram_user` — token bound to a different user rejected.
+- `test_wrong_server` — token bound to a different server rejected.
+- `test_unauthorized_user_via_bridge` — unauthorized `/pair` denied, no token created.
+- `test_malformed_deep_link` — malformed `drhiro://pair` links rejected.
+- `test_rejected_non_https_remote_endpoint` — remote HTTP rejected; LAN HTTP flagged insecure.
+- `test_revoked_device_access` — revoked device credential fails verification; owner-scoped revoke.
+- `test_rate_limit_token_creation` — creation rate-limited.
 
 ## Beyond unit tests (manual / integration, documented)
 

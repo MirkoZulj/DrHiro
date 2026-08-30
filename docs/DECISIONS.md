@@ -109,3 +109,20 @@ rationale and any rejected alternatives. It complements `docs/PUBLIC_RELEASE_AUD
   human approval. These steps are gated, not automated.
 - **Rationale:** A signing keystore is a secret; publishing/uploading is an external action
   that must not happen without approval.
+
+## D16 — Secure Bridge pairing via single-use tokens
+
+- **Decision:** The Android Bridge links to the server through a short-lived, single-use,
+  cryptographically random pairing token bound to the authorized Telegram user id and server
+  URL, delivered via a `drhiro://pair` deep link (with a manual code-entry fallback). The
+  server issues a device-specific credential; only its SHA-256 hash is stored.
+- **Rationale:** Avoids embedding any server credential or permanent token in the APK, and
+  binds pairing to the specific authorized user who requested it.
+
+## D17 — HTTPS required for remote; HTTP only for trusted-LAN dev
+
+- **Decision:** `validate_server_url` requires HTTPS for non-local endpoints and allows HTTP
+  only for localhost / private ranges / `.local`, flagging every such exchange `insecure` so
+  the Bridge shows a visible warning.
+- **Rationale:** A privacy-first health agent must not send credentials over plain HTTP to a
+  remote host; trusted-LAN dev remains convenient but is explicit and warned.

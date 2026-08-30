@@ -283,6 +283,10 @@ cat <<'CMDS'
   APK verify:      ./scripts/apk-verify.sh
   APK info:        ./scripts/apk-info.sh
   APK register:    ./scripts/apk-register.sh   (uploads to Telegram; approval-gated)
+  Pairing token:   ./scripts/create-pairing-token.sh <user-id>
+  List devices:    ./scripts/list-paired-devices.sh <user-id>
+  Revoke device:   ./scripts/revoke-device.sh <device-id> <user-id>
+  Pairing link:    ./scripts/regenerate-pairing-link.sh <user-id>
   Stop:            docker compose stop
   Start:           docker compose start
   TrueForge admin: open http://localhost:8790 (TRUEFORGE_PORT)

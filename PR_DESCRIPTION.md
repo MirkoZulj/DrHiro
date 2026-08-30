@@ -31,13 +31,21 @@ over synthetic data and a long-polling Telegram bridge.
   Bridge Android APK from a protected `./apk/` directory: checksum/size validation, one-time
   upload with persisted `file_id`, resend by `file_id`, and `/apk`+`/apkinfo` restricted to
   the authorized user. Scripts `apk-verify.sh`, `apk-register.sh`, `apk-info.sh`.
+- **Secure Bridge pairing.** `/apk`/`/pair` mint a single-use, time-limited, cryptographically
+  random pairing token bound to the authorized user id + server URL, delivered as a
+  `drhiro://pair` deep link with a "Connect drHiro Bridge" button (plus a manual code-entry
+  fallback). A device-facing HTTP API (`/pair/exchange`, `/pair/verify`, `/pair/devices`,
+  `/pair/revoke`) issues a device-specific credential; only its SHA-256 hash is stored.
+  HTTPS required for remote; HTTP allowed only for trusted-LAN dev with a visible warning.
+  `/pair`, `/devices`, `/revoke` added. Scripts `create-pairing-token.sh`,
+  `list-paired-devices.sh`, `revoke-device.sh`, `regenerate-pairing-link.sh`.
 - **Installer** `install.sh` + `scripts/` (configure, health-check, update, backup,
   uninstall). Prompts for exactly five inputs; validates token without exposing it; detects
   webhook conflicts; validates AI backend/model.
 - **Docker Compose** deployment of TrueForge hosted mode (server + Postgres + Redis) plus
   the two drHiro services.
-- **Offline tests:** 42 passing tests against mock Telegram + mock TrueForge (no real bot
-  required), including 11 APK-distribution scenarios.
+- **Offline tests:** 52 passing tests against mock Telegram + mock TrueForge (no real bot
+  required), including 11 APK-distribution scenarios and 10 secure-pairing scenarios.
 
 ## Safety & compliance
 
@@ -49,7 +57,7 @@ over synthetic data and a long-polling Telegram bridge.
 
 ## Tests
 
-`./run_tests.sh` → **42 passed**.
+`./run_tests.sh` → **52 passed**.
 
 ## Documentation
 

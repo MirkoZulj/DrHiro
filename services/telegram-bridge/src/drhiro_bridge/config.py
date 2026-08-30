@@ -21,6 +21,12 @@ class Config:
         self.poll_timeout: int = int(os.environ.get("POLL_TIMEOUT", "30"))
         self.apk_dir: str = os.environ.get("APK_DIR", "/data/apk")
         self.apk_max_size_mb: int = int(os.environ.get("APK_MAX_SIZE_MB", "45"))
+        self.pairing_state_dir: str = os.environ.get("PAIRING_STATE_DIR", "/data/pairing")
+        self.pairing_ttl: int = int(os.environ.get("PAIRING_TTL_SECONDS", "600"))
+        self.pairing_http_host: str = os.environ.get("PAIRING_HTTP_HOST", "0.0.0.0")
+        self.pairing_http_port: int = int(os.environ.get("PAIRING_HTTP_PORT", "8091"))
+        self.server_public_url: str = os.environ.get("DRHIRO_PUBLIC_URL", "")
+        self.allow_http_lan: bool = os.environ.get("PAIRING_ALLOW_HTTP_LAN", "true").lower() == "true"
         self.debug: bool = os.environ.get("DRHIRO_DEBUG", "false").lower() == "true"
 
     def validate(self) -> list[str]:

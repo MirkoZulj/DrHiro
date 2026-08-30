@@ -29,6 +29,10 @@ approvals, context management, and session state.
 - **APK distribution via your bot.** The signed drHiro Bridge Android app is served by your
   own Telegram bot (`/apk`), with checksum verification and persisted `file_id` — no public
   APK host or QR pairing. See [docs/APK_DISTRIBUTION.md](docs/APK_DISTRIBUTION.md).
+- **Secure Bridge pairing.** A short-lived, single-use pairing token (bound to your Telegram
+  user) links the Android Bridge to your server via a `drhiro://pair` deep link. No server
+  credentials or permanent tokens are ever embedded in the APK. See
+  [docs/BRIDGE_PAIRING.md](docs/BRIDGE_PAIRING.md).
 
 ## How TrueForge is used
 
@@ -101,8 +105,11 @@ else):
 | Command | What it does |
 |---|---|
 | `/start` | Welcome message |
-| `/apk` | Send the current signed drHiro Bridge Android APK |
+| `/apk` | Send the current signed drHiro Bridge Android APK + a pairing link |
 | `/apkinfo` | Show version, Android requirement, size, SHA-256 |
+| `/pair` | Generate a fresh pairing link without resending the APK |
+| `/devices` | List the authorized user's linked devices |
+| `/revoke <device>` | Revoke a linked device (after confirmation) |
 | `/status` | Non-sensitive server + APK status |
 | `/help` | Explain commands and Android installation |
 
@@ -129,6 +136,7 @@ else):
 - [docs/PUBLIC_RELEASE_AUDIT.md](docs/PUBLIC_RELEASE_AUDIT.md) — what was audited before release
 - [docs/DECISIONS.md](docs/DECISIONS.md) — design decisions log
 - [docs/APK_DISTRIBUTION.md](docs/APK_DISTRIBUTION.md) — how the Bridge APK is distributed
+- [docs/BRIDGE_PAIRING.md](docs/BRIDGE_PAIRING.md) — secure Android Bridge linking
 - [docs/INSTALL_ANDROID_BRIDGE.md](docs/INSTALL_ANDROID_BRIDGE.md) — installing the Android app
 
 ## License

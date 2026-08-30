@@ -39,6 +39,25 @@ messages. This is enforced by tests (`tests/test_secret_safe_logs.py`).
 - **Tool-level guard.** `save_visit_brief` independently refuses to persist any brief not
   marked `SYNTHETIC`.
 
+## Secure Bridge pairing
+
+The Android Bridge links to the server via **short-lived, single-use pairing tokens** bound
+to the authorized Telegram user id:
+
+- Tokens are cryptographically random, valid by default **10 minutes**, and invalidated
+  after a single successful exchange (reuse/expiry rejected).
+- The token is bound to **(user, server)** — a wrong user or wrong server is rejected.
+- Only a **device-specific credential** is issued; the server stores only its SHA-256 hash.
+- **HTTPS is required** for remote server endpoints; **HTTP is allowed only** for
+  trusted-LAN dev mode (localhost / private ranges / `.local`) and is flagged `insecure` so
+  the Bridge shows a visible warning.
+- Token creation and pairing attempts are **rate-limited**.
+- Device access can be **revoked** at any time (`/devices`, `/revoke`, or the scripts).
+- **No secrets in the APK**: no bot token, AI key, TrueForge key, root credential, server
+  URL, or permanent user token is ever compiled into the Bridge.
+
+See [docs/BRIDGE_PAIRING.md](BRIDGE_PAIRING.md) for the full pairing design.
+
 ## Webhook / polling exclusivity
 
 - The bridge uses long polling only.
@@ -65,6 +84,8 @@ All other services: internal Docker network only
 | Token/key leak via logs or repo | Secret-safe logging; `.env` gitignored and mode 600; token validated without printing. |
 | Webhook + polling conflict / hijack | Exclusivity enforcement; explicit-confirmation deletion. |
 | Unauthorized data write/export | Approval gate at TrueForge + tool-level synthetic guard. |
+| Pairing-token theft / reuse | Single-use, time-limited tokens bound to (user, server); reuse/expiry rejected; rate-limited. |
+| Rogue device linking | HTTPS required for remote; device credential issued once, only its hash stored; revocable. |
 | Exposure of real health data | None exists — synthetic only, explicitly labelled. |
 | Model abuse / prompt injection into a real backend | Agent is single-user, synthetic-only, non-diagnostic; the backend is the operator's own. |
 | DoS / long turns | Bounded timeouts on turns; best-effort typing keepalive; failed turns return a generic message. |

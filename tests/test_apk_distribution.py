@@ -44,7 +44,7 @@ def _write_apk(apk_dir, version="0.1.0", payload=b"PK\x03\x04 synthetic apk byte
     return apk_path, sha
 
 
-def _make_bridge(apk_dir, allowed_username="alice", allowed_user_id="", mock_tg=None, mock_tf=None):
+def _make_bridge(apk_dir, allowed_username="alice", allowed_user_id="", mock_tg=None, mock_tf=None, tmp_path=None):
     cfg = Config()
     cfg.bot_token = "123456:TESTTOKEN"
     cfg.allowed_username = allowed_username
@@ -54,6 +54,8 @@ def _make_bridge(apk_dir, allowed_username="alice", allowed_user_id="", mock_tg=
     cfg.poll_timeout = 2
     cfg.apk_dir = apk_dir
     cfg.apk_max_size_mb = 1  # keep tests fast; overridden where needed
+    import tempfile
+    cfg.pairing_state_dir = tempfile.mkdtemp(prefix="pairtest")
     b = Bridge(cfg)
     if mock_tg:
         b.tg._api = f"{mock_tg['base']}/bottok"

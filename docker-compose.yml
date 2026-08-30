@@ -104,9 +104,15 @@ services:
       TRUEFORGE_AGENT: ${TRUEFORGE_AGENT:-drhiro}
       APK_DIR: /data/apk
       APK_MAX_SIZE_MB: ${APK_MAX_SIZE_MB:-45}
+      PAIRING_STATE_DIR: /data/pairing
+      PAIRING_TTL_SECONDS: ${PAIRING_TTL_SECONDS:-600}
+      PAIRING_HTTP_PORT: ${PAIRING_HTTP_PORT:-8091}
+      DRHIRO_PUBLIC_URL: ${DRHIRO_PUBLIC_URL:-}
+      PAIRING_ALLOW_HTTP_LAN: ${PAIRING_ALLOW_HTTP_LAN:-true}
       DRHIRO_DEBUG: ${DRHIRO_DEBUG:-false}
     volumes:
       - ${APK_DIR:-./apk}:/data/apk
+      - pairing_state:/data/pairing
     depends_on:
       - trueforge
       - drhiro-tools
@@ -115,6 +121,7 @@ services:
 volumes:
   tf_pgdata:
   exports_data:
+  pairing_state:
 
 networks:
   drhiro-net:

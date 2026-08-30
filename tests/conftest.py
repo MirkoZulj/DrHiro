@@ -44,7 +44,7 @@ def mock_tf():
 
 
 @pytest.fixture()
-def bridge(mock_tg, mock_tf, monkeypatch):
+def bridge(mock_tg, mock_tf, monkeypatch, tmp_path):
     """A Bridge wired to the mock servers with a fixed allowed user."""
     from drhiro_bridge.config import Config
     from drhiro_bridge.main import Bridge
@@ -55,6 +55,7 @@ def bridge(mock_tg, mock_tf, monkeypatch):
     cfg.trueforge_url = mock_tf["base"]
     cfg.agent_name = "drhiro"
     cfg.poll_timeout = 2
+    cfg.pairing_state_dir = str(tmp_path / "pairing")
 
     b = Bridge(cfg)
     # Point Telegram client at the mock API base.
