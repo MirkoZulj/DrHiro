@@ -228,3 +228,53 @@ def test_management_endpoints_require_service_token(tmp_path):
         assert code == 200
     finally:
         server.shutdown()
+
+
+def test_http_token_only_exchange_succeeds(tmp_path):
+    """Qodo #2: the Android Bridge request contains only server + token (no
+    telegram_user_id). The HTTP adapter must preserve that missing value as None
+    so the manager uses the identity bound to the token, instead of coercing it
+    to an empty string that would raise WrongUserError."""
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from drhiro_bridge.pairing_http import _Handler
+
+    m = PairingManager(tmp_path / "p4", token_ttl=600)
+    _Handler.manager = m
+    _Handler.service_token = "svc-secret"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    port = server.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+
+    # Token bound to a real user.
+    tok = m.create_token("user-1", "https://bridge.example.com")
+
+    # Android-style request: ONLY token + server_url (no telegram_user_id).
+    body = json.dumps({
+        "token": tok["token"],
+        "server_url": "https://bridge.example.com",
+    }).encode()
+    req = urllib.request.Request(
+        base + "/pair/exchange", data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            code = resp.status
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        code = e.code
+        result = json.loads(e.read() or b"{}")
+
+    assert code == 200, result
+    assert result["ok"] is True
+    assert result["device_id"]
+    assert result["device_secret"]
+    # The device is owned by the token-bound user.
+    assert m.list_devices("user-1")[0]["device_id"] == result["device_id"]
+    server.shutdown()

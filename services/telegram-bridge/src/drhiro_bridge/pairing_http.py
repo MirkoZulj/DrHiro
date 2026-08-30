@@ -95,7 +95,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _exchange(self, body):
         token = body.get("token", "")
-        user = str(body.get("telegram_user_id", ""))
+        # The Android Bridge deep link carries only server + token; it does not
+        # know the Telegram user id. Preserve a MISSING value as None so the
+        # manager uses the identity bound to the token, instead of coercing it to
+        # a supplied-but-empty string that would be treated as a mismatched user.
+        raw_user = body.get("telegram_user_id")
+        user = None if raw_user in (None, "") else str(raw_user)
         server = body.get("server_url", "")
         name = body.get("device_name", "Android")
         result = self.manager.exchange(token, user, server, device_name=name)
