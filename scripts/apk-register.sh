@@ -43,13 +43,20 @@ If Android asks, allow installation from this source.
 Open drHiro Bridge.
 Only install APK files sent by your own authorized drHiro bot."
 
-# 3. Resend by existing file_id if present (no re-upload), else upload.
+# 3. Resend by existing file_id ONLY if it is bound to the current hash
+#    (Qodo #9); an upgrade invalidates the stale id and forces a re-upload.
+SHA="$(sha256sum "$APK_PATH" | awk '{print $1}')"
 FID="$(python3 -c 'import json,sys
-try: print(json.load(open(sys.argv[1])).get("file_id",""))
-except Exception: print("")' "$META_PATH")"
+try:
+    m=json.load(open(sys.argv[1]))
+    if str(m.get("sha256","")).lower() == sys.argv[2].lower():
+        print(m.get("file_id",""))
+    else:
+        print("")
+except Exception: print("")' "$META_PATH" "$SHA")"
 
 if [[ -n "$FID" ]]; then
-  info "Reusing stored file_id (no re-upload)."
+  info "Reusing stored file_id for current APK hash (no re-upload)."
   RESP="$(curl -sS -m 60 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile" \
     -F "file_id=$FID" 2>&1 || true)"
   if python3 -c 'import sys,json
@@ -63,7 +70,7 @@ except Exception: sys.exit(1)' <<<"$RESP" 2>/dev/null; then
 fi
 
 if [[ -z "$FID" ]]; then
-  info "Uploading APK to Telegram (first registration)..."
+  info "Uploading APK to Telegram (registration)..."
   RESP="$(curl -sS -m 180 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
     -F "document=@${APK_PATH}" -F "caption=${CAPTION}" 2>&1 || true)"
   if ! python3 -c 'import sys,json
@@ -75,12 +82,13 @@ except Exception: sys.exit(1)' <<<"$RESP" 2>/dev/null; then
 try: print(json.load(sys.stdin)["result"]["document"]["file_id"])
 except Exception: print("")' <<<"$RESP")"
   [[ -n "$FID" ]] || fail "Telegram returned no file_id."
-  # Persist the file_id securely (mode 600).
-  python3 - "$META_PATH" "$FID" <<'PY'
+  # Persist the file_id bound to the current APK hash (mode 600).
+  python3 - "$META_PATH" "$FID" "$SHA" <<'PY'
 import json, sys, time
-meta_path, fid = sys.argv[1], sys.argv[2]
+meta_path, fid, sha = sys.argv[1], sys.argv[2], sys.argv[3]
 meta = json.load(open(meta_path))
 meta["file_id"] = fid
+meta["sha256"] = sha
 meta["file_id_set_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 open(meta_path, "w").write(json.dumps(meta, indent=2, sort_keys=True))
 PY

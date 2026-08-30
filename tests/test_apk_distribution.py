@@ -229,3 +229,136 @@ def test_resolved_user_id_authorizes_apk(apk_bridge):
     # Now a message with that numeric id (no username) is authorized.
     _process(b, mock_tg, "/apk", username="", user_id=int(b.cfg.allowed_user_id))
     assert mock_tg["state"].document_uploads, "resolved id should authorize /apk"
+
+
+# ---------------------------------------------------------------------- #
+# Qodo #8 — missing checksum must be refused, never "accepted as unverified"
+# ---------------------------------------------------------------------- #
+def test_missing_checksum_is_refused(tmp_path):
+    """Qodo #8: an APK whose apk.json omits sha256 must be refused at runtime —
+    not accepted because the expected value was absent."""
+    apk_dir = str(tmp_path / "apk")
+    os.makedirs(apk_dir, exist_ok=True)
+    with open(os.path.join(apk_dir, "drhiro-bridge.apk"), "wb") as f:
+        f.write(b"PK\x03\x04 bytes")
+    # apk.json WITHOUT sha256.
+    with open(os.path.join(apk_dir, "apk.json"), "w") as f:
+        json.dump({"version": "0.1.0"}, f)
+    manager = ApkManager(apk_dir, max_size_mb=1)
+    with pytest.raises(ApkChecksumError):
+        manager.validate()
+
+
+def test_malformed_checksum_is_refused(tmp_path):
+    """Qodo #8: a non-64-hex sha256 must be refused."""
+    apk_dir = str(tmp_path / "apk")
+    os.makedirs(apk_dir, exist_ok=True)
+    with open(os.path.join(apk_dir, "drhiro-bridge.apk"), "wb") as f:
+        f.write(b"PK\x03\x04 bytes")
+    with open(os.path.join(apk_dir, "apk.json"), "w") as f:
+        json.dump({"version": "0.1.0", "sha256": "short"}, f)
+    manager = ApkManager(apk_dir, max_size_mb=1)
+    with pytest.raises(ApkChecksumError):
+        manager.validate()
+
+
+def test_missing_checksum_blocks_upload(apk_bridge):
+    """Qodo #8: /apk with no recorded checksum must not upload."""
+    b, apk_dir, mock_tg, _ = apk_bridge["bridge"], apk_bridge["apk_dir"], apk_bridge["mock_tg"], apk_bridge["mock_tf"]
+    os.makedirs(apk_dir, exist_ok=True)
+    with open(os.path.join(apk_dir, "drhiro-bridge.apk"), "wb") as f:
+        f.write(b"PK\x03\x04 bytes")
+    with open(os.path.join(apk_dir, "apk.json"), "w") as f:
+        json.dump({"version": "0.1.0"}, f)
+
+    _process(b, mock_tg, "/apk", username="alice")
+    assert not mock_tg["state"].document_uploads, "APK without checksum must not be uploaded"
+
+
+# ---------------------------------------------------------------------- #
+# Qodo #9 — upgrades must not resend a stale file_id bound to an old APK
+# ---------------------------------------------------------------------- #
+def test_upgrade_reuploads_instead_of_stale_file_id(apk_bridge):
+    """Qodo #9: after the local APK is replaced (upgrade), send() must re-upload
+    the new bytes and bind the new file_id — never resend the old file_id with a
+    caption claiming the new version."""
+    b, apk_dir, mock_tg, _ = apk_bridge["bridge"], apk_bridge["apk_dir"], apk_bridge["mock_tg"], apk_bridge["mock_tf"]
+    mock_tg["state"].upload_file_id = "FILEID-V1"
+    # First registration of v1.
+    _write_apk(apk_dir, version="0.1.0", payload=b"PK\x03\x04 v1 bytes")
+    _process(b, mock_tg, "/apk", username="alice")
+    assert mock_tg["state"].document_uploads, "first /apk should upload v1"
+    # Stored file_id is bound to v1's hash.
+    v1_sha = b.apk.meta()["sha256"]
+    assert b.apk._stored_file_id_for_hash(v1_sha) == "FILEID-V1"
+
+    # Upgrade: replace the APK with v2 (new bytes + new apk.json hash).
+    mock_tg["state"].upload_file_id = "FILEID-V2"
+    _write_apk(apk_dir, version="0.1.1", payload=b"PK\x03\x04 v2 bytes")
+    v2_sha = b.apk.meta()["sha256"]
+    assert v2_sha != v1_sha
+
+    # Next /apk must re-upload (not resend FILEID-V1), and rebind to V2.
+    uploads_before = len(mock_tg["state"].document_uploads)
+    _process(b, mock_tg, "/apk", username="alice")
+    assert len(mock_tg["state"].document_uploads) == uploads_before + 1, \
+        "upgrade must trigger a re-upload, not a stale resend"
+    assert b.apk._stored_file_id_for_hash(v2_sha) == "FILEID-V2"
+
+
+# ---------------------------------------------------------------------- #
+# Qodo #7 — signing certificate verified against trusted signer
+# ---------------------------------------------------------------------- #
+def test_signer_cert_mismatch_is_refused(tmp_path, monkeypatch):
+    """Qodo #7: when apk.json records a trusted signer fingerprint, an APK whose
+    certificate does not match must be refused."""
+    apk_dir = str(tmp_path / "apk")
+    os.makedirs(apk_dir, exist_ok=True)
+    data = b"PK\x03\x04 signed bytes"
+    apk_path = os.path.join(apk_dir, "drhiro-bridge.apk")
+    with open(apk_path, "wb") as f:
+        f.write(data)
+    sha = hashlib.sha256(data).hexdigest()
+    with open(os.path.join(apk_dir, "apk.json"), "w") as f:
+        json.dump({
+            "version": "0.1.0",
+            "sha256": sha,
+            "signer_sha256": "a" * 64,  # trusted signer that the stub will NOT match
+        }, f)
+
+    # Stub apksigner to report a DIFFERENT cert fingerprint.
+    stub = tmp_path / "apksigner"
+    stub.write_text("#!/usr/bin/env bash\necho 'Signer #1 certificate SHA-256 digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("APKSIGNER", str(stub))
+
+    manager = ApkManager(apk_dir, max_size_mb=1)
+    with pytest.raises(ApkChecksumError):
+        manager.validate()
+
+
+def test_signer_cert_match_passes(tmp_path, monkeypatch):
+    """Qodo #7 (positive): an APK whose certificate matches the trusted signer
+    passes validation."""
+    apk_dir = str(tmp_path / "apk")
+    os.makedirs(apk_dir, exist_ok=True)
+    data = b"PK\x03\x04 signed bytes"
+    apk_path = os.path.join(apk_dir, "drhiro-bridge.apk")
+    with open(apk_path, "wb") as f:
+        f.write(data)
+    sha = hashlib.sha256(data).hexdigest()
+    trusted = "c" * 64
+    with open(os.path.join(apk_dir, "apk.json"), "w") as f:
+        json.dump({
+            "version": "0.1.0",
+            "sha256": sha,
+            "signer_sha256": trusted,
+        }, f)
+
+    stub = tmp_path / "apksigner"
+    stub.write_text(f"#!/usr/bin/env bash\necho 'Signer #1 certificate SHA-256 digest: {trusted}'\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("APKSIGNER", str(stub))
+
+    manager = ApkManager(apk_dir, max_size_mb=1)
+    assert manager.validate()["ok"] is True

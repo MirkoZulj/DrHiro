@@ -77,9 +77,22 @@ class ApkManager:
         fid = m.get("file_id")
         return str(fid) if fid else None
 
-    def set_file_id(self, file_id: str) -> None:
+    def _stored_file_id_for_hash(self, current_sha256: str) -> str | None:
+        """Qodo #9: return the stored file_id ONLY if it was bound to the current
+        APK hash. If the local APK was replaced (upgrade), the old file_id refers
+        to stale bytes and must not be reused."""
+        m = self._load_meta()
+        if str(m.get("sha256", "")).lower() != current_sha256.lower():
+            return None
+        fid = m.get("file_id")
+        return str(fid) if fid else None
+
+    def set_file_id(self, file_id: str, apk_sha256: str) -> None:
         m = self._load_meta()
         m["file_id"] = file_id
+        # Qodo #9: bind the file_id to the exact APK it was uploaded from, so an
+        # upgrade invalidates the stale id instead of resending old bytes.
+        m["sha256"] = apk_sha256
         m["file_id_set_at"] = __import__("time").strftime(
             "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()
         )
@@ -97,8 +110,14 @@ class ApkManager:
         return h.hexdigest()
 
     def validate(self, path: Path | None = None) -> dict:
-        """Validate the APK exists, is under the size limit, and matches the
-        recorded SHA-256. Returns {version, size, sha256, ok}. Raises ApkError."""
+        """Validate the APK exists, is under the size limit, matches the recorded
+        SHA-256 (REQUIRED), and — when the trusted signer fingerprint is
+        configured — its Android signing certificate.
+
+        Qodo #7/#8: a missing or malformed checksum is REFUSED (never "accepted
+        because the expected value was absent"); a substituted APK that fails the
+        trusted-signer check is refused. Returns {version, size, sha256, ok}.
+        """
         p = path or self.apk_path
         if not p.exists():
             raise ApkError("APK file not found — place drhiro-bridge.apk in the APK dir first.")
@@ -115,11 +134,27 @@ class ApkManager:
 
         meta = self._load_meta()
         expected = meta.get("sha256")
+        if not expected or not isinstance(expected, str) or len(str(expected)) != 64:
+            raise ApkChecksumError(
+                "apk.json is missing a valid sha256 — refusing to serve an unverified "
+                "APK. Regenerate the metadata with the signed release checksum."
+            )
         actual = self.compute_sha256(p)
-        if expected and actual.lower() != str(expected).lower():
+        if actual.lower() != str(expected).lower():
             raise ApkChecksumError(
                 "APK SHA-256 mismatch — refusing to serve a tampered artifact."
             )
+
+        # Qodo #7: verify the Android signing certificate against the trusted
+        # signer fingerprint, when one is configured in apk.json.
+        trusted_signer = meta.get("signer_sha256")
+        if trusted_signer:
+            cert = self._verify_signing_cert(p)
+            if not cert or str(cert).lower() != str(trusted_signer).lower():
+                raise ApkChecksumError(
+                    "APK signing certificate does not match the trusted signer — "
+                    "refusing to serve a substituted artifact."
+                )
 
         version = meta.get("version", "unknown")
         return {
@@ -132,30 +167,64 @@ class ApkManager:
             "android_requirement": meta.get("android_requirement", "Android 8.0+"),
         }
 
+    def _verify_signing_cert(self, path: Path) -> str | None:
+        """Return the first signer's certificate SHA-256 fingerprint using
+        apksigner, or None if apksigner is unavailable. Used to authenticate the
+        Android signing identity (Qodo #7)."""
+        import subprocess
+
+        candidates = (
+            os.environ.get("APKSIGNER"),
+            "/usr/bin/apksigner",
+            "/usr/lib/android-sdk/build-tools/current/apksigner",
+            "/android-sdk/build-tools/36.0.0/apksigner",
+        )
+        apksigner = next((c for c in candidates if c and os.path.exists(c)), None)
+        if not apksigner:
+            return None
+        try:
+            out = subprocess.run(
+                [apksigner, "verify", "--print-certs", str(path)],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        # Lines look like: "Signer #1 certificate SHA-256 digest: <hex>"
+        for line in (out.stdout or "").splitlines():
+            low = line.lower()
+            if "certificate sha-256 digest" in low:
+                return line.split(":", 1)[-1].strip()
+        return None
+
     # ------------------------------------------------------------------ #
     # Delivery
     # ------------------------------------------------------------------ #
     def register(self, tg, force_upload: bool = True) -> str:
         """Upload the APK to Telegram as a document and persist the returned
-        file_id. Returns the file_id. Raises on any failure; a failed upload
-        never persists a file_id."""
+        file_id bound to the current APK hash. Returns the file_id. Raises on any
+        failure; a failed upload never persists a file_id."""
         info = self.validate()
         file_id = tg.send_document_file(
             info["path"], filename="drhiro-bridge.apk", caption=self._caption(info)
         )
-        self.set_file_id(file_id)
+        self.set_file_id(file_id, info["sha256"])
         log.info("APK registered with Telegram; file_id stored.")
         return file_id
 
     def send(self, tg, chat_id: int) -> str:
-        """Send the APK to the chat: by stored file_id if present, else by
-        first upload. Returns a non-sensitive status line."""
+        """Send the APK to the chat.
+
+        Qodo #9: reuse the stored file_id ONLY if it is bound to the current APK
+        hash. After an upgrade the old file_id refers to stale bytes, so we
+        re-upload and bind the new file_id instead of sending an old APK with a
+        caption claiming the new version.
+        """
         info = self.validate()
-        fid = self.stored_file_id()
+        fid = self._stored_file_id_for_hash(info["sha256"])
         if fid:
             tg.send_document_file_id(chat_id, fid, caption=self._caption(info))
             return f"sent by file_id (v{info['version']})"
-        # First delivery: upload and store the file_id for reuse.
+        # Stale/missing file_id or APK upgraded: re-upload and bind.
         fid = self.register(tg)
         tg.send_document_file_id(chat_id, fid, caption=self._caption(info))
         return f"uploaded and sent (v{info['version']})"
