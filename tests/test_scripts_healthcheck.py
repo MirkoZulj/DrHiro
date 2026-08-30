@@ -134,3 +134,29 @@ def test_model_validation_rejects_missing_model():
                           text=True).returncode == 0
     # The correct validator rejects an unlisted model.
     assert _run_model_check(models, "does-not-exist") == 1
+
+
+# ---------------------------------------------------------------------- #
+# Qodo #11 — configure.sh must define `warn` before use
+# ---------------------------------------------------------------------- #
+def test_configure_sh_defines_warn():
+    """Qodo #11: configure.sh calls `warn` on recoverable API failures but must
+    define it; under `set -e` an undefined function would abort the script."""
+    script = (os.path.join(SCRIPTS_DIR, "configure.sh"))
+    text = open(script).read()
+    # A `warn() {` definition must exist before any `|| warn "..."` use.
+    assert "warn() {" in text
+    first_def = text.index("warn() {")
+    # Find the first `|| warn` usage; it must appear AFTER the definition.
+    import re
+    uses = [m.start() for m in re.finditer(r"\|\|\s*warn\s+", text)]
+    assert uses, "configure.sh must use warn on recoverable failures"
+    assert all(u > first_def for u in uses), \
+        "warn() must be defined before its first use"
+
+
+def test_configure_sh_syntax():
+    """configure.sh must pass bash -n syntax check (defining warn)."""
+    r = subprocess.run(["bash", "-n", os.path.join(SCRIPTS_DIR, "configure.sh")],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr

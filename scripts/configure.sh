@@ -14,6 +14,7 @@ TF="${TRUEFORGE_URL:-http://localhost:${TRUEFORGE_PORT:-8790}}/api/v1"
 TF_BASE="${TRUEFORGE_URL:-http://localhost:${TRUEFORGE_PORT:-8790}}"
 
 info() { echo "[configure] $*"; }
+warn() { echo "[configure] WARNING: $*"; }
 fail() { echo "[configure] ERROR: $*" >&2; exit 1; }
 
 # 1. Wait for TrueForge
