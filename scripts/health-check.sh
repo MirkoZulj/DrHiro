@@ -17,22 +17,23 @@ say() { echo "[health] $*"; }
 ok()   { say "OK   $*"; }
 bad()  { say "FAIL $*"; FAIL=1; }
 
-# 1. Compose services
+# 1. Compose services (Qodo #4/#5)
+# Use process substitution so the loop runs in THIS shell and FAIL propagates.
 say "Checking compose services..."
-docker compose ps --format '{{.Name}} {{.Status}}' 2>/dev/null | while read -r n s; do
+while read -r n s; do
+  [[ -z "$n" ]] && continue
   if [[ "$s" == *"Up"* ]]; then ok "container $n: up"; else bad "container $n: $s"; fi
-done
+done < <(docker compose ps --all --format '{{.Name}} {{.Status}}' 2>/dev/null)
 
 # 2. TrueForge health
 if curl -sf -m 10 "$TF_BASE/healthz" >/dev/null 2>&1; then ok "TrueForge /healthz"; else bad "TrueForge /healthz unreachable"; fi
 
-# 3. drhiro-tools SSE endpoint
-if curl -sf -m 10 "http://localhost:3100/sse" >/dev/null 2>&1 || true; then
-  ok "drhiro-tools SSE reachable on :3100 (probe best-effort)"
+# 3. drhiro-tools SSE endpoint (Qodo #4)
+# No `|| true` coercion: if curl cannot connect this branch must NOT claim success.
+if curl -sf -m 10 "http://localhost:3100/sse" >/dev/null 2>&1; then
+  ok "drhiro-tools SSE reachable on :3100"
 else
-  # SSE streams; a 4xx/5xx or connect failure means down. Use a short timeout.
-  CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://localhost:3100/sse" 2>/dev/null || true)"
-  [[ -n "$CODE" ]] && ok "drhiro-tools responded HTTP $CODE" || bad "drhiro-tools not reachable on :3100"
+  bad "drhiro-tools not reachable on :3100"
 fi
 
 # 4. Telegram token valid + no webhook (secret-safe)
