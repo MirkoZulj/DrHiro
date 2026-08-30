@@ -92,3 +92,20 @@ rationale and any rejected alternatives. It complements `docs/PUBLIC_RELEASE_AUD
 - **Decision:** The README's "Qodo Code Review Evidence" section is a placeholder until a real
   Qodo-reviewed PR is merged; only then is the actual PR URL and factual summary added.
 - **Rationale:** Release constraint: never fabricate review evidence.
+
+## D14 — APK distributed by the user's own bot
+
+- **Decision:** The signed drHiro Bridge Android APK is served by the user's configured
+  Telegram bot via `/apk` (uploaded once, `file_id` persisted, resent by `file_id`), with
+  checksum/size validation. No public APK host and no QR-code pairing.
+- **Rationale:** Matches the updated architecture requirement — the APK must come from the
+  user's own bot after install, and only to the authorized user.
+
+## D15 — Signed APK is a credential-gated external artifact
+
+- **Decision:** The bridge code, commands, scripts, tests, and docs for APK distribution are
+  fully built and verified offline. Producing the **signed** release APK requires the Android
+  toolchain and the operator's signing keystore; uploading it to Telegram requires explicit
+  human approval. These steps are gated, not automated.
+- **Rationale:** A signing keystore is a secret; publishing/uploading is an external action
+  that must not happen without approval.

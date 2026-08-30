@@ -99,9 +99,14 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set in .env}
       TELEGRAM_ALLOWED_USERNAME: ${TELEGRAM_ALLOWED_USERNAME:?set in .env}
+      TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
       TRUEFORGE_URL: http://trueforge:8790
       TRUEFORGE_AGENT: ${TRUEFORGE_AGENT:-drhiro}
+      APK_DIR: /data/apk
+      APK_MAX_SIZE_MB: ${APK_MAX_SIZE_MB:-45}
       DRHIRO_DEBUG: ${DRHIRO_DEBUG:-false}
+    volumes:
+      - ${APK_DIR:-./apk}:/data/apk
     depends_on:
       - trueforge
       - drhiro-tools

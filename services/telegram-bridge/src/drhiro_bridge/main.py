@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 
+from .apk_distribution import ApkManager
 from .config import Config
 from .telegram_client import (
     TelegramClient,
@@ -38,9 +39,16 @@ _DENY = "drhiro_deny"
 
 
 def _authorized(message: dict, cfg: Config) -> bool:
-    """True only if the message sender is the configured allowed username."""
-    user = (message.get("from") or {}).get("username") or ""
-    return user.lower() == cfg.allowed_username.lower()
+    """True if the sender is the configured allowed username OR the resolved
+    allowed user id (trusted once verified)."""
+    sender = message.get("from") or {}
+    user = sender.get("username") or ""
+    if user and user.lower() == cfg.allowed_username.lower():
+        return True
+    sender_id = sender.get("id")
+    if cfg.allowed_user_id and sender_id is not None:
+        return str(sender_id) == str(cfg.allowed_user_id)
+    return False
 
 
 def _extract_text(message: dict) -> str:
@@ -81,6 +89,7 @@ class Bridge:
         self.cfg = cfg
         self.tg = TelegramClient(cfg.bot_token)
         self.tf = TrueForgeClient(cfg.trueforge_url, cfg.agent_name)
+        self.apk = ApkManager(cfg.apk_dir, max_size_mb=cfg.apk_max_size_mb)
         self._sessions: dict[int, str] = {}  # chat_id -> trueforge session_id
         self._pending_approvals: dict[int, list[dict]] = {}
         self._running = True
@@ -152,9 +161,18 @@ class Bridge:
             self.tg.send_message(chat_id, "Sorry, you are not authorized to use this bot.")
             return
 
+        # After a successful verification, remember the sender's numeric id so it
+        # becomes an additional authorization key for future /apk and /apkinfo.
+        self._remember_user_id(message)
+
         text = _extract_text(message)
         if not text:
             return
+
+        # Route bot commands BEFORE the agent loop.
+        if text.startswith("/"):
+            if self._handle_command(chat_id, text):
+                return
 
         # Start a typing keepalive in the background for long turns.
         threading.Thread(
@@ -175,6 +193,107 @@ class Bridge:
             )
         else:
             self._send_reply(chat_id, reply)
+
+    def _remember_user_id(self, message: dict) -> None:
+        """Persist the verified sender's numeric id once, so future requests are
+        authorized by id even if the username changes. Does not override an
+        explicitly configured ALLOWED_USER_ID."""
+        sender = message.get("from") or {}
+        sender_id = sender.get("id")
+        if sender_id is None:
+            return
+        if not self.cfg.allowed_user_id:
+            self.cfg.allowed_user_id = str(sender_id)
+            log.info("Resolved authorized user id (stored in memory for this run)")
+
+    def _handle_command(self, chat_id: int, text: str) -> bool:
+        """Handle bot commands. Returns True if the message was fully handled."""
+        cmd = text.split()[0].lower()
+        try:
+            if cmd == "/apk":
+                self._cmd_apk(chat_id)
+                return True
+            if cmd == "/apkinfo":
+                self._cmd_apkinfo(chat_id)
+                return True
+            if cmd == "/status":
+                self._cmd_status(chat_id)
+                return True
+            if cmd == "/help":
+                self._cmd_help(chat_id)
+                return True
+            if cmd == "/start":
+                self._cmd_start(chat_id)
+                return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("command %s failed: %s", cmd, e)
+            self.tg.send_message(
+                chat_id, "Sorry, that command failed. See /help.", parse_mode=None
+            )
+            return True
+        return False
+
+    # -- APK / status / help commands -------------------------------- #
+    def _cmd_apk(self, chat_id: int) -> None:
+        # Only authorized users reach here (checked in _process_update).
+        try:
+            result = self.apk.send(self.tg, chat_id)
+            self.tg.send_message(chat_id, result, parse_mode=None)
+        except Exception as e:  # noqa: BLE001
+            log.warning("APK delivery failed: %s", e)
+            self.tg.send_message(
+                chat_id,
+                "Could not send the APK right now. See /apkinfo or check server logs.",
+                parse_mode=None,
+            )
+
+    def _cmd_apkinfo(self, chat_id: int) -> None:
+        try:
+            info = self.apk.validate()
+            self.tg.send_message(
+                chat_id,
+                f"drHiro Bridge v{info['version']}\n"
+                f"Android: {info['android_requirement']}\n"
+                f"Size: {info['size_mb']} MB\n"
+                f"SHA-256: {info['sha256']}",
+                parse_mode=None,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.tg.send_message(
+                chat_id,
+                f"APK not ready: {e}. Place drhiro-bridge.apk on the server first.",
+                parse_mode=None,
+            )
+
+    def _cmd_status(self, chat_id: int) -> None:
+        s = self.apk.status()
+        self.tg.send_message(
+            chat_id,
+            f"drHiro server status:\n"
+            f"- APK: {s.get('apk')} (v{s.get('version', '?')}, {s.get('size_mb', 0)} MB)\n"
+            f"- Registered with Telegram: {s.get('registered', False)}",
+            parse_mode=None,
+        )
+
+    def _cmd_help(self, chat_id: int) -> None:
+        self.tg.send_message(
+            chat_id,
+            "Commands:\n"
+            "/apk — download the drHiro Bridge Android app\n"
+            "/apkinfo — app version, size, and SHA-256\n"
+            "/status — non-sensitive server status\n"
+            "/help — this help\n\n"
+            "Only install APKs sent by your own authorized drHiro bot.",
+            parse_mode=None,
+        )
+
+    def _cmd_start(self, chat_id: int) -> None:
+        self.tg.send_message(
+            chat_id,
+            "Welcome to drHiro — your privacy-first health information agent.\n"
+            "Send /apk to download the Android Bridge app, or just start chatting.",
+            parse_mode=None,
+        )
 
     def _run_conversation(self, chat_id: int, text: str) -> tuple[str, list[dict]]:
         session_id = self._sessions.get(chat_id)

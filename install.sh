@@ -252,7 +252,23 @@ if [[ -x "$SCRIPT_DIR/scripts/configure.sh" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 12. Safe operational commands
+# 12. Android Bridge APK registration (OPTIONAL, approval-gated)
+# ---------------------------------------------------------------------------
+# Uploading the APK to Telegram is an external action — only proceed if the
+# operator explicitly confirms AND a signed APK is present in ./apk.
+if [[ -f "$SCRIPT_DIR/apk/drhiro-bridge.apk" && -x "$SCRIPT_DIR/scripts/apk-register.sh" ]]; then
+  echo
+  warn "A drHiro Bridge APK was found in ./apk."
+  read -rp "Register it with Telegram now (upload + store file_id)? [y/N]: " REG_APK
+  if [[ "${REG_APK,,}" == "y" ]]; then
+    bash "$SCRIPT_DIR/scripts/apk-register.sh" || warn "APK registration failed — see output above."
+  else
+    info "Skipping APK registration. Send /apk to the bot later to register on demand."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 13. Safe operational commands
 # ---------------------------------------------------------------------------
 echo
 info "Install complete. Safe operational commands:"
@@ -264,6 +280,9 @@ cat <<'CMDS'
   Backup:          ./scripts/backup.sh
   Configure:       ./scripts/configure.sh
   Uninstall:       ./scripts/uninstall.sh
+  APK verify:      ./scripts/apk-verify.sh
+  APK info:        ./scripts/apk-info.sh
+  APK register:    ./scripts/apk-register.sh   (uploads to Telegram; approval-gated)
   Stop:            docker compose stop
   Start:           docker compose start
   TrueForge admin: open http://localhost:8790 (TRUEFORGE_PORT)

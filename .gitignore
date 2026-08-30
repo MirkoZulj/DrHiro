@@ -28,6 +28,12 @@ data/state/
 *.sql.gz
 *.dump
 
+# --- Android Bridge APK artifact (signed binary + file_id sidecar) ---
+# The signed APK and apk.json (contains Telegram file_id) are placed on the
+# server at install time; never commit them.
+apk/
+!apk/README.md
+
 # --- OS / editors ---
 .DS_Store
 .idea/

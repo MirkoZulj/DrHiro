@@ -41,8 +41,13 @@ A dependency-free Python service (stdlib only) that:
 - **Enforces webhook/polling exclusivity** before polling starts: it calls
   `getWebhookInfo`; if a webhook URL is set, it raises a `WebhookConflictError` and
   requires explicit operator confirmation before `deleteWebhook`.
-- **Gates by username.** Only the configured `TELEGRAM_ALLOWED_USERNAME` reaches the agent;
-  everyone else is told they are unauthorized.
+- **Gates by username (and later by resolved user id).** Only the configured
+  `TELEGRAM_ALLOWED_USERNAME` reaches the agent; everyone else is told they are
+  unauthorized. After a successful verification the sender's numeric id is also trusted.
+- **Serves the drHiro Bridge APK.** `/apk`, `/apkinfo`, `/status`, and `/help` distribute
+  the signed Android companion APK. Delivery validates the SHA-256 and size, uploads once,
+  persists the Telegram `file_id` (mode 600), and resends by `file_id` on later requests.
+  `/apk` and `/apkinfo` are restricted to the authorized user.
 - **Maps conversations to persistent TrueForge sessions** (one session per Telegram chat),
   streams turns over SSE, and relays the reply.
 - **Surfaces approvals.** When TrueForge emits `tool.approval_required` (the gated

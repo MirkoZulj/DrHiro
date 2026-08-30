@@ -26,6 +26,9 @@ approvals, context management, and session state.
 - **Approval-gated export.** Saving a visit brief requires the user's explicit Allow/Deny.
 - **Structured output validation.** The agent's replies are validated against a JSON schema.
 - **Synthetic data only.** Zero real health data ships in or out of this package.
+- **APK distribution via your bot.** The signed drHiro Bridge Android app is served by your
+  own Telegram bot (`/apk`), with checksum verification and persisted `file_id` — no public
+  APK host or QR pairing. See [docs/APK_DISTRIBUTION.md](docs/APK_DISTRIBUTION.md).
 
 ## How TrueForge is used
 
@@ -90,11 +93,24 @@ All values are provided interactively by `install.sh` and written to a protected
 - **Not a medical device.** drHiro does not diagnose, prescribe, triage, or replace a
   clinician. See [docs/SECURITY_AND_PRIVACY.md](docs/SECURITY_AND_PRIVACY.md).
 
+## Bot commands
+
+The bot answers commands from the authorized user (plus agent conversation for anything
+else):
+
+| Command | What it does |
+|---|---|
+| `/start` | Welcome message |
+| `/apk` | Send the current signed drHiro Bridge Android APK |
+| `/apkinfo` | Show version, Android requirement, size, SHA-256 |
+| `/status` | Non-sensitive server + APK status |
+| `/help` | Explain commands and Android installation |
+
 ## Demo video
 
 > 🎬 **Demo video placeholder.** A recorded walkthrough of installing the package on a clean
-> Ubuntu 22.04 host and running a full conversation (including an approval) will be linked
-> here once recorded.
+> Ubuntu 22.04 host, running a full conversation (including an approval), and downloading the
+> drHiro Bridge APK via `/apk` will be linked here once recorded.
 
 ## Qodo Code Review Evidence
 
@@ -112,6 +128,8 @@ All values are provided interactively by `install.sh` and written to a protected
 - [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) — demo recording script
 - [docs/PUBLIC_RELEASE_AUDIT.md](docs/PUBLIC_RELEASE_AUDIT.md) — what was audited before release
 - [docs/DECISIONS.md](docs/DECISIONS.md) — design decisions log
+- [docs/APK_DISTRIBUTION.md](docs/APK_DISTRIBUTION.md) — how the Bridge APK is distributed
+- [docs/INSTALL_ANDROID_BRIDGE.md](docs/INSTALL_ANDROID_BRIDGE.md) — installing the Android app
 
 ## License
 

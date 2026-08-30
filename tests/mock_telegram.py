@@ -25,6 +25,10 @@ class MockTelegramState:
         self.webhook_url: str = ""  # "" = no webhook configured
         self.update_queue: list[dict] = []
         self.sent_messages: list[dict] = []  # every sendMessage call
+        self.document_sends: list[dict] = []  # every sendDocument call
+        self.document_uploads: list[dict] = []  # uploads (multipart)
+        self.upload_file_id: str = "FILEID-0001"  # file_id returned for uploads
+        self.fail_upload: bool = False  # simulate a failed first upload
         self.chat_actions: list[dict] = []
         self.callback_queue: list[dict] = []
         self.offset: int | None = None
@@ -39,6 +43,19 @@ class MockTelegramState:
                     "message_id": update_id,
                     "chat": {"id": chat_id, "type": "private"},
                     "from": {"id": chat_id, "username": username},
+                    "text": text,
+                },
+            })
+
+    def enqueue_update_with_id(self, update_id: int, chat_id: int, text: str, user_id: int) -> None:
+        """Enqueue a message from a numeric user id (no username)."""
+        with self.lock:
+            self.update_queue.append({
+                "update_id": update_id,
+                "message": {
+                    "message_id": update_id,
+                    "chat": {"id": chat_id, "type": "private"},
+                    "from": {"id": user_id},
                     "text": text,
                 },
             })
@@ -59,6 +76,34 @@ class MockTelegramState:
             return self.sent_messages[-1]["text"] if self.sent_messages else ""
 
 
+def _extract_multipart(content_type: str, raw: bytes) -> tuple[str, bytes]:
+    """Minimal multipart/form-data parser: return the (filename, file bytes) of
+    the 'document' part. Good enough for the mock's purposes."""
+    boundary = None
+    for piece in content_type.split(";"):
+        piece = piece.strip()
+        if piece.startswith("boundary="):
+            boundary = piece[len("boundary="):].strip('"')
+    if not boundary:
+        return "unknown.apk", raw
+    delim = b"--" + boundary.encode("utf-8")
+    # Split body by the delimiter; find the part with name="document".
+    parts = raw.split(delim)
+    filename = "unknown.apk"
+    for part in parts:
+        if b'name="document"' not in part:
+            continue
+        header, _, body = part.partition(b"\r\n\r\n")
+        for line in header.split(b"\r\n"):
+            if b"filename=" in line:
+                fn = line.split(b'filename="', 1)[-1].rsplit(b'"', 1)[0]
+                filename = fn.decode("utf-8", "replace")
+        # Strip trailing CRLF before the next delimiter.
+        body = body.rstrip(b"\r\n")
+        return filename, body
+    return filename, raw
+
+
 class Handler(BaseHTTPRequestHandler):
     state: MockTelegramState = None  # type: ignore[assignment]
 
@@ -73,12 +118,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
+        ctype = self.headers.get("Content-Type", "")
+        path = urllib.parse.urlparse(self.path).path
+        st = self.state
+
+        # multipart/form-data = a document upload (sendDocument with file)
+        if "multipart/form-data" in ctype and path.endswith("/sendDocument"):
+            with st.lock:
+                if st.fail_upload:
+                    self._send(400, {"ok": False, "description": "simulated upload failure"})
+                    return
+                filename, file_bytes = _extract_multipart(ctype, raw)
+                st.document_uploads.append({"filename": filename, "size": len(file_bytes)})
+                fid = st.upload_file_id
+                self._send(200, {
+                    "ok": True,
+                    "result": {"document": {"file_id": fid, "file_name": filename, "file_size": len(file_bytes)}},
+                })
+            return
+
         try:
             req = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError:
             req = {}
-        path = urllib.parse.urlparse(self.path).path
-        st = self.state
         with st.lock:
             if path.endswith("/getMe"):
                 self._send(200, {"ok": True, "result": {"id": 1, "username": st.bot_username, "first_name": "DrHiro"}})
@@ -94,6 +156,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path.endswith("/sendMessage"):
                 st.sent_messages.append(req)
                 self._send(200, {"ok": True, "result": {"message_id": len(st.sent_messages), **req}})
+            elif path.endswith("/sendDocument"):
+                # Sending by file_id (JSON body) — record and confirm.
+                st.document_sends.append(req)
+                self._send(200, {"ok": True, "result": {"document": {"file_id": req.get("document", "")}}})
             elif path.endswith("/sendChatAction"):
                 st.chat_actions.append(req)
                 self._send(200, {"ok": True, "result": True})

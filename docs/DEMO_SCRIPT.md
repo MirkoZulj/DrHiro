@@ -47,6 +47,16 @@ Using the bot from the **authorized username**:
 5. Bot confirms the brief was exported (returns the file path inside the container).
 6. Optionally show `get_service_status`.
 
+## Scene 4b — APK distribution (30–45 s)
+
+1. Show the signed `drhiro-bridge.apk` + `apk.json` in `./apk/` on the server.
+2. Run `./scripts/apk-verify.sh` (checksum OK) and `./scripts/apk-info.sh`.
+3. From the authorized user, send `/apkinfo` → shows version, size, SHA-256.
+4. Send `/apk` → the bot sends the signed APK as a Telegram document with the
+   version/checksum caption.
+5. Optionally show a second `/apk` reusing the stored `file_id` (no re-upload).
+6. Blur any real token/key; never show the stored `file_id` value.
+
 ## Scene 5 — Safety & architecture recap (30 s)
 
 - Show the architecture diagram (docs/ARCHITECTURE.md).

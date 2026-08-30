@@ -78,6 +78,69 @@ class TelegramClient:
             payload["reply_markup"] = reply_markup
         return self._call("sendMessage", payload)
 
+    def send_document_file_id(self, chat_id: int, file_id: str, caption: str = "") -> dict:
+        """Send a previously-uploaded document by its file_id (no re-upload)."""
+        payload: dict = {"chat_id": chat_id, "document": file_id}
+        if caption:
+            payload["caption"] = caption
+        return self._call("sendDocument", payload)
+
+    def send_document_file(
+        self, path: str, filename: str | None = None, caption: str = ""
+    ) -> str:
+        """Upload a local file as a document (multipart/form-data) and return
+        the Telegram file_id. Used to register the APK on first setup."""
+        from pathlib import Path
+
+        filename = filename or Path(path).name
+        boundary = "----drhiro" + __import__("uuid").uuid4().hex
+        with open(path, "rb") as f:
+            file_bytes = f.read()
+
+        parts: list[bytes] = []
+        # Optional caption part
+        if caption:
+            parts.append(
+                (
+                    f"--{boundary}\r\n"
+                    'Content-Disposition: form-data; name="caption"\r\n\r\n'
+                    f"{caption}\r\n"
+                ).encode("utf-8")
+            )
+        # File part
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="document"; '
+                f'filename="{filename}"\r\n'
+                "Content-Type: application/vnd.android.package-archive\r\n\r\n"
+            ).encode("utf-8")
+        )
+        parts.append(file_bytes)
+        parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        body = b"".join(parts)
+
+        url = f"{self._api}/sendDocument"
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise TelegramError(f"Telegram sendDocument HTTP {e.code}: {e.reason}") from e
+        except urllib.error.URLError as e:
+            raise TelegramError(f"Telegram sendDocument unreachable: {e.reason}") from e
+        if not result.get("ok"):
+            raise TelegramError(f"Telegram sendDocument error: {result.get('description')}")
+        doc = result.get("result", {}).get("document", {})
+        file_id = doc.get("file_id")
+        if not file_id:
+            raise TelegramError("Telegram sendDocument returned no file_id")
+        return file_id
+
     # ------------------------------------------------------------------ #
     # Webhook / polling conflict management
     # ------------------------------------------------------------------ #

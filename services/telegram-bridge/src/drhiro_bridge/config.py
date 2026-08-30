@@ -13,9 +13,14 @@ class Config:
     def __init__(self) -> None:
         self.bot_token: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self.allowed_username: str = os.environ.get("TELEGRAM_ALLOWED_USERNAME", "")
+        # Numeric user id, resolved after first successful verification and then
+        # trusted as an additional authorization key.
+        self.allowed_user_id: str = os.environ.get("TELEGRAM_ALLOWED_USER_ID", "")
         self.trueforge_url: str = os.environ.get("TRUEFORGE_URL", "http://trueforge:8790")
         self.agent_name: str = os.environ.get("TRUEFORGE_AGENT", "drhiro")
         self.poll_timeout: int = int(os.environ.get("POLL_TIMEOUT", "30"))
+        self.apk_dir: str = os.environ.get("APK_DIR", "/data/apk")
+        self.apk_max_size_mb: int = int(os.environ.get("APK_MAX_SIZE_MB", "45"))
         self.debug: bool = os.environ.get("DRHIRO_DEBUG", "false").lower() == "true"
 
     def validate(self) -> list[str]:

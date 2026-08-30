@@ -15,7 +15,7 @@ python -m pytest tests/ -v
 ## Result (2026-08-30)
 
 ```
-31 passed in ~10s
+42 passed in ~15s
 ```
 
 ## Test coverage by requirement
@@ -66,6 +66,16 @@ python -m pytest tests/ -v
 - `test_allowed_save_after_confirmation` — full flow: message → prompt → Allow → resume →
   reply delivered, decision recorded as `allow`.
 - `test_allowed_save_via_deny_does_not_approve`
+
+### 9. APK distribution (mocked Telegram)
+- `test_authorized_apk_sends_expected_file_id` — authorized `/apk` uploads then sends the expected `file_id`.
+- `test_unauthorized_apk_is_denied` — no upload/send for an unauthorized user.
+- `test_missing_apk_fails_safely` / `test_missing_apk_apkinfo_fails_safely`
+- `test_checksum_mismatch_blocks_upload` — tampered APK is refused.
+- `test_apk_over_size_limit_blocks_upload` / `test_apk_over_telegram_hard_limit_blocks_upload`
+- `test_failed_first_upload_does_not_save_false_file_id` — a failed upload persists nothing.
+- `test_later_apk_reuses_stored_file_id` — no re-upload; stored `file_id` is reused.
+- `test_start_and_help_commands` / `test_resolved_user_id_authorizes_apk`
 
 ## Beyond unit tests (manual / integration, documented)
 
