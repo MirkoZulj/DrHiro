@@ -1,75 +1,94 @@
-# drHiro — Self-hosted Health Information Agent on TrueForge
+# drHiro
 
-drHiro is a **privacy-first personal health information agent**. It helps one person
-organize what they want to discuss with their own clinician before an upcoming visit —
-preparing a care-preparation brief, not a diagnosis. It is built on
-[TrueForge](https://trueforge.dev) (the open-source, MIT-licensed agent harness),
-which runs the entire agent execution loop: model calls, tool orchestration, human
-approvals, context management, and session state.
+**Self-hosted, privacy-first health assistant over Telegram with human approvals.**
 
-> **What drHiro does:** records what a user wants to talk about, retrieves a bundled
-> synthetic demo case, and produces a structured, non-diagnostic care-preparation brief.
+drHiro is a single-user, self-hosted personal health information assistant. It runs on
+[TrueForge](https://trueforge.dev) (the open-source, MIT-licensed agent harness), which owns
+the entire agent execution loop — model calls, tool orchestration, human approvals, context
+management, and session state. Telegram is a pure transport; the agent decides, and you
+approve.
+
+> **What drHiro does:** records what you want to discuss with your own clinician, retrieves a
+> bundled synthetic demo case, and produces a structured, non-diagnostic care-preparation
+> brief.
 >
-> **What drHiro does NOT do:** it does **not** diagnose, prescribe, provide emergency
-> triage, act as a medical device, or replace a healthcare professional. All data in
-> this package is **synthetic and explicitly labelled as such**.
+> **What drHiro does NOT do:** it does **not** diagnose, prescribe, provide emergency triage,
+> act as a medical device, or replace a healthcare professional. All data in this package is
+> **synthetic and explicitly labelled as such**.
 
-## Highlights
+## Features
 
-- **TrueForge manages the agent loop.** Telegram is a pure transport; TrueForge owns the
-  model, the tools, approvals, context, and session state.
-- **Long polling by default.** No public domain, no HTTPS webhook, no DNS — a user needs
-  only a bot token. The installer detects an existing webhook and requires explicit
-  confirmation before removing it, and never runs polling and webhook together.
-- **Five inputs only.** Telegram bot token, authorized Telegram username, OpenAI-compatible
-  AI backend base URL, API key (or placeholder), and model name.
-- **Approval-gated export.** Saving a visit brief requires the user's explicit Allow/Deny.
+- **Privacy-first, self-hosted.** Runs on your own Ubuntu host. No cloud dependency, no
+  third-party health storage, no public data plane.
+- **Human approvals.** Exporting a visit brief requires your explicit Allow/Deny in Telegram.
+  The agent asks before any approved action.
+- **Single-user, authorized by username.** Only the configured Telegram username reaches the
+  agent.
+- **Long polling by default.** No public domain, no HTTPS webhook, no DNS — you need only a
+  bot token. The installer detects an existing webhook and requires explicit confirmation
+  before removing it, and never runs polling and webhook together.
 - **Structured output validation.** The agent's replies are validated against a JSON schema.
 - **Synthetic data only.** Zero real health data ships in or out of this package.
 - **APK distribution via your bot.** The signed drHiro Bridge Android app is served by your
   own Telegram bot (`/apk`), with checksum verification and persisted `file_id` — no public
-  APK host or QR pairing. See [docs/APK_DISTRIBUTION.md](docs/APK_DISTRIBUTION.md).
-- **Secure Bridge pairing.** A short-lived, single-use pairing token (bound to your Telegram
-  user) links the Android Bridge to your server via a `drhiro://pair` deep link. No server
-  credentials or permanent tokens are ever embedded in the APK. See
+  APK host. See [docs/APK_DISTRIBUTION.md](docs/APK_DISTRIBUTION.md).
+- **Secure Bridge pairing.** A short-lived, single-use pairing token bound to your Telegram
+  user links the Android Bridge to your server via a `drhiro://pair` deep link. No server
+  credentials or permanent tokens are embedded in the APK. See
   [docs/BRIDGE_PAIRING.md](docs/BRIDGE_PAIRING.md).
 
-## How TrueForge is used
+## Architecture
 
 ```
-Telegram user
-  → telegram-bridge      long-polling transport (authorized-user gate)
-  → TrueForge            agent execution loop (model, tools, approvals, context, sessions)
-  → drhiro-tools         MCP server — the four tools (synthetic data)
+Telegram
+   │  long-polling transport (authorized-user gate)
+   ▼
+Pairing / approval bridge      short-lived single-use pairing tokens,
+   │                           Allow/Deny approval prompts, command handling
+   ▼
+TrueForge runtime              agent execution loop: model calls, tool
+   │                           orchestration, approvals, context, sessions
+   ▼
+MCP tools                      the bundled tools the agent calls (synthetic data)
+   ▼
+Model backend                  any OpenAI-compatible endpoint (cloud or local)
 ```
 
-- **TrueForge runs the agent loop.** It owns the model calls, the reasoning, the tool
-  orchestration, human-approval pauses, context compaction, and persistent per-user sessions.
-- **The agent calls real tools** exposed as an MCP server (`drhiro-tools`):
-  - `get_demo_case` — read-only synthetic fixture retrieval
-  - `create_visit_brief` — structured non-diagnostic care-preparation output
-  - `save_visit_brief` — **approval-gated** persistent/export action
-  - `get_service_status` — non-sensitive status for authorized users
-- **Approvals.** `save_visit_brief` is declared in `require_approval_for_tools`, so TrueForge
-  pauses with `tool.approval_required`; the bridge asks the user Allow/Deny in Telegram and
-  resumes with `user.tool_approval`.
-- **Structured output.** The agent spec declares `response_format: json_schema`.
-- **Session context safely.** One persistent TrueForge session per conversation, scoped to
-  the authorized user, operating only on synthetic data.
+- **TrueForge runs the agent loop.** It owns the model calls, reasoning, tool orchestration,
+  human-approval pauses, context compaction, and persistent per-user sessions.
+- **The pairing/approval bridge** is the thin layer between Telegram and TrueForge: it enforces
+  the authorized-user gate, mints one-use pairing tokens, and surfaces Allow/Deny approval
+  prompts from the agent.
+- **The agent calls real MCP tools**, exposed over MCP: retrieval of a synthetic demo case,
+  creation of a structured care-preparation brief, an approval-gated export action, and a
+  non-sensitive status read.
+- **The model backend** is any OpenAI-compatible endpoint — cloud or a local server.
 
 The agent spec lives in [`agent/drhiro.agent.json`](agent/drhiro.agent.json).
 
 ## Quick start
 
 ```bash
-# 1. Download / clone this repository onto Ubuntu 22.04 or 24.04.
+# 1. Clone this repository onto Ubuntu 22.04 or 24.04.
 # 2. Run the installer as root (or with sudo):
 sudo ./install.sh
-# 3. Answer the five prompts.
+# 3. Answer the five prompts (bot token, username, model backend URL, key, model).
 # 4. The stack builds, starts, health-checks, and provisions TrueForge automatically.
 ```
 
 See [docs/INSTALL.md](docs/INSTALL.md) for the full step-by-step guide.
+
+### Pairing flow
+
+To link the Android Bridge to your server, the server must be reachable from the device over a
+public address. Set `DRHIRO_PUBLIC_URL` (e.g. `https://bridge.example.com`) either when the
+installer prompts, or later in `.env`. With it set, the bot mints a short-lived, single-use
+pairing link via `/pair` (or `/apk`). The Android Bridge opens the `drhiro://pair` deep link,
+exchanges a one-time token bound to your Telegram user, and is linked — no server credentials
+ever reach the device.
+
+If `DRHIRO_PUBLIC_URL` is unset, pairing commands refuse to mint an unreachable link and you
+get a clear warning.
 
 ## Configuration variables
 
@@ -80,12 +99,31 @@ All values are provided interactively by `install.sh` and written to a protected
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token (from @BotFather). Never exposed. |
 | `TELEGRAM_ALLOWED_USERNAME` | Yes | Authorized Telegram username (no `@`). Only this user may talk to the bot. |
-| `AI_BACKEND_BASE_URL` | Yes | OpenAI-compatible AI backend base URL (e.g. `https://api.openai.com/v1` or a local `http://host:8000/v1`). |
-| `AI_API_KEY` | Yes | AI backend API key, or any placeholder (`local`) for a local model that ignores auth. |
+| `AI_BACKEND_BASE_URL` | Yes | OpenAI-compatible AI backend base URL (cloud or local). |
+| `AI_API_KEY` | Yes | AI backend API key, or any placeholder for a local model that ignores auth. |
 | `AI_MODEL` | Yes | Model name advertised by the backend. |
-| `TRUEFORGE_PORT` | No | TrueForge admin UI port (default `8790`). |
-| `TRUEFORGE_AGENT` | No | TrueForge agent name (default `drhiro`). |
+| `DRHIRO_PUBLIC_URL` | No | Public URL the Android device reaches the server at for pairing. Enables `/pair` and `/apk`. |
+| `TRUEFORGE_PORT` | No | TrueForge HTTP port (default `8790`). |
+| `TF_POSTGRES_PORT` | No | TrueForge Postgres host port (default `5433`). |
+| `TF_REDIS_PORT` | No | TrueForge Redis host port (default `6380`). |
+| `EXPORT_DIR` | No | Where saved visit briefs are exported (default `/data/exports`). |
+| `APK_DIR` | No | Host directory holding the signed Bridge APK + sidecar (default `./apk`). |
 | `DRHIRO_DEBUG` | No | `true` enables debug logs (default `false`). |
+
+## Roadmap
+
+- **Production MCP servers as pinned artifacts.** This package ships synthetic example tools so
+  the full stack can be evaluated end-to-end with no private data. The roadmap replaces those
+  with **real MCP servers published as pinned, installable artifacts** — versioned, checksum
+  pinned, and fetched by the installer by artifact reference rather than by mutable clone — so
+  a production deployment wires its own tool servers the same way it wires its own model
+  backend. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current design.
+- **Extended demo coverage** (installer-to-approval walkthrough video).
+- **Qodo code-review evidence** on the merged release branch (see
+  [docs/PUBLIC_RELEASE_AUDIT.md](docs/PUBLIC_RELEASE_AUDIT.md)).
+
+## Scope of this package
+This repository ships with synthetic example tools so the full stack — install, Telegram pairing, human approvals, agent runtime — can be evaluated end-to-end with no private data or credentials. A production deployment connects its own MCP servers via the tool configuration; no real health data, tokens, or secrets are required or included.
 
 ## Safety & privacy boundaries
 
@@ -99,8 +137,7 @@ All values are provided interactively by `install.sh` and written to a protected
 
 ## Bot commands
 
-The bot answers commands from the authorized user (plus agent conversation for anything
-else):
+The bot answers commands from the authorized user (plus agent conversation for anything else):
 
 | Command | What it does |
 |---|---|
@@ -112,19 +149,6 @@ else):
 | `/revoke <device>` | Revoke a linked device (after confirmation) |
 | `/status` | Non-sensitive server + APK status |
 | `/help` | Explain commands and Android installation |
-
-## Demo video
-
-> 🎬 **Demo video placeholder.** A recorded walkthrough of installing the package on a clean
-> Ubuntu 22.04 host, running a full conversation (including an approval), and downloading the
-> drHiro Bridge APK via `/apk` will be linked here once recorded.
-
-## Qodo Code Review Evidence
-
-> **Placeholder.** A single substantive feature branch was prepared and opened for review
-> through the Qodo (formerly CodiumAI) code-review workflow. Once a Qodo-reviewed PR is
-> merged, the actual PR URL and a factual summary of the review findings and remediations
-> will replace this placeholder. No backdated or fabricated review evidence is included.
 
 ## Documentation
 
