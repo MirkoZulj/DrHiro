@@ -71,3 +71,49 @@ def test_unauthorized_user_cannot_trigger_save(bridge, mock_tg, mock_tf):
     assert mock_tf["state"].sessions_created == 0
     last = mock_tg["state"].last_message_text()
     assert "authorized" in last.lower()
+
+
+def test_unauthorized_callback_sender_is_denied(bridge, mock_tg, mock_tf):
+    """Finding #1: an unauthorized user who presses Allow/Deny must be rejected
+    BEFORE pending approval state is consumed or TrueForge is resumed."""
+    mock_tf["state"].approval_needed = True
+    bridge.cfg.allowed_username = "alice"
+    bridge.tg._api = f"{mock_tg['base']}/bottok"
+
+    # Authorized user requests the save -> approval prompt pending.
+    _enqueue_and_process(bridge, mock_tg, chat_id=222, text="save the brief", username="alice")
+    assert 222 in bridge._pending_approvals
+
+    # Unauthorized user (eve) presses Allow via the callback.
+    mock_tg["state"].enqueue_callback(
+        "cb-eve", chat_id=222, data=_APPROVE, from_user={"id": 999, "username": "eve"}
+    )
+    cb_update = mock_tg["state"].callback_queue.pop(0)
+    bridge._process_update(cb_update)
+
+    # The pending approval must still be intact (NOT consumed), and no resume
+    # happened (no 'allow' recorded, no TrueForge turn).
+    assert 222 in bridge._pending_approvals
+    assert mock_tf["state"].approval_decisions == []
+    assert "authorized" in mock_tg["state"].last_message_text().lower()
+
+
+def test_authorized_callback_sender_can_approve(bridge, mock_tg, mock_tf):
+    """Finding #1 (positive): the configured user pressing Allow through the
+    full _process_update path (with callback authorization) approves the save."""
+    mock_tf["state"].approval_needed = True
+    mock_tf["state"].reply_text = "Brief saved."
+    bridge.cfg.allowed_username = "alice"
+    bridge.tg._api = f"{mock_tg['base']}/bottok"
+
+    _enqueue_and_process(bridge, mock_tg, chat_id=222, text="save the brief", username="alice")
+    assert 222 in bridge._pending_approvals
+
+    mock_tg["state"].enqueue_callback(
+        "cb-ok", chat_id=222, data=_APPROVE, from_user={"id": 111, "username": "alice"}
+    )
+    cb_update = mock_tg["state"].callback_queue.pop(0)
+    bridge._process_update(cb_update)
+
+    assert "allow" in mock_tf["state"].approval_decisions
+    assert mock_tf["state"].reply_text in mock_tg["state"].last_message_text()

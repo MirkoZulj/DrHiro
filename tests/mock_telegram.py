@@ -60,15 +60,19 @@ class MockTelegramState:
                 },
             })
 
-    def enqueue_callback(self, callback_id: str, chat_id: int, data: str) -> None:
+    def enqueue_callback(self, callback_id: str, chat_id: int, data: str,
+                         from_user: dict | None = None) -> None:
+        cb = {
+            "id": callback_id,
+            "data": data,
+            "message": {"chat": {"id": chat_id}, "message_id": 1},
+        }
+        if from_user:
+            cb["from"] = from_user
         with self.lock:
             self.callback_queue.append({
                 "update_id": 90000 + len(self.callback_queue),
-                "callback_query": {
-                    "id": callback_id,
-                    "data": data,
-                    "message": {"chat": {"id": chat_id}, "message_id": 1},
-                },
+                "callback_query": cb,
             })
 
     def last_message_text(self) -> str:

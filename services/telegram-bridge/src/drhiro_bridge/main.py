@@ -53,6 +53,23 @@ def _authorized(message: dict, cfg: Config) -> bool:
     return False
 
 
+def _authorized_callback(cb: dict, cfg: Config) -> bool:
+    """Authorize the user who pressed an inline button (callback_query.from).
+
+    Callback updates carry the presser's identity in `from`, not in a `message`
+    field, so they are routed through their own authorization check before any
+    pending approval state is consumed or TrueForge is resumed.
+    """
+    sender = cb.get("from") or {}
+    user = sender.get("username") or ""
+    if user and user.lower() == cfg.allowed_username.lower():
+        return True
+    sender_id = sender.get("id")
+    if cfg.allowed_user_id and sender_id is not None:
+        return str(sender_id) == str(cfg.allowed_user_id)
+    return False
+
+
 def _extract_text(message: dict) -> str:
     return (message.get("text") or "").strip()
 
@@ -163,9 +180,20 @@ class Bridge:
 
     # ------------------------------------------------------------------ #
     def _process_update(self, update: dict) -> None:
-        # Callback query = user answered an approval prompt.
+        # Callback query = user answered an approval prompt. Authorize the
+        # sender (callback_query.from) BEFORE consuming pending approval state
+        # or resuming TrueForge — otherwise any group member could Allow/Deny
+        # the configured user's gated action.
         cb = update.get("callback_query")
         if cb:
+            if not _authorized_callback(cb, self.cfg):
+                chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
+                if chat_id is not None:
+                    log.info("Ignoring callback from unauthorized sender (chat=%s)", chat_id)
+                    self.tg.send_message(
+                        chat_id, "Sorry, you are not authorized to use this bot."
+                    )
+                return
             self._handle_callback(cb)
             return
 
