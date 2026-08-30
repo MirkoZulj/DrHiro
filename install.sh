@@ -245,9 +245,17 @@ info "Protected .env written (mode 600)."
 # ---------------------------------------------------------------------------
 if [[ ! -d "$SCRIPT_DIR/trueforge-src/.git" ]]; then
   info "Cloning TrueForge (MIT) source for hosted-mode build (one-time)..."
-  git clone --depth 1 --branch "v${TRUEFORGE_VERSION:-0.1.4}" \
-    https://github.com/truefoundry/trueforge.git "$SCRIPT_DIR/trueforge-src" \
-    || git clone --depth 1 https://github.com/truefoundry/trueforge.git "$SCRIPT_DIR/trueforge-src"
+  # Qodo #12: do NOT silently fall back to the unpinned default branch. The
+  # production image is built directly from this clone, so it must stay pinned
+  # to the requested tag/commit. If the pinned clone fails, abort with a clear
+  # message instead of deploying an unintended revision.
+  if ! git clone --depth 1 --branch "v${TRUEFORGE_VERSION:-0.1.4}" \
+    https://github.com/truefoundry/trueforge.git "$SCRIPT_DIR/trueforge-src"; then
+    rm -rf "$SCRIPT_DIR/trueforge-src"
+    fail "Failed to clone TrueForge at the pinned tag v${TRUEFORGE_VERSION:-0.1.4}. "
+         "Aborting to avoid deploying an unpinned upstream revision. Set "
+         "TRUEFORGE_VERSION to a valid tag and rerun."
+  fi
 fi
 
 info "Building and starting the stack (first build can take several minutes)..."

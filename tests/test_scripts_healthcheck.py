@@ -160,3 +160,36 @@ def test_configure_sh_syntax():
     r = subprocess.run(["bash", "-n", os.path.join(SCRIPTS_DIR, "configure.sh")],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+# ---------------------------------------------------------------------- #
+# Qodo #12 — installer must not silently drop the TrueForge source pin
+# ---------------------------------------------------------------------- #
+def test_installer_has_no_unpinned_trueforge_fallback():
+    """Qodo #12: install.sh must not silently clone the unpinned default branch
+    when the pinned tag clone fails. Every TrueForge clone must carry --branch
+    (or a commit pin)."""
+    install = os.path.join(os.path.dirname(SCRIPTS_DIR), "install.sh")
+    text = open(install).read()
+    # The pinned clone spans a line continuation, so scan the whole text (minus
+    # whitespace/newlines) for the clone command fragments.
+    import re
+    # Find every git-clone invocation of trueforge.git with its flags.
+    # Join continuation lines, then check each clone block carries --branch.
+    joined = re.sub(r"\\\n", " ", text)
+    # Every `git clone ... trueforge.git` must include an explicit --branch.
+    for m in re.finditer(r"git clone ([^\n;]*trueforge\.git)", joined):
+        block = m.group(1)
+        assert "--branch" in block or "--commit" in block or "--depth 1 --branch" in block, \
+            f"unpinned TrueForge clone: {block.strip()}"
+    # No fallback clone without a pin: each clone fragment must mention a pin.
+    unpinned = [m.group(1).strip() for m in re.finditer(r"git clone ([^\n;]*trueforge\.git)", joined)
+                if "--branch" not in m.group(1) and "--commit" not in m.group(1)]
+    assert unpinned == [], "installer must not fall back to an unpinned TrueForge clone"
+
+
+def test_installer_syntax():
+    """install.sh must pass bash -n."""
+    install = os.path.join(os.path.dirname(SCRIPTS_DIR), "install.sh")
+    r = subprocess.run(["bash", "-n", install], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
