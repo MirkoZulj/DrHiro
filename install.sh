@@ -141,6 +141,22 @@ if [[ -z "$AI_MODEL" ]]; then
   [[ -n "$AI_MODEL" ]] || fail "Model name is required."
 fi
 
+# 4.6 (OPTIONAL) Pairing public URL — reachable by the Android Bridge.
+# The Android device reaches the server for pairing over this address. It must
+# be an HTTPS (or trusted-LAN) URL the phone can reach, fronted by a reverse
+# proxy that forwards to the internal pairing port. If left blank, pairing
+# commands (/pair, /apk) will refuse to mint an unreachable link.
+DRHIRO_PUBLIC_URL=""
+if grep -q '^DRHIRO_PUBLIC_URL=.\\+' "$ENV_FILE"; then
+  DRHIRO_PUBLIC_URL="$(grep '^DRHIRO_PUBLIC_URL=' "$ENV_FILE" | cut -d= -f2-)"
+fi
+if [[ -z "$DRHIRO_PUBLIC_URL" ]]; then
+  read -rp "Pairing public URL the Android device reaches the server at (e.g. https://bridge.example.com; ENTER to skip): " DRHIRO_PUBLIC_URL
+  if [[ -z "$DRHIRO_PUBLIC_URL" ]]; then
+    warn "DRHIRO_PUBLIC_URL not set — Android Bridge pairing will be unavailable until it is configured in .env."
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # 5. Validate Telegram token WITHOUT exposing it
 # ---------------------------------------------------------------------------
@@ -219,6 +235,7 @@ TELEGRAM_ALLOWED_USERNAME=${ALLOWED_USER}
 AI_BACKEND_BASE_URL=${AI_BASE_URL}
 AI_API_KEY=${AI_API_KEY}
 AI_MODEL=${AI_MODEL}
+DRHIRO_PUBLIC_URL=${DRHIRO_PUBLIC_URL}
 EOF
 chmod 600 "$ENV_FILE"
 info "Protected .env written (mode 600)."

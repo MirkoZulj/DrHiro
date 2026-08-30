@@ -278,3 +278,38 @@ def test_http_token_only_exchange_succeeds(tmp_path):
     # The device is owned by the token-bound user.
     assert m.list_devices("user-1")[0]["device_id"] == result["device_id"]
     server.shutdown()
+
+
+def test_pairing_refuses_when_public_url_unset(bridge, mock_tg, mock_tf, tmp_path):
+    """Qodo #3: when DRHIRO_PUBLIC_URL is unset, /pair must refuse to mint an
+    unreachable localhost deep link and instead surface an actionable message —
+    no unreachable pairing link may be generated."""
+    import tempfile
+
+    from drhiro_bridge.config import Config
+    from drhiro_bridge.main import Bridge
+    from drhiro_bridge.pairing import PairingManager
+
+    # Fresh bridge with pairing_state in a temp dir and NO public URL.
+    cfg = Config()
+    cfg.bot_token = "123456:TESTTOKEN"
+    cfg.allowed_username = "alice"
+    cfg.trueforge_url = mock_tf["base"]
+    cfg.agent_name = "drhiro"
+    cfg.poll_timeout = 2
+    cfg.pairing_state_dir = tempfile.mkdtemp(prefix="pairtest3")
+    cfg.server_public_url = ""  # unset -> pairing must refuse
+    b = Bridge(cfg)
+    b.tg._api = f"{mock_tg['base']}/bottok"
+
+    mock_tg["state"].enqueue_update(800, 555, "/pair", "alice")
+    upd = mock_tg["state"].update_queue.pop(0)
+    b._process_update(upd)
+
+    last = mock_tg["state"].last_message_text()
+    assert "DRHIRO_PUBLIC_URL" in last
+    # No deep-link button / no unreachable localhost link was sent.
+    assert "localhost" not in last
+    # No pairing token was created for the chat user.
+    tokens = [t for t in b.pairing._data["tokens"].values() if not t.get("used")]
+    assert tokens == []

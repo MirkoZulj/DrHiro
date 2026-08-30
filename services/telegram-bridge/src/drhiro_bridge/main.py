@@ -306,11 +306,20 @@ class Bridge:
 
     # -- APK / status / help commands -------------------------------- #
     def _server_public_url(self) -> str:
-        """The URL the Android Bridge uses to reach this server for pairing."""
+        """The URL the Android Bridge uses to reach this server for pairing.
+
+        Must be a reachable HTTPS (or trusted-LAN) URL. If DRHIRO_PUBLIC_URL is
+        unset we refuse to mint a pairing link rather than silently embedding
+        http://localhost (which on the phone points to the phone, not the
+        server), so pairing can never produce an unreachable deep link.
+        """
         if self.cfg.server_public_url:
             return self.cfg.server_public_url
-        # Default: localhost over the pairing HTTP port (dev / LAN).
-        return f"http://localhost:{self.cfg.pairing_http_port}"
+        raise ValueError(
+            "Pairing requires a reachable server URL: set DRHIRO_PUBLIC_URL to an "
+            "HTTPS (or trusted-LAN) address the Android device can reach, and make "
+            "sure the pairing port is exposed via a reverse proxy or host mapping."
+        )
 
     def _connect_button(self, link: str) -> dict:
         return {"inline_keyboard": [[{"text": "🔗 Connect drHiro Bridge", "url": link}]]}
@@ -340,7 +349,12 @@ class Bridge:
         from .pairing import RateLimitedError
 
         user_id = self._chat_user_id(chat_id)
-        server = self._server_public_url()
+        try:
+            server = self._server_public_url()
+        except ValueError as e:
+            # DRHIRO_PUBLIC_URL not configured — no unreachable link allowed.
+            self.tg.send_message(chat_id, str(e), parse_mode=None)
+            return
         try:
             created = self.pairing.create_token(user_id, server)
         except RateLimitedError as e:
