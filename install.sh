@@ -205,22 +205,22 @@ fi
 # ---------------------------------------------------------------------------
 info "Validating AI backend connectivity and model availability..."
 MODELS_JSON="$(curl -sS -m 30 "${AI_BASE_URL%/}/models" -H "Authorization: Bearer ${AI_API_KEY}" 2>/dev/null || true)"
-if python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); assert "data" in d' <<<"$MODELS_JSON" 2>/dev/null; then
-  if python3 - "$AI_MODEL" <<<"$MODELS_JSON" 2>/dev/null; then
-    :
-  else
-    FOUND="$(python3 - "$AI_MODEL" <<'PY'
-import sys,json
-model=sys.argv[1]
-d=json.load(sys.stdin)
-ids=[m.get("id","") for m in d.get("data",[])]
-sys.exit(0 if any(model==i or model in i for i in ids) else 1)
-PY
-    )" || true
-    if [[ -z "$FOUND" && -n "$MODELS_JSON" ]]; then
-      warn "Model '$AI_MODEL' not obviously listed in /models. TrueForge will confirm at run time."
-    fi
-  fi
+# Qodo #10: parse the /models JSON and compare AI_MODEL against returned IDs —
+# never execute the response as a Python program.
+MODEL_MATCH="$(AI_MODEL_SAFE="$AI_MODEL" python3 -c 'import sys,json,os
+model=os.environ["AI_MODEL_SAFE"]
+try:
+    d=json.load(sys.stdin)
+    ids=[m.get("id","") for m in d.get("data",[])]
+    sys.exit(0 if any(model==i or model in i for i in ids) else 1)
+except Exception:
+    sys.exit(2)' <<<"$MODELS_JSON" 2>/dev/null; echo $?)"
+if [[ "$MODEL_MATCH" == "0" ]]; then
+  info "Model '$AI_MODEL' confirmed available."
+elif [[ "$MODEL_MATCH" == "1" ]]; then
+  warn "Model '$AI_MODEL' not listed in /models — TrueForge will confirm at run time."
+elif [[ "$MODEL_MATCH" == "2" ]]; then
+  warn "Could not parse /models response (non-fatal; connectivity will be rechecked at startup)."
 else
   warn "Could not list models from $AI_BASE_URL (non-fatal; connectivity will be rechecked at startup)."
 fi

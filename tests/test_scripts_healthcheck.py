@@ -13,6 +13,17 @@ import pytest
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "scripts")
 
+# The Python snippet used by install.sh to validate AI_MODEL against /models.
+# Qodo #10: it must PARSE the JSON and compare IDs — never execute it as code.
+_MODEL_CHECK = '''import sys,json,os
+model=os.environ["AI_MODEL_SAFE"]
+try:
+    d=json.load(sys.stdin)
+    ids=[m.get("id","") for m in d.get("data",[])]
+    sys.exit(0 if any(model==i or model in i for i in ids) else 1)
+except Exception:
+    sys.exit(2)'''
+
 
 @pytest.fixture()
 def stub_bin(tmp_path):
@@ -92,3 +103,34 @@ exit 0
     code, out = _run_health_check(stub_bin)
     assert code == 0
     assert "ALL CHECKS PASSED." in out
+
+
+# ---------------------------------------------------------------------- #
+# Qodo #10 — installer model validation must parse JSON, not execute it
+# ---------------------------------------------------------------------- #
+def _run_model_check(models_json, model):
+    env = dict(os.environ)
+    env["AI_MODEL_SAFE"] = model
+    r = subprocess.run(
+        ["python3", "-c", _MODEL_CHECK],
+        input=models_json, capture_output=True, text=True, env=env,
+    )
+    return r.returncode
+
+
+def test_model_validation_matches_when_present():
+    """Qodo #10: a listed model must be accepted (exit 0)."""
+    models = '{"data":[{"id":"gpt-4o-mini"},{"id":"gpt-4o"}]}'
+    assert _run_model_check(models, "gpt-4o-mini") == 0
+
+
+def test_model_validation_rejects_missing_model():
+    """Qodo #10: an unlisted model must be rejected (exit 1) — previously the
+    installer could "succeed" by executing the JSON as a Python program (a JSON
+    object IS valid Python source and runs successfully regardless of the model)."""
+    models = '{"data":[{"id":"gpt-4o-mini"},{"id":"gpt-4o"}]}'
+    # Confirms the dangerous premise: JSON-as-Python runs and exits 0.
+    assert subprocess.run(["python3"], input=models, capture_output=True,
+                          text=True).returncode == 0
+    # The correct validator rejects an unlisted model.
+    assert _run_model_check(models, "does-not-exist") == 1
