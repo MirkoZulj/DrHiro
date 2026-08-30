@@ -1,4 +1,4 @@
-# drHiro — Privacy-first Health Information Agent on TrueForge
+# drHiro — Self-hosted Health Information Agent on TrueForge
 
 drHiro is a **privacy-first personal health information agent**. It helps one person
 organize what they want to discuss with their own clinician before an upcoming visit —
