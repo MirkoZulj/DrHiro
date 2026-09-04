@@ -64,7 +64,19 @@ export default function SystemSettings() {
       const res = await authClient.api('/settings', { method: 'PUT', body: JSON.stringify(payload) })
       setData(res)
       setAiKeyNew(''); setBotTokenNew('')
-      setSavedMsg('Settings saved. Some changes apply on the next service restart / re-provision.')
+      // Determine which services will be restarted so the user understands the
+      // apply model. (Field-name only; never a value.)
+      const needsBridge = ('telegram_bot_token' in payload) || ('telegram_allowed_username' in payload)
+      const needsOpenclaw = ('telegram_bot_token' in payload) || ('model_name' in payload) ||
+        ('ai_backend_url' in payload) || ('ai_api_key' in payload)
+      const needsTrueforge = ('model_name' in payload) || ('ai_backend_url' in payload) || ('ai_api_key' in payload)
+      const notes: string[] = []
+      if (needsBridge) notes.push('Telegram bridge restarting — ~10 seconds')
+      if (needsOpenclaw) notes.push('OpenClaw gateway restarting — ~10 seconds')
+      if (needsTrueforge) notes.push('TrueForge re-provisioning (agent + model) — ~30 seconds')
+      setSavedMsg(notes.length
+        ? 'Saved. ' + notes.join(' · ')
+        : 'Saved. Applied immediately.')
     } catch (e) {
       setError('Save failed: ' + String(e))
     } finally {
