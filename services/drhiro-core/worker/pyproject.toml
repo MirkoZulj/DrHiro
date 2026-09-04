@@ -1,0 +1,15 @@
+[project]
+name = "drhiro-worker"
+version = "0.1.0"
+description = "drHiro async worker: reminders, aggregates, summaries, alert recompute"
+requires-python = ">=3.11"
+dependencies = [
+    "rq>=1.16,<2",
+    "redis>=5.0,<6",
+    "sqlalchemy>=2.0.30,<3",
+    "psycopg[binary]>=3.2,<4",
+    "drhiro-api>=0.1.0,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
