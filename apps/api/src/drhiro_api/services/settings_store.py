@@ -114,3 +114,48 @@ def apply_updates(db: Session, updates: dict) -> AppSetting:
         if isinstance(payload, str):
             setattr(row, field, payload if payload else None)
     return row
+
+
+# --- Runtime resolution (services read from the store, .env as fallback) ---
+
+_AI_URL_FIELD = "ai_backend_url"
+_MODEL_FIELD = "model_name"
+_AI_KEY_FIELD = "ai_api_key"
+_TG_TOKEN_FIELD = "telegram_bot_token"
+_TG_USERNAME_FIELD = "telegram_allowed_username"
+
+
+def resolve_runtime(db: Session, env: dict) -> dict:
+    """Return the effective runtime settings, store-first with .env fallback.
+
+    Used by services that need the editable fields at call time. The
+    ``app_settings`` row is authoritative where set; otherwise the bootstrap
+    environment value (from .env, which install.sh seeded on first boot) is
+    the fallback. Only the api/worker call this (they have a DB session); the
+    env-only consumers (telegram-bridge, trueforge, openclaw) are re-provisioned
+    from the store on save and recreated, so their env reflects the store.
+
+    Returns:
+        {
+          "ai_backend_url": str|None,
+          "model_name": str|None,
+          "ai_api_key": str|None,   # may be None (not configured)
+          "telegram_bot_token": str|None,
+          "telegram_allowed_username": str|None,
+        }
+    """
+    row = get_row(db)
+    def _pick(field: str, env_key: str) -> str | None:
+        stored = getattr(row, field, None)
+        if stored:
+            return stored
+        v = env.get(env_key)
+        return v if v else None
+
+    return {
+        "ai_backend_url": _pick(_AI_URL_FIELD, "AI_BACKEND_BASE_URL"),
+        "model_name": _pick(_MODEL_FIELD, "AI_MODEL"),
+        "ai_api_key": _pick(_AI_KEY_FIELD, "AI_API_KEY"),
+        "telegram_bot_token": _pick(_TG_TOKEN_FIELD, "TELEGRAM_BOT_TOKEN"),
+        "telegram_allowed_username": _pick(_TG_USERNAME_FIELD, "TELEGRAM_ALLOWED_USERNAME"),
+    }
