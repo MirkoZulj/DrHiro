@@ -1,0 +1,275 @@
+/**
+ * drHiro Design Tokens
+ * ---------------------------------------------------------------------------
+ * Single source of truth for the drHiro design system. Component code should
+ * consume ONLY these custom properties — never hardcoded hex values.
+ *
+ * Light theme lives on :root. Dark theme overrides on [data-theme="dark"].
+ * Toggle by setting document.documentElement.dataset.theme = 'dark'.
+ *
+ * Naming convention:
+ *   --color-*    color / brand / semantic  --font-*    typography
+ *   --space-*    spacing                    --radius-*  corner radius
+ *   --shadow-*   elevation                  --border-*  border width/style
+ *   --text-*     text roles + type scale
+ *
+ * All text tokens meet WCAG AA (>= 4.5:1) on their surface in both themes.
+ * Missing data is NEVER zero — use --color-missing + dashed borders.
+ */
+
+:root {
+  /* ---- Brand accent: trustworthy teal/green ---------------------------- */
+  --color-accent:            #0E7C66;  /* filled surfaces, bars, sparklines  */
+  --color-accent-hover:      #0B5F4E;  /* primary button hover               */
+  --color-accent-active:     #094B3E;  /* primary button pressed             */
+  --color-accent-text:       #0B5F4E;  /* accent as TEXT on light bg (AA)    */
+  --color-accent-subtle:     #E3F1EC;  /* tinted fills: active tab, chips    */
+  --color-accent-border:     #9CC9BC;  /* subtle accent outline              */
+
+  /* ---- Neutral scale ---------------------------------------------------- */
+  --color-bg:                #F4F6F8;  /* app background                     */
+  --color-surface:           #FFFFFF;  /* cards, inputs, panels              */
+  --color-surface-raised:    #FFFFFF;  /* popovers, menus, sheets            */
+  --color-surface-subtle:    #F1F3F5;  /* hover rows, chips, fills           */
+  --color-border:            #D5DAE0;
+  --color-border-strong:     #AEB6BF;  /* focus, dividers, input borders     */
+
+  /* ---- Text (all AA on their surface) ----------------------------------- */
+  --color-text:              #1A1D21;  /* primary (17.5:1)                   */
+  --color-text-secondary:    #4A5158;  /* secondary (8.1:1)                  */
+  --color-text-muted:        #66707A;  /* captions/helper (5.0:1)            */
+  --color-text-inverse:      #FFFFFF;  /* text on accent-filled surfaces     */
+  --color-text-disabled:     #9AA3AC;  /* disabled controls                  */
+
+  /* ---- Semantic set ----------------------------------------------------- */
+  --color-success:           #1E7B34;  /* filled surface                     */
+  --color-success-text:      #1E7B34;
+  --color-success-tint:      #E6F4EA;
+  --color-warning:           #8A5A00;
+  --color-warning-text:      #8A5A00;
+  --color-warning-tint:      #FBF0DB;
+  --color-danger:            #B02A20;
+  --color-danger-text:       #B02A20;
+  --color-danger-tint:       #FCEBEA;
+  --color-info:              #14508C;
+  --color-info-text:         #14508C;
+  --color-info-tint:         #E6F0F9;
+
+  /* ---- Missing data (MISSING IS NEVER ZERO) ----------------------------- */
+  --color-missing:           #8A9199;  /* dashed outline/underline           */
+  --color-missing-tint:      #F0F2F4;
+  --color-missing-text:      #66707A;  /* "–" placeholder value              */
+
+  /* ---- Data-viz series (each >= 3:1 on both themes) --------------------- */
+  --color-chart-secondary:   #3A7FB7;
+  --color-chart-tertiary:    #7B6CB8;
+  --color-goal:              #2A3A4A;  /* dashed goal/target reference       */
+  --color-macro-protein:     #3A7FB7;
+  --color-macro-carbs:       #C77B2E;
+  --color-macro-fat:         #7B6CB8;
+  --color-macro-sugar:       #C0487C;
+
+  /* ---- Typography scale ------------------------------------------------- */
+  --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 Helvetica, Arial, sans-serif, "Apple Color Emoji",
+                 "Segoe UI Emoji";
+  --font-family-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+                      Consolas, "Liberation Mono", monospace;
+
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 16px;
+  --text-lg: 18px;
+  --text-xl: 22px;
+  --text-2xl: 28px;
+  --text-stat: 34px;
+
+  --leading-tight: 1.1;     /* stat values                                  */
+  --leading-snug: 1.25;     /* large headings                               */
+  --leading-normal: 1.4;    /* titles, labels                               */
+  --leading-relaxed: 1.5;   /* body text                                    */
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* ---- Spacing (4px base grid) ------------------------------------------ */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* ---- Radii ------------------------------------------------------------- */
+  --radius-sm: 8px;      /* buttons, inputs, badges                        */
+  --radius-md: 12px;     /* stat tiles, list items, chips                  */
+  --radius-lg: 16px;     /* cards                                          */
+  --radius-xl: 24px;     /* modals, sheets, empty states                   */
+  --radius-full: 999px;  /* pills, nav tabs                                */
+
+  /* ---- Borders ----------------------------------------------------------- */
+  --border-width: 1px;
+  --border-width-strong: 2px;
+  --border-style: solid;
+  --border-style-dashed: dashed;   /* missing data ONLY                    */
+
+  /* ---- Shadows / elevation ---------------------------------------------- */
+  --shadow-sm: 0 1px 2px rgba(16, 24, 32, 0.06);       /* resting cards    */
+  --shadow-md: 0 2px 8px rgba(16, 24, 32, 0.08);       /* raised / sticky  */
+  --shadow-lg: 0 8px 24px rgba(16, 24, 32, 0.10);      /* overlays, menus  */
+  --shadow-focus: 0 0 0 3px rgba(14, 124, 102, 0.25);  /* visible focus    */
+
+  /* ---- Motion ------------------------------------------------------------ */
+  --duration-fast: 120ms;
+  --duration-normal: 200ms;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ============================== DARK THEME ============================== */
+[data-theme="dark"] {
+  --color-accent:            #4DC0A5;  /* lighter teal for dark bg (6.7:1)  */
+  --color-accent-hover:      #63D0B4;
+  --color-accent-active:     #3AAE92;
+  --color-accent-text:       #4DC0A5;  /* accent as TEXT on dark bg (AA)    */
+  --color-accent-subtle:     #123029;  /* tinted fills, active tab          */
+  --color-accent-border:     #2E6B5D;
+
+  --color-bg:                #0D1114;
+  --color-surface:           #151B20;
+  --color-surface-raised:    #1D252B;
+  --color-surface-subtle:    #1C2429;
+  --color-border:            #2A333A;
+  --color-border-strong:     #3D4850;
+
+  --color-text:              #E7EBEE;  /* primary (15:1 on surface)         */
+  --color-text-secondary:    #C2CBD1;
+  --color-text-muted:        #8B95A0;
+  --color-text-inverse:      #0D1114;  /* text on accent-filled surfaces    */
+  --color-text-disabled:     #5B6670;
+
+  --color-success:           #58C078;
+  --color-success-text:      #58C078;
+  --color-success-tint:      #123321;
+  --color-warning:           #E0A93C;
+  --color-warning-text:      #E0A93C;
+  --color-warning-tint:      #3A2E12;
+  --color-danger:            #F07B71;
+  --color-danger-text:       #F07B71;
+  --color-danger-tint:       #3B1513;
+  --color-info:              #66A9E0;
+  --color-info-text:         #66A9E0;
+  --color-info-tint:         #12293E;
+
+  --color-missing:           #9AA3AC;
+  --color-missing-tint:      #242B31;
+  --color-missing-text:      #8B95A0;
+
+  --color-chart-secondary:   #5A9ED6;
+  --color-chart-tertiary:    #9C8FD4;
+  --color-goal:              #B8C2CC;
+  --color-macro-protein:     #66A9E0;
+  --color-macro-carbs:       #E0A93C;
+  --color-macro-fat:         #A89BE0;
+  --color-macro-sugar:       #E087B0;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.40);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.50);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.60);
+  --shadow-focus: 0 0 0 3px rgba(77, 192, 165, 0.30);
+}
+
+/* ============================== BASE RESET ============================== */
+/* Optional: apply on the app root for a consistent baseline. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-family);
+  font-size: var(--text-base);
+  line-height: var(--leading-relaxed);
+  color: var(--color-text);
+  background: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Numeric values use tabular figures so stat tiles don't jitter. */
+.tabular,
+[data-stat],
+.stat-value,
+input[type="number"] {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* Visible focus ring for keyboard users. */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+}
+
+/* Respect reduced-motion preferences. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ============================ COMPONENT TOKENS ========================== */
+/* Convenience aliases for Jerry's component code — compose the primitives
+   above so components stay readable and swap cleanly between themes. */
+:root,
+[data-theme="dark"] {
+  --card-bg: var(--color-surface);
+  --card-border: var(--color-border);
+  --card-radius: var(--radius-lg);
+  --card-padding: var(--space-4);
+  --card-shadow: var(--shadow-sm);
+
+  --input-bg: var(--color-surface);
+  --input-border: var(--color-border-strong);
+  --input-radius: var(--radius-sm);
+  --input-padding: var(--space-2) var(--space-3);
+
+  --btn-primary-bg: var(--color-accent);
+  --btn-primary-bg-hover: var(--color-accent-hover);
+  --btn-primary-bg-active: var(--color-accent-active);
+  --btn-primary-text: var(--color-text-inverse);
+  --btn-primary-radius: var(--radius-sm);
+  --btn-padding: var(--space-2) var(--space-4);
+
+  --btn-secondary-bg: transparent;
+  --btn-secondary-border: var(--color-border-strong);
+  --btn-secondary-text: var(--color-text);
+
+  --badge-radius: var(--radius-full);
+  --badge-padding: var(--space-1) var(--space-2);
+  --badge-font-size: var(--text-sm);
+
+  --tab-radius: var(--radius-full);
+  --tab-active-bg: var(--color-accent-subtle);
+  --tab-active-text: var(--color-accent-text);
+  --tab-inactive-text: var(--color-text-secondary);
+
+  --divider: var(--color-border);
+}
