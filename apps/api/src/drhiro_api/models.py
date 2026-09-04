@@ -289,6 +289,34 @@ class AuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class AppSetting(Base):
+    """Singleton row holding instance-global runtime settings.
+
+    This is the SOURCE OF TRUTH for settings editable from the web Settings
+    screen. `.env` is bootstrap-only: install.sh writes it, first boot seeds
+    this table from it, and thereafter this row is authoritative.
+
+    Only one row exists (id = 'singleton'). Columns are the editable fields:
+      - ai_backend_url, model_name       -> the AI model drHiro/TrueForge uses
+      - telegram_bot_token, telegram_allowed_username -> Telegram comms
+      - ai_api_key                       -> secret (never returned in full)
+
+    Secret values are write-only via the API: reads return a masked set/not-set
+    indicator, never the stored secret.
+    """
+
+    __tablename__ = "app_settings"
+
+    id: Mapped[str] = mapped_column(String(16), primary_key=True, default="singleton")
+    ai_backend_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ai_api_key: Mapped[str | None] = mapped_column(Text, nullable=True)          # secret
+    telegram_bot_token: Mapped[str | None] = mapped_column(Text, nullable=True)  # secret
+    telegram_allowed_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
 class IngestBatch(Base, TimestampMixin):
     """Idempotency record for ingestion batches.
 
