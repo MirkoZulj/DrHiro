@@ -106,3 +106,74 @@ The test suite runs entirely offline against **mock Telegram + mock TrueForge** 
 installation behaviour can be validated with no real bot, no real AI backend, and no
 TrueForge instance. See [docs/VALIDATION_REPORT.md](VALIDATION_REPORT.md) and the `tests/`
 directory.
+
+## Optional — food / nutrition lookup (USDA + Camoufox)
+
+The nutrition pipeline that powers food logging uses two optional lookups behind the local
+food database. Both are configured through **environment variables**; no code change is
+required.
+
+### Primary: USDA FoodData Central (recommended)
+
+When the local food DB has no match, drHiro queries the **USDA FoodData Central** API
+first. It is authoritative, free, and needs no browser.
+
+1. Register at <https://fdc.nal.usda.gov/api-key-signup.html> — the key is emailed to you.
+2. Export it as an environment variable on the host running the meal/food service:
+
+   ```bash
+   export USDA_API_KEY="your-32-char-key"     # NOT the public DEMO_KEY
+   ```
+
+3. Restart the food service so it picks up the variable.
+
+The service falls back to the demo key if unset, but the **demo key is rate-limited
+(~30 req/hr)** and frequently returns empty — set a real key for reliable lookups.
+
+### Fallback: DuckDuckGo via a Camoufox browser behind a SOCKS5 proxy
+
+For foods USDA still does not list, drHiro can scrape **DuckDuckGo** with a headless
+**Camoufox** browser. Two important, tested facts:
+
+- **Google is deliberately not used.** Both plain HTTP clients and headless browsers from
+  a datacenter IP are blocked by Google regardless of the IP used — do not build a Google
+  scraper.
+- **DuckDuckGo HTML** works with a real browser, but the browser must egress through a
+  **residential IP**. A datacenter/VPS IP is blocked by DuckDuckGo too. Camoufox also needs
+  a SOCKS5 proxy with **remote DNS** so DNS resolves on the residential side.
+
+Layout (everything on the VPS host; the browser never runs inside a container):
+
+| Component | Purpose |
+|---|---|
+| `home-socks.service` | Persistent `ssh -D 127.0.0.1:1080` dynamic SOCKS5 tunnel to a residential host (the Pi) |
+| `ddg-http.service` | Tiny HTTP wrapper that runs Camoufox through the tunnel and returns parsed nutrition JSON |
+| food service | On DB/USDA miss, `POST /lookup` to the wrapper's HTTP endpoint |
+
+Environment / settings used by the food service:
+
+```bash
+# Where the DDG wrapper listens (the docker bridge gateway, reachable from containers)
+DDG_HTTP_URL="http://172.20.0.1:8098"
+# The wrapper egresses through the tunnel to the residential IP
+HOME_SOCKS_PROXY="socks5://127.0.0.1:1080"
+```
+
+The wrapper and tunnel are described only generically here because they are deployment
+specific. If you operate drHiro from a VPS and want this fallback, the durable lesson from
+production testing is: keep the browser **on the residential network** (or route it there
+through the tunnel) and use **DuckDuckGo, not Google**. Do not install browsers or scraping
+daemons on a shared/worker host that must stay lean.
+
+### Setting order (priority)
+
+1. Local food database
+2. USDA FoodData Central (real `USDA_API_KEY`)
+3. DuckDuckGo via Camoufox behind the SOCKS5 tunnel (`DDG_HTTP_URL` / `HOME_SOCKS_PROXY`)
+
+### Privacy note
+
+Food queries contain the foods a user eats. The USDA call sends only the food-name query
+to the USDA API; the DDG fallback sends it to DuckDuckGo. Configure the proxy and data
+sources according to your privacy requirements.
+
