@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { authClient, API_BASE } from '../lib/auth'
+import SystemSettings from './SystemSettings'
 
 export default function Settings() {
   const [error, setError] = useState<string | null>(null)
@@ -54,6 +55,8 @@ export default function Settings() {
       <p className="page-sub">Manage your data and account.</p>
 
       {error && <div className="error">{error}</div>}
+
+      <SystemSettings />
 
       <section className="section">
         <h3>Your data</h3>
