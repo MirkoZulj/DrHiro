@@ -1,0 +1,12 @@
+[project]
+name = "drhiro-mcp"
+version = "0.1.0"
+description = "MCP server exposing drHiro Core API tools to OpenClaw"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0,<2",
+    "httpx>=0.28,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
