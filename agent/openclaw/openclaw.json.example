@@ -1,0 +1,69 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "~/.openclaw/workspace/drhiro",
+      "model": {
+        "primary": "${OPENCLAW_MODEL}"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "trueforge": {
+        "api": "openai-completions",
+        "baseUrl": "${TRUEFORGE_BASE_URL}",
+        "apiKey": "${TRUEFORGE_API_KEY}",
+        "models": [
+          { "id": "trueforge-drhiro", "name": "drHiro via TrueForge (shim)" }
+        ]
+      },
+      "qwen-local": {
+        "api": "openai-completions",
+        "baseUrl": "${QWEN_LOCAL_BASE_URL}",
+        "apiKey": "${QWEN_LOCAL_API_KEY}",
+        "models": [
+          {
+            "id": "${QWEN_LOCAL_MODEL_ID}",
+            "name": "${QWEN_LOCAL_MODEL_NAME}"
+          }
+        ]
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "dmPolicy": "pairing",
+      "groupPolicy": "disabled",
+      "capabilities": {
+        "inlineButtons": "all"
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "drhiro": {
+        "command": "node",
+        "transport": "stdio",
+        "enabled": false,
+        "env": {
+          "DRHIRO_MCP_API": "${OPENCLAW_DRHIRO_API}",
+          "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}"
+        }
+      }
+    }
+  },
+  "skills": {
+    "entries": {
+      "skill-drhiro": {
+        "enabled": false,
+        "env": {
+          "OPENCLAW_DRHIRO_API": "${OPENCLAW_DRHIRO_API}",
+          "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}"
+        }
+      }
+    }
+  }
+}
