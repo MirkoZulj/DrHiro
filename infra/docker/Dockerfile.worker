@@ -1,0 +1,20 @@
+# drHiro worker image (shares the API + worker packages)
+FROM python:3.12-slim AS base
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY packages/health-schema /app/packages/health-schema
+COPY packages/rule-engine /app/packages/rule-engine
+COPY packages/nutrition-core /app/packages/nutrition-core
+COPY apps/api /app/apps/api
+COPY apps/worker /app/apps/worker
+
+RUN pip install --no-cache-dir \
+    /app/packages/health-schema \
+    /app/packages/rule-engine \
+    /app/packages/nutrition-core \
+    /app/apps/api \
+    /app/apps/worker
+
+CMD ["rq", "worker", "--url", "redis://redis:6379/0", "drhiro"]
