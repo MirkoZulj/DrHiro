@@ -127,3 +127,25 @@ def test_resolve_runtime_prefers_store():
     assert eff["model_name"] == "store-model"
     assert eff["ai_backend_url"] == "http://store:9000/v1"
     assert eff["ai_api_key"] == "store-key"
+
+
+def test_services_for_fields_mapping():
+    from drhiro_api.services.settings_store import services_for_fields
+
+    assert services_for_fields({"model_name"}) == {"trueforge", "openclaw-gateway"}
+    assert services_for_fields({"telegram_bot_token"}) == {"telegram-bridge", "openclaw-gateway"}
+    assert services_for_fields({"telegram_allowed_username"}) == {"telegram-bridge"}
+    # A field with no restart need (e.g. future live-only) maps to nothing.
+    assert services_for_fields(set()) == set()
+
+
+def test_write_restart_flags_only_names(tmp_path):
+    from drhiro_api.services.settings_store import write_restart_flags
+
+    write_restart_flags(str(tmp_path), {"telegram-bridge", "trueforge"})
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["telegram-bridge.flag", "trueforge.flag"]
+    # Flag files are empty — they carry ONLY the service name, never a value.
+    for p in tmp_path.iterdir():
+        assert p.read_text() == ""
+        assert "token" not in p.name and "key" not in p.name

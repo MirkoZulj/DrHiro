@@ -111,4 +111,17 @@ def update_settings(
         metadata={"fields": sorted(payload.keys())},  # field names only — never values
     )
     db.commit()
+    # Signal the host watcher which services need re-provisioning/restart for
+    # this change. The flag files carry ONLY the service name; the watcher reads
+    # the values from Postgres itself. Best-effort.
+    from drhiro_api.services.settings_store import services_for_fields, write_restart_flags
+
+    try:
+        import os as _os
+
+        affected = services_for_fields(set(payload.keys()))
+        if affected:
+            write_restart_flags(_os.environ.get("RESTART_FLAGS_DIR"), affected)
+    except Exception:  # never fail the save because a flag write failed
+        pass
     return to_masked_dict(row)
