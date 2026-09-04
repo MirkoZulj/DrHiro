@@ -52,15 +52,34 @@ else
   bad "TELEGRAM_BOT_TOKEN not set"
 fi
 
-# 5. AI backend reachable
+# 5. AI backend reachable (send the real key for the check but never echo it)
 if [[ -n "${AI_BACKEND_BASE_URL:-}" ]]; then
   if curl -sf -m 15 -o /dev/null "${AI_BACKEND_BASE_URL%/}/models" -H "Authorization: Bearer ${AI_API_KEY:-}" 2>/dev/null; then
-    ok "AI backend reachable: $AI_BACKEND_BASE_URL"
+    ok "AI backend reachable"
   else
-    bad "AI backend unreachable: $AI_BACKEND_BASE_URL"
+    bad "AI backend unreachable"
   fi
 else
   bad "AI_BACKEND_BASE_URL not set"
+fi
+
+# 6. Settings watcher installed + alive (Qodo / settings-apply model)
+FLAGS_DIR="${RESTART_FLAGS_DIR:-/var/lib/drhiro/restart-flags}"
+WATCHER_CRON_MARKER="drhiro-settings-watcher.sh"
+if crontab -l 2>/dev/null | grep -q "$WATCHER_CRON_MARKER" \
+   || systemctl list-timers --all --no-pager 2>/dev/null | grep -q "drhiro-settings-watcher" \
+   || [[ -f /etc/systemd/system/drhiro-settings-watcher.timer ]] \
+   || [[ -f /etc/cron.d/drhiro-settings-watcher ]]; then
+  ok "settings watcher installed"
+else
+  bad "settings watcher NOT installed (no cron/systemd entry)"
+fi
+
+# 7. No half-applied settings state (a .failed marker means a prior apply failed)
+if compgen -G "$FLAGS_DIR/failed.flag" >/dev/null 2>&1; then
+  bad "settings apply left in FAILED state ($FLAGS_DIR/failed.flag present) — inspect $LOG_FILE"
+else
+  ok "no failed settings-apply markers"
 fi
 
 say ""
