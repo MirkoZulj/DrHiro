@@ -1,0 +1,11 @@
+[project]
+name = "drhiro-rule-engine"
+version = "0.1.0"
+description = "drHiro deterministic calculations and versioned safety rules"
+requires-python = ">=3.11"
+dependencies = [
+    "drhiro-health-schema>=0.1.0,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
