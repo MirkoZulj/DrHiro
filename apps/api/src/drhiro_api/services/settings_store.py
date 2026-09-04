@@ -159,3 +159,50 @@ def resolve_runtime(db: Session, env: dict) -> dict:
         "telegram_bot_token": _pick(_TG_TOKEN_FIELD, "TELEGRAM_BOT_TOKEN"),
         "telegram_allowed_username": _pick(_TG_USERNAME_FIELD, "TELEGRAM_ALLOWED_USERNAME"),
     }
+
+
+# --- Which service(s) must be re-provisioned/restarted for a changed field ---
+# The api/worker/web LLM client live-reloads at call time (no flag). Services
+# that bind config at start (telegram-bridge, openclaw-gateway) or provision
+# an external runtime (trueforge via configure.sh) need a host-side restart.
+FIELD_TO_SERVICES: dict[str, set[str]] = {
+    # AI fields: the api live-reloads, but trueforge (agent model) must be
+    # re-provisioned via configure.sh, and openclaw-gateway binds its model.
+    "ai_backend_url": {"trueforge", "openclaw-gateway"},
+    "model_name": {"trueforge", "openclaw-gateway"},
+    "ai_api_key": {"trueforge", "openclaw-gateway"},
+    # Telegram fields: telegram-bridge binds bot token + username at start.
+    "telegram_bot_token": {"telegram-bridge", "openclaw-gateway"},
+    "telegram_allowed_username": {"telegram-bridge"},
+}
+
+
+def services_for_fields(changed_fields: set[str]) -> set[str]:
+    """Return the set of services needing a host-side restart for the change."""
+    affected: set[str] = set()
+    for f in changed_fields:
+        affected |= FIELD_TO_SERVICES.get(f, set())
+    return affected
+
+
+def write_restart_flags(flags_dir: str | None, services: set[str]) -> None:
+    """Write a flag file per affected service into the host-shared volume.
+
+    The file contains ONLY the service name (as the filename); the host watcher
+    reads the actual settings from Postgres itself. No secrets are written.
+    Best-effort: a missing/unwritable volume is logged and ignored (the change
+    still persists in the store; a manual restart applies it).
+    """
+    if not flags_dir:
+        return
+    try:
+        import pathlib
+
+        d = pathlib.Path(flags_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        for svc in sorted(services):
+            (d / f"{svc}.flag").touch(exist_ok=True)
+    except Exception as e:  # pragma: no cover - best effort
+        import logging
+
+        logging.getLogger(__name__).warning("restart-flag write failed: %s", e)
