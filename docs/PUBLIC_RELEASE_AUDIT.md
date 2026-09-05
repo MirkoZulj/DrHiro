@@ -50,7 +50,7 @@ or referenced in the public release:
 | Username / local paths | `/home/<user>/...` paths in scripts, README, `import_usda.py` | Excluded |
 | Bot identity | A named production bot handle referenced in tf-shim README | Excluded; new package is bot-token driven |
 | Patient / user health data | Real measurements, meals, weight, goals in the production DB; photo-derived values | Never copied; package ships synthetic fixtures only, explicitly labeled |
-| Employer/client assets | DrHiro is Kresimir's own personal project; no third-party client data found | n/a |
+| Employer/client assets | drHiro is the author's own personal project; no third-party client data found | n/a |
 | Local model files | `nutrition_cache.json`, USDA/CIQUAL data caches, `.gguf` model references | Excluded; package is model-provider agnostic |
 | Production config | `infra/.env.prod`, `docker-compose.vps.yml` (hardcoded VPS host), Caddyfile with private domains | Excluded; new compose is generic and self-contained |
 

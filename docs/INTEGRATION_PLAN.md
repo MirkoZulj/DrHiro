@@ -116,8 +116,8 @@ Everything else derives from those + optional overrides in `.env` (DB URL, JWT
 secret, MinIO keys, MCP URL, food-service URL). The Phase 1 audit found several
 hardcoded identifiers that must be converted to env before migration
 (`intelligent_food_search.py` Pi SSH creds, `openclaw_tools.py` base URL,
-`ApiClient.kt` base URL, `MainActivity.kt`/`DeviceLinker.kt` "Kresimir", the
-`984523234` user id in skill examples). None of these ship as-is.
+`ApiClient.kt` base URL, `MainActivity.kt`/`DeviceLinker.kt` a hardcoded user
+name, the real Telegram user id in skill examples). None of these ship as-is.
 
 ---
 
