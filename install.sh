@@ -296,10 +296,10 @@ if [[ ! -d "$SCRIPT_DIR/trueforge-src/.git" ]]; then
   # production image is built directly from this clone, so it must stay pinned
   # to the requested tag/commit. If the pinned clone fails, abort with a clear
   # message instead of deploying an unintended revision.
-  if ! git clone --depth 1 --branch "v${TRUEFORGE_VERSION:-0.1.4}" \
+  if ! git clone --depth 1 --branch "v${TRUEFORGE_VERSION:-0.1.9}" \
     https://github.com/truefoundry/trueforge.git "$SCRIPT_DIR/trueforge-src"; then
     rm -rf "$SCRIPT_DIR/trueforge-src"
-    fail "Failed to clone TrueForge at the pinned tag v${TRUEFORGE_VERSION:-0.1.4}. "
+    fail "Failed to clone TrueForge at the pinned tag v${TRUEFORGE_VERSION:-0.1.9}. "
          "Aborting to avoid deploying an unpinned upstream revision. Set "
          "TRUEFORGE_VERSION to a valid tag and rerun."
   fi

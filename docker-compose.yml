@@ -158,7 +158,7 @@ services:
       context: ./trueforge-src
       dockerfile: Dockerfile
       args:
-        APP_VERSION: ${TRUEFORGE_VERSION:-0.1.4}
+        APP_VERSION: ${TRUEFORGE_VERSION:-0.1.9}
     image: ${TRUEFORGE_IMAGE:-drhiro-trueforge:latest}
     restart: unless-stopped
     ports: ["${TRUEFORGE_PORT:-8790}:8790"]
@@ -225,6 +225,28 @@ services:
       - ${APK_DIR:-./apk}:/data/apk
       - pairing_state:/data/pairing
     depends_on: [trueforge, drhiro-tools]
+    networks: [drhiro-net]
+
+  # --- OpenClaw model bridge: tf-shim (OpenAI-compatible -> TrueForge) ------
+  # OpenClaw reaches the model through this OpenAI-compatible adapter, which maps
+  # /v1/chat/completions to a persistent TrueForge agent session. Self-contained:
+  # source + Dockerfile ship in ./services/tf-shim.
+  tf-shim:
+    build:
+      context: ./services/tf-shim
+    image: drhiro-tf-shim:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    expose: ["3200"]
+    environment:
+      TRUEFORGE_URL: http://trueforge:8790
+      TRUEFORGE_AGENT: ${TRUEFORGE_AGENT:-drhiro}
+      REDIS_URL: redis://redis:6379/3
+      SHIM_MODEL_ID: ${SHIM_MODEL_ID:-trueforge-drhiro}
+    depends_on:
+      trueforge:
+        condition: service_started
+      redis:
+        condition: service_healthy
     networks: [drhiro-net]
 
   # --- OpenClaw (Telegram comms layer) ------------------------------------
