@@ -10,9 +10,8 @@
   description = "Synthetic pytest test-fixture values (conftest.py only) — not real credentials"
 
   # pytest conftest sets a dummy DRHIRO_JWT_SECRET for the test app
-  [[allowlist.regexes]]
-    regex = '''DRHIRO_JWT_SECRET", "pytest-dummy-not-a-real-secret"'''
-
-  # pytest conftest sets a dummy (obviously-invalid) Telegram bot token
-  [[allowlist.regexes]]
-    regex = '''DRHIRO_TELEGRAM_BOT_TOKEN", "000000:TESTONLYnotarealbottoken"'''
+  regexes = [
+    '''pytest-dummy-not-a-real-secret''',
+    # pytest conftest sets a dummy (obviously-invalid) Telegram bot token
+    '''000000:TESTONLYnotarealbottoken''',
+  ]
