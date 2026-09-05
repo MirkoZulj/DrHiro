@@ -7,7 +7,7 @@ private codebase at `/opt/drhiro` on the VPS and categorises every file as
 
 **Audit date:** 2026-09-04
 **Auditor:** Jeeves (read-only; nothing copied)
-**Private source audited:** `/opt/drhiro` (VPS 144.91.107.8), ~156 MB incl.
+**Private source audited:** a private drHiro codebase (VPS), ~156 MB incl.
 artifacts; source (excluding node_modules/dist/venv) ≈ 62 `.py`, 22 `.tsx`, 9
 `.kt`, plus markdown/shell/config.
 
@@ -31,7 +31,7 @@ stack — **not** a competing runtime. It must not be removed or migrated away.
 
 | File | Finding | Verdict |
 |---|---|---|
-| `apps/api/src/drhiro_api/services/intelligent_food_search.py:99-102` | **Hardcoded** `sshpass -p Mile0001` + `mirko@100.75.194.51` (Pi SSH). Real password + host. | **never-copy as-is** → must become env-driven or replaced (this is the deprecated Pi-SSH food path). |
+| `apps/api/src/drhiro_api/services/intelligent_food_search.py:99-102` | **Hardcoded** `sshpass -p <redacted>` + `<redacted-user>@<redacted-pi-ip>` (Pi SSH). Real password + host. | **never-copy as-is** → must become env-driven or replaced (this is the deprecated Pi-SSH food path). |
 | `openclaw/openclaw.json` | Contains live `apiKey` for `trueforge` and `qwen-local` providers. | **never-copy** → ship as `.example` with placeholders only. |
 | `infra/.env`, `.env.prod`, `.env.prod.bak-*`, `settings.json` | Live secrets (JWT, DB URL, USDA key, service token, bot token). | **never-copy** (all are gitignored runtime state). |
 | `infra/.env.example` | Safe template (placeholders). | **safe-to-copy** (already public in hackathon shell). |
@@ -40,11 +40,11 @@ stack — **not** a competing runtime. It must not be removed or migrated away.
 
 | File | Finding | Verdict |
 |---|---|---|
-| `apps/android-bridge/.../MainActivity.kt:215,231` | `"Linked as Kresimir!"` / `"Device linked (Kresimir)"` — real user name hardcoded in UI. | **needs-review** → replace with dynamic user display name. |
-| `apps/android-bridge/.../net/DeviceLinker.kt:39` | `device_name: String = "Kresimir"` hardcoded default. | **needs-review** → env/config-driven. |
-| `openclaw/skills/skill-drhiro/SKILL.md` + `scripts/drhiro_api.sh` | Telegram user id `984523234` hardcoded in example calls. | **needs-review** → replace with `<TELEGRAM_USER_ID>` placeholder. |
-| `apps/api/src/drhiro_api/routers/openclaw_tools.py:452` | Hardcoded `https://vmi3413468.contaboserver.net/drhiro-app`. | **needs-review** → env-driven base URL. |
-| `apps/android-bridge/.../net/ApiClient.kt:26` | Hardcoded `baseUrl = "https://vmi3413468.contaboserver.net/drhiro/api/v1"`. | **needs-review** → env-driven (already has a setter; make the default a placeholder). |
+| `apps/android-bridge/.../MainActivity.kt:215,231` | A hardcoded user display name in the UI. | **needs-review** → replace with dynamic user display name. |
+| `apps/android-bridge/.../net/DeviceLinker.kt:39` | Hardcoded user-name default. | **needs-review** → env/config-driven. |
+| `openclaw/skills/skill-drhiro/SKILL.md` + `scripts/drhiro_api.sh` | Real Telegram user id hardcoded in example calls. | **needs-review** → replace with `<TELEGRAM_USER_ID>` placeholder. |
+| `apps/api/src/drhiro_api/routers/openclaw_tools.py:452` | Hardcoded private web-app base URL. | **needs-review** → env-driven base URL. |
+| `apps/android-bridge/.../net/ApiClient.kt:26` | Hardcoded private API base URL. | **needs-review** → env-driven (already has a setter; make the default a placeholder). |
 | `xiaomi_csv.py` / `test_import_csv.py` | `ACTIVITY_1234567890.csv` etc. and test BP rows are **synthetic fixtures** (fake IDs, fake timestamps). | **safe-to-copy** (already synthetic). |
 
 ### 2.3 Device / infra names
@@ -130,7 +130,7 @@ stack — **not** a competing runtime. It must not be removed or migrated away.
 1. **Real Pi password in source** (`intelligent_food_search.py`). Must be removed
    before any merge; the file must read credentials from env or be deleted if the
    DDG path supersedes it. **Blocker for merge.**
-2. **Real user name "Kresimir"** baked into the Android bridge. A published APK
+2. **A real user name** baked into the Android bridge. A published APK
    built from the repo would carry it unless scrubbed. Fix before public release.
 3. **Health data hygiene:** confirm no Postgres/Redis/MinIO volume is bind-mounted
    under a repo path that would get committed. Production data lives in container
