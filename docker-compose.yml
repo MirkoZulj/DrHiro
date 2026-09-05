@@ -188,6 +188,10 @@ services:
     environment:
       EXPORT_DIR: /data/exports
       DRHIRO_VERSION: ${DRHIRO_VERSION:-0.1.0}
+      # FastMCP SSE server binds this port (pydantic-settings FASTMCP_ prefix).
+      # The compose exposes 3100 and TrueForge registers
+      # http://drhiro-tools:3100/sse as the MCP server URL, so it MUST match.
+      FASTMCP_PORT: "3100"
     volumes:
       - exports_data:/data/exports
     healthcheck:
