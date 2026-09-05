@@ -17,6 +17,14 @@ fi
 echo "[uninstall] Stopping and removing containers/volumes..."
 docker compose down --volumes --remove-orphans
 
+# Remove the host-side settings watcher (cron + flags + log). Run as root.
+echo "[uninstall] Removing settings watcher..."
+rm -f /etc/cron.d/drhiro-settings-watcher
+rm -f /var/lock/drhiro-settings-watcher.lock
+rm -rf "${RESTART_FLAGS_DIR:-/var/lib/drhiro/restart-flags}"
+rm -f "${DRHIRO_WATCHER_LOG:-/var/log/drhiro-settings-watcher.log}"
+echo "[uninstall] Settings watcher removed."
+
 if [[ -f .env ]]; then
   echo "[uninstall] Removing protected .env..."
   rm -f .env

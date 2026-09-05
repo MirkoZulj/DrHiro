@@ -80,6 +80,16 @@ class Handler(BaseHTTPRequestHandler):
             code = 503 if not st.health_ok else 200
             self._send_json(code, {"ok": st.health_ok, "status": "OK!" if st.health_ok else "degraded"})
             return
+        if path == "/api/v1/agents":
+            # DB-backed agent registry (mounted at /api/v1/agents in v0.1.9).
+            self._send_json(200, {"data": [{"id": "mock-agent-1", "name": "drhiro"}]})
+            return
+        if path == "/api/v1/settings/model-providers":
+            self._send_json(200, {"data": []})
+            return
+        if path == "/api/v1/settings/mcp-servers":
+            self._send_json(200, {"data": []})
+            return
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -95,6 +105,15 @@ class Handler(BaseHTTPRequestHandler):
             req = {}
         path = urllib.parse.urlparse(self.path).path
 
+        if path == "/api/v1/agents":
+            self._send_json(200, {"data": {"id": "mock-agent-1", "name": req.get("name", "drhiro")}})
+            return
+        if path == "/api/v1/settings/model-providers":
+            self._send_json(200, {"ok": True})
+            return
+        if path == "/api/v1/settings/mcp-servers":
+            self._send_json(200, {"ok": True})
+            return
         if path == "/api/v1/sessions":
             with st.lock:
                 st.sessions_created += 1

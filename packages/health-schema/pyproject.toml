@@ -1,0 +1,11 @@
+[project]
+name = "drhiro-health-schema"
+version = "0.1.0"
+description = "drHiro canonical health-data schema: metric types, value schemas, enums"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7,<3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,208 @@
+"""Runtime settings store — instance-global configuration.
+
+`.env` is BOOTSTRAP ONLY. On first boot the app_settings singleton row is
+seeded from environment variables; after that the row is the source of truth
+for settings editable from the web Settings screen.
+
+Secrets (ai_api_key, telegram_bot_token) are write-only through the API: a
+read returns a masked set/not-set indicator, never the stored secret. This
+module never logs secret values.
+"""
+from __future__ import annotations
+
+from sqlalchemy.orm import Session
+
+from drhiro_api.models import AppSetting
+
+# Fields a deployer may edit from the Settings screen, and whether each is a
+# secret (never returned in full by the API).
+EDITABLE_FIELDS = {
+    "ai_backend_url": False,
+    "model_name": False,
+    "ai_api_key": True,
+    "telegram_bot_token": True,
+    "telegram_allowed_username": False,
+}
+
+SINGLETON_ID = "singleton"
+
+
+def get_row(db: Session) -> AppSetting:
+    """Return the singleton settings row, creating + seeding it if absent."""
+    row = db.get(AppSetting, SINGLETON_ID)
+    if row is None:
+        row = AppSetting(id=SINGLETON_ID)
+        db.add(row)
+        db.flush()
+    return row
+
+
+def seed_from_env(db: Session, env: dict) -> bool:
+    """Seed the singleton row from .env values (first-boot bootstrap).
+
+    Called once at startup (or install). Only fills fields that are still
+    NULL so it never overwrites a value the user has since set from the UI.
+    Returns True if any field was seeded.
+    """
+    row = get_row(db)
+    mappings = {
+        "ai_backend_url": env.get("AI_BACKEND_BASE_URL"),
+        "model_name": env.get("AI_MODEL"),
+        "ai_api_key": env.get("AI_API_KEY"),
+        "telegram_bot_token": env.get("TELEGRAM_BOT_TOKEN"),
+        "telegram_allowed_username": env.get("TELEGRAM_ALLOWED_USERNAME"),
+    }
+    changed = False
+    for field, value in mappings.items():
+        if value is None or value == "":
+            continue
+        if getattr(row, field) is None:
+            setattr(row, field, value)
+            changed = True
+    if changed:
+        db.commit()
+    return changed
+
+
+def _masked(has_value: bool) -> dict:
+    return {"set": has_value}
+
+
+def to_masked_dict(row: AppSetting | None) -> dict:
+    """Serialize the settings row for the API with secrets masked.
+
+    Non-secret fields are returned in full; secret fields return a
+    ``{"set": true|false}`` indicator only. Never return the stored secret.
+    """
+    if row is None:
+        return {f: ("" if not secret else {"set": False}) for f, secret in EDITABLE_FIELDS.items()}
+    out = {}
+    for field, secret in EDITABLE_FIELDS.items():
+        val = getattr(row, field, None)
+        if secret:
+            out[field] = _masked(bool(val))
+        else:
+            out[field] = val or ""
+    return out
+
+
+def apply_updates(db: Session, updates: dict) -> AppSetting:
+    """Apply non-secret-field updates and secret-field set/clear semantics.
+
+    For a secret field the payload value is either ``{"set": true,
+    "value": "..."}`` (write the new secret) or ``{"set": false}`` (clear it).
+    A plain non-empty string on a non-secret field writes it directly. A null
+    or empty string on a non-secret field clears it.
+
+    Returns the updated row (uncommitted; caller commits).
+    """
+    row = get_row(db)
+    for field, secret in EDITABLE_FIELDS.items():
+        if field not in updates:
+            continue
+        payload = updates[field]
+        if secret:
+            if isinstance(payload, dict):
+                if payload.get("set") is True and payload.get("value"):
+                    setattr(row, field, payload["value"])
+                elif payload.get("set") is False:
+                    setattr(row, field, None)
+            # A raw string on a secret field is rejected by the router schema;
+            # ignore defensively here.
+            continue
+        # Non-secret: accept a string (empty clears).
+        if isinstance(payload, str):
+            setattr(row, field, payload if payload else None)
+    return row
+
+
+# --- Runtime resolution (services read from the store, .env as fallback) ---
+
+_AI_URL_FIELD = "ai_backend_url"
+_MODEL_FIELD = "model_name"
+_AI_KEY_FIELD = "ai_api_key"
+_TG_TOKEN_FIELD = "telegram_bot_token"
+_TG_USERNAME_FIELD = "telegram_allowed_username"
+
+
+def resolve_runtime(db: Session, env: dict) -> dict:
+    """Return the effective runtime settings, store-first with .env fallback.
+
+    Used by services that need the editable fields at call time. The
+    ``app_settings`` row is authoritative where set; otherwise the bootstrap
+    environment value (from .env, which install.sh seeded on first boot) is
+    the fallback. Only the api/worker call this (they have a DB session); the
+    env-only consumers (telegram-bridge, trueforge, openclaw) are re-provisioned
+    from the store on save and recreated, so their env reflects the store.
+
+    Returns:
+        {
+          "ai_backend_url": str|None,
+          "model_name": str|None,
+          "ai_api_key": str|None,   # may be None (not configured)
+          "telegram_bot_token": str|None,
+          "telegram_allowed_username": str|None,
+        }
+    """
+    row = get_row(db)
+    def _pick(field: str, env_key: str) -> str | None:
+        stored = getattr(row, field, None)
+        if stored:
+            return stored
+        v = env.get(env_key)
+        return v if v else None
+
+    return {
+        "ai_backend_url": _pick(_AI_URL_FIELD, "AI_BACKEND_BASE_URL"),
+        "model_name": _pick(_MODEL_FIELD, "AI_MODEL"),
+        "ai_api_key": _pick(_AI_KEY_FIELD, "AI_API_KEY"),
+        "telegram_bot_token": _pick(_TG_TOKEN_FIELD, "TELEGRAM_BOT_TOKEN"),
+        "telegram_allowed_username": _pick(_TG_USERNAME_FIELD, "TELEGRAM_ALLOWED_USERNAME"),
+    }
+
+
+# --- Which service(s) must be re-provisioned/restarted for a changed field ---
+# The api/worker/web LLM client live-reloads at call time (no flag). Services
+# that bind config at start (telegram-bridge, openclaw-gateway) or provision
+# an external runtime (trueforge via configure.sh) need a host-side restart.
+FIELD_TO_SERVICES: dict[str, set[str]] = {
+    # AI fields: the api live-reloads, but trueforge (agent model) must be
+    # re-provisioned via configure.sh, and openclaw-gateway binds its model.
+    "ai_backend_url": {"trueforge", "openclaw-gateway"},
+    "model_name": {"trueforge", "openclaw-gateway"},
+    "ai_api_key": {"trueforge", "openclaw-gateway"},
+    # Telegram fields: telegram-bridge binds bot token + username at start.
+    "telegram_bot_token": {"telegram-bridge", "openclaw-gateway"},
+    "telegram_allowed_username": {"telegram-bridge"},
+}
+
+
+def services_for_fields(changed_fields: set[str]) -> set[str]:
+    """Return the set of services needing a host-side restart for the change."""
+    affected: set[str] = set()
+    for f in changed_fields:
+        affected |= FIELD_TO_SERVICES.get(f, set())
+    return affected
+
+
+def write_restart_flags(flags_dir: str | None, services: set[str]) -> None:
+    """Write a flag file per affected service into the host-shared volume.
+
+    The file contains ONLY the service name (as the filename); the host watcher
+    reads the actual settings from Postgres itself. No secrets are written.
+    Best-effort: a missing/unwritable volume is logged and ignored (the change
+    still persists in the store; a manual restart applies it).
+    """
+    if not flags_dir:
+        return
+    try:
+        import pathlib
+
+        d = pathlib.Path(flags_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        for svc in sorted(services):
+            (d / f"{svc}.flag").touch(exist_ok=True)
+    except Exception as e:  # pragma: no cover - best effort
+        import logging
+
+        logging.getLogger(__name__).warning("restart-flag write failed: %s", e)

@@ -24,7 +24,11 @@ from mcp.server.fastmcp import FastMCP
 
 from . import store as _store
 
-mcp = FastMCP("drhiro-tools")
+# SSE server port. TrueForge registers http://drhiro-tools:3100/sse as the
+# MCP server URL, and the compose exposes 3100, so bind it here explicitly.
+# (FastMCP's FASTMCP_PORT env is NOT honored for the SSE port in this version.)
+MCP_PORT = int(os.environ.get("DRHIRO_TOOLS_PORT", "3100"))
+mcp = FastMCP("drhiro-tools", port=MCP_PORT)
 
 EXPORT_DIR = Path(os.environ.get("EXPORT_DIR", "/data/exports"))
 START_TIME = time.time()

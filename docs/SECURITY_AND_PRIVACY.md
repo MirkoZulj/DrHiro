@@ -103,3 +103,59 @@ docs all state this. If any component suggests otherwise, treat it as a bug and 
 - Back up with `scripts/backup.sh`.
 - If you expose the TrueForge admin UI beyond localhost, protect it with an authentication
   proxy — TrueForge hosted mode has no login by default.
+
+## Runtime settings store & the settings-apply model
+
+### The settings store holds secrets
+
+The runtime settings store (the `app_settings` row in Postgres) holds the AI API
+key and the Telegram bot token. That means:
+
+- **DB backups contain secrets.** `scripts/backup.sh` dumps Postgres, so a backup
+  file is a secret-bearing artifact. Handle and store backups with the same care
+  as `.env` (restrict access, encrypt at rest). Do not commit or share a dump.
+- **The store is not exposed broadly.** Only the authorized user can read or
+  write `/api/v1/settings` (see Access control above). No service-scoped
+  endpoint serves settings (including secrets) to service credentials — the
+  secret flow is strictly **store → .env regeneration → restart**.
+- **Secrets are write-only through the API.** Reads return a masked set/not-set
+  indicator; the full secret is never returned to the frontend, logged, or
+  placed in flag files or watcher logs. Audit records field names only.
+
+### How a settings change applies (and why)
+
+Settings that the api reads **live** (AI model/url/key) take effect at the next
+call — no restart. Settings that services bind at start
+(`telegram-bridge`, `openclaw-gateway`) or that provision an external runtime
+(`trueforge` via `scripts/configure.sh`) follow the restart-apply model:
+
+1. The authorized user saves a change in the web Settings screen.
+2. The api writes an empty `<service>.flag` into `RESTART_FLAGS_DIR`.
+3. A **host-side watcher** (root cron) reads the flags, pulls the current values
+   **directly from Postgres** (`docker compose exec -T postgres psql`), atomically
+   regenerates `.env`, runs `configure.sh` for `trueforge`, and force-recreates
+   the affected service. It logs timestamp/service/exit-code only — never values —
+   and leaves a `failed.flag` on any failure so `health-check.sh` reports a
+   half-applied state instead of a silent one.
+
+### Why no container mounts the Docker socket
+
+A container cannot restart its siblings, so applying a settings change requires
+host-level Docker control. We deliberately do **not** mount
+`/var/run/docker.sock` into any container: doing so would give that container
+full control of the host's Docker daemon (and effectively the host), a severe
+and unnecessary blast-radius expansion. Instead the watcher runs **on the host
+as root** — the same trust level as `install.sh`, which is already host-root by
+design. No container ever mounts `docker.sock`, and no app code shells out to
+`docker`.
+
+### Threat-model additions
+
+| Threat | Mitigation |
+|---|---|
+| Settings-store secrets leak via API | Write-only secrets (masked reads); authorized-user-only route; no service-scoped settings endpoint. |
+| Settings-store secrets leak via backup | Documented: DB dumps are secret-bearing; handle like `.env`. |
+| Secret in flag file / watcher log / intermediate | Flag files carry only the service name; watcher reads from Postgres; logs field names + exit codes only. |
+| Half-applied settings (silent) | Watcher leaves `failed.flag` on failure; `health-check.sh` detects and reports it. |
+| Container escalates to host via Docker | No container mounts `docker.sock`; watcher is host-root, not in a container. |
+| Settings change races / overlap | Watcher runs under `flock`; one run processes all pending flags then exits. |

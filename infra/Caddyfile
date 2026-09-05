@@ -1,0 +1,27 @@
+# drHiro reverse proxy — TLS terminated at the edge.
+# Only 80/443 reach the internet. Everything else is private.
+
+drhiro.example.com {
+    encode gzip
+
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+
+    handle /tools/* {
+        reverse_proxy api:8000
+    }
+
+    handle /openclaw/* {
+        reverse_proxy openclaw-gateway:8080
+    }
+
+    handle {
+        reverse_proxy web:3000
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}

@@ -1,78 +1,184 @@
-# drHiro on TrueForge — Docker Compose stack.
+# drHiro — single merged Docker Compose stack.
 #
-# TrueForge is deployed in HOSTED mode (its official quickstart path): the
-# trueforge server plus the Postgres + Redis it requires. drHiro adds two thin
-# services on top:
-#   - drhiro-tools     the four submission MCP tools (synthetic data)
-#   - telegram-bridge  long-polling Telegram transport -> TrueForge agent loop
+# ONE stack, ONE installer (install.sh), ONE configuration surface. Every
+# service that powers drHiro is here:
 #
-# Long polling is the ONLY transport; no public webhook, no exposed HTTPS.
-# Only TrueForge's UI port (8790) is published for administration.
+#   Data/infra        postgres, redis, minio
+#   App core          api, worker, scheduler, web (reverse-proxy)
+#   Agent runtime     trueforge (MIT, cloned by install.sh into ./trueforge-src)
+#   Comms             telegram-bridge, drhiro-tools, openclaw-gateway
 #
-# Secrets come from .env (created by install.sh with mode 600) — never committed.
+# Configuration model (see README + docs/ARCHITECTURE.md):
+#   - .env is BOOTSTRAP ONLY: secrets + initial values written by install.sh
+#     from the 5 installer inputs. It is NOT the live settings surface.
+#   - Runtime settings live in a persistent store the web app can read/write;
+#     services read from it, with .env values as the initial seed.
+#   - drhiro-core (api/worker/web) reads runtime settings from the settings
+#     table in Postgres. See the settings-store design in docs/ARCHITECTURE.md.
+#
+# Do not edit .env by hand for day-to-day changes — use the web Settings screen.
 
-name: drhiro-trueforge
+name: drhiro
 
 services:
-  # --- TrueForge hosted-mode services ----------------------------------
-  tf-postgres:
-    image: postgres:17
+  # --- Data / shared infrastructure ---------------------------------------
+  # ONE Postgres instance. TrueForge runs in its own database (created below)
+  # so its schema stays isolated from drHiro's. Two logical DBs, one server.
+  postgres:
+    image: postgres:16
     restart: unless-stopped
     environment:
-      POSTGRES_USER: trueforge
-      POSTGRES_PASSWORD: trueforge
-      POSTGRES_DB: trueforge
+      POSTGRES_USER: ${POSTGRES_USER:-drhiro}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a strong password}
+      POSTGRES_DB: ${POSTGRES_DB:-drhiro}
+      # TrueForge's own DB (created on first boot via the init script).
+      TF_POSTGRES_USER: ${TF_POSTGRES_USER:-trueforge}
+      TF_POSTGRES_PASSWORD: ${TF_POSTGRES_PASSWORD:-trueforge}
+      TF_POSTGRES_DB: ${TF_POSTGRES_DB:-trueforge}
     volumes:
-      - tf_pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U trueforge -d trueforge"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-drhiro}"]
+      interval: 10s
       timeout: 5s
       retries: 10
     networks: [drhiro-net]
 
-  tf-redis:
+  redis:
     image: redis:7-alpine
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      interval: 10s
       timeout: 3s
       retries: 5
     networks: [drhiro-net]
 
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-drhiro}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set a strong password}
+    volumes:
+      - miniodata:/data
+    expose: ["9000", "9001"]
+    networks: [drhiro-net]
+
+  # --- drHiro Core (the full app logic) -----------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+    image: drhiro-api:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DRHIRO_REDIS_URL: redis://redis:6379/0
+      # Shared volume where the settings-save hook writes restart-flag files.
+      # The HOST watcher (root cron, not a container) reads these and runs
+      # `docker compose restart <service>`. No container mounts docker.sock.
+      RESTART_FLAGS_DIR: ${RESTART_FLAGS_DIR:-/var/lib/drhiro/restart-flags}
+    volumes:
+      - ${RESTART_FLAGS_DIR:-/var/lib/drhiro/restart-flags}:/var/lib/drhiro/restart-flags
+    expose: ["8000"]
+    ports: ["8010:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [drhiro-net]
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.worker
+    image: drhiro-worker:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DRHIRO_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    networks: [drhiro-net]
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.worker
+    image: drhiro-scheduler:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    command: ["python", "-m", "drhiro_worker.scheduler"]
+    env_file: .env
+    environment:
+      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DRHIRO_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis: { condition: service_healthy }
+    networks: [drhiro-net]
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-/api/v1}
+        VITE_BASE_PATH: ${VITE_BASE_PATH:-/}
+    image: drhiro-web:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    expose: ["3000"]
+    ports: ["3000:3000"]
+    networks: [drhiro-net]
+
+  reverse-proxy:
+    image: caddy:2.10
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api, web]
+    networks: [drhiro-net]
+
+  # --- TrueForge (agent runtime) ------------------------------------------
   trueforge:
-    # Built from the public MIT TrueForge source. install.sh clones it into
-    # ./trueforge-src (pinned tag) if it is not already present. Override the
-    # image with TRUEFORGE_IMAGE to use a prebuilt one.
     build:
       context: ./trueforge-src
       dockerfile: Dockerfile
       args:
-        APP_VERSION: ${TRUEFORGE_VERSION:-0.1.4}
-    image: ${TRUEFORGE_IMAGE:-truefoundry-server:latest}
+        APP_VERSION: ${TRUEFORGE_VERSION:-0.1.9}
+    image: ${TRUEFORGE_IMAGE:-drhiro-trueforge:latest}
     restart: unless-stopped
-    ports:
-      - "${TRUEFORGE_PORT:-8790}:8790"
+    ports: ["${TRUEFORGE_PORT:-8790}:8790"]
     environment:
       NODE_ENV: production
       PORT: 8790
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8790}
-      POSTGRES_HOST: tf-postgres
+      POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      POSTGRES_USER: trueforge
-      POSTGRES_PASSWORD: trueforge
-      POSTGRES_DB: trueforge
+      POSTGRES_USER: ${TF_POSTGRES_USER:-trueforge}
+      POSTGRES_PASSWORD: ${TF_POSTGRES_PASSWORD:-trueforge}
+      POSTGRES_DB: ${TF_POSTGRES_DB:-trueforge}
       STANDALONE: "false"
-      REDIS_URL: redis://tf-redis:6379
+      REDIS_URL: redis://redis:6379/1
     depends_on:
-      tf-postgres:
-        condition: service_healthy
-      tf-redis:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
     networks: [drhiro-net]
 
-  # --- drHiro services ---------------------------------------------------
+  # --- drHiro shell services (TrueForge tools + Telegram comms) -----------
   drhiro-tools:
     build:
       context: ./services/drhiro-tools
@@ -82,6 +188,10 @@ services:
     environment:
       EXPORT_DIR: /data/exports
       DRHIRO_VERSION: ${DRHIRO_VERSION:-0.1.0}
+      # FastMCP SSE server binds this port (pydantic-settings FASTMCP_ prefix).
+      # The compose exposes 3100 and TrueForge registers
+      # http://drhiro-tools:3100/sse as the MCP server URL, so it MUST match.
+      FASTMCP_PORT: "3100"
     volumes:
       - exports_data:/data/exports
     healthcheck:
@@ -114,13 +224,66 @@ services:
     volumes:
       - ${APK_DIR:-./apk}:/data/apk
       - pairing_state:/data/pairing
+    depends_on: [trueforge, drhiro-tools]
+    networks: [drhiro-net]
+
+  # --- OpenClaw model bridge: tf-shim (OpenAI-compatible -> TrueForge) ------
+  # OpenClaw reaches the model through this OpenAI-compatible adapter, which maps
+  # /v1/chat/completions to a persistent TrueForge agent session. Self-contained:
+  # source + Dockerfile ship in ./services/tf-shim.
+  tf-shim:
+    build:
+      context: ./services/tf-shim
+    image: drhiro-tf-shim:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    expose: ["3200"]
+    environment:
+      TRUEFORGE_URL: http://trueforge:8790
+      TRUEFORGE_AGENT: ${TRUEFORGE_AGENT:-drhiro}
+      REDIS_URL: redis://redis:6379/3
+      SHIM_MODEL_ID: ${SHIM_MODEL_ID:-trueforge-drhiro}
     depends_on:
-      - trueforge
-      - drhiro-tools
+      trueforge:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks: [drhiro-net]
+
+  # --- OpenClaw (Telegram comms layer) ------------------------------------
+  openclaw-gateway:
+    image: ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION:-2026.7.1-2}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      OPENCLAW_SKIP_ONBOARDING: '1'
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OPENCLAW_MODEL: ${OPENCLAW_MODEL:-${AI_MODEL:-}}
+      NOUS_API_KEY: ${NOUS_API_KEY:-}
+      OPENCLAW_DRHIRO_API: http://api:8000/api/v1
+      DRHIRO_OPENCLAW_SERVICE_TOKEN: ${DRHIRO_OPENCLAW_SERVICE_TOKEN:-}
+    volumes:
+      - ./openclaw/openclaw.json:/seed/openclaw.json:ro
+      - ./openclaw/skill-drhiro:/seed/skills:ro
+      - ./openclaw/workspace:/seed/workspace:ro
+      - openclaw_state:/home/node/.openclaw
+    command: ["sh", "-lc",
+      "mkdir -p /home/node/.openclaw/skills /home/node/.openclaw/workspace/drhiro /home/node/.openclaw/mcp
+      && cp -n /seed/openclaw.json /home/node/.openclaw/openclaw.json 2>/dev/null || true
+      ; cp -rn /seed/skills/. /home/node/.openclaw/skills/ 2>/dev/null || true
+      ; for f in /seed/workspace/*.md; do t=/home/node/.openclaw/workspace/drhiro/$(basename \"$$f\"); [ -s \"$$t\" ] || cp \"$$f\" \"$$t\" 2>/dev/null || true; done
+      ; exec node openclaw.mjs gateway --allow-unconfigured"]
+    expose: ["8080"]
+    depends_on: [api]
     networks: [drhiro-net]
 
 volumes:
-  tf_pgdata:
+  pgdata:
+  redisdata:
+  miniodata:
+  caddy_data:
+  caddy_config:
+  openclaw_state:
   exports_data:
   pairing_state:
 
