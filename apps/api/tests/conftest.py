@@ -16,7 +16,7 @@ os.environ.setdefault(
     "postgresql+psycopg://drhiro:drhiro@localhost:5435/drhiro",
 )
 os.environ.setdefault("DRHIRO_REDIS_URL", "redis://localhost:6382/0")
-os.environ.setdefault("DRHIRO_JWT_SECRET", "test-only-jwt-secret-value-for-pytest")
+os.environ.setdefault("DRHIRO_JWT_SECRET", "pytest-dummy-not-a-real-secret")
 os.environ.setdefault("DRHIRO_TELEGRAM_BOT_TOKEN", "000000:TESTONLYnotarealbottoken")
 
 from drhiro_api.db import Base, engine, SessionLocal  # noqa: E402
