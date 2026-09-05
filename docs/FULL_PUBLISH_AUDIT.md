@@ -51,7 +51,7 @@ stack — **not** a competing runtime. It must not be removed or migrated away.
 
 - `apps/android-bridge/.../MainActivity.kt` mentions "Windows Qwen box" only in
   the workspace prose (anonymised). No Tailscale name in source other than the
-  Pi IP above. Grep for `100.119.202.68` found **no** source hits outside the
+  Pi IP above. Grep for `<tailscale-ip>` found **no** source hits outside the
   `.env` files → the Windows box IP is not in tracked logic. Good.
 
 ### 2.4 OpenClaw persona/workspace — already anonymised
