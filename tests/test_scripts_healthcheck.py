@@ -90,7 +90,7 @@ exit 0
     assert "FAIL drhiro-tools not reachable on :3100" in out
 
 
-def test_health_check_passes_when_all_ok(stub_bin):
+def test_health_check_passes_when_all_ok(stub_bin, tmp_path):
     """All checks passing should yield exit 0 and ALL CHECKS PASSED."""
     _write_stub(stub_bin, "docker", '''#!/usr/bin/env bash
 if [[ "$1" == "compose" && "$2" == "ps" ]]; then
@@ -100,7 +100,15 @@ fi
     _write_stub(stub_bin, "curl", '''#!/usr/bin/env bash
 exit 0
 ''')
-    code, out = _run_health_check(stub_bin)
+    # Settings watcher is installed (crontab lists the marker) and there is no
+    # failed-apply marker in the flag dir (pointed at a temp dir, not /var/lib).
+    _write_stub(stub_bin, "crontab", '''#!/usr/bin/env bash
+echo "* * * * * root flock drhiro-settings-watcher.sh"
+exit 0
+''')
+    code, out = _run_health_check(
+        stub_bin, env_extra={"RESTART_FLAGS_DIR": str(tmp_path / "flags")}
+    )
     assert code == 0
     assert "ALL CHECKS PASSED." in out
 
