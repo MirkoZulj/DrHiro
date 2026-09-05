@@ -129,8 +129,7 @@ All values are provided interactively by `install.sh` and written to a protected
   pinned, and fetched by the installer by artifact reference rather than by mutable clone — so
   a production deployment wires its own tool servers the same way it wires its own model
   backend. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current design.
-- **Demo walkthrough (text).** Recording in progress; a video will be linked here when
-  available. In the meantime the full flow is: run `sudo ./install.sh`, answer the five
+- **Demo walkthrough.** The full flow is: run `sudo ./install.sh`, answer the five
   prompts, then message the bot — it answers the authorized user's questions, and any
   gated action (e.g. saving/exporting) pauses with an Allow/Deny prompt in Telegram. On the
   Android side, `/apk` sends the signed Bridge APK and a `drhiro://pair` deep link; opening
@@ -172,7 +171,6 @@ The bot answers commands from the authorized user (plus agent conversation for a
 - [docs/INSTALL.md](docs/INSTALL.md) — step-by-step installation on Ubuntu 22.04/24.04
 - [docs/SECURITY_AND_PRIVACY.md](docs/SECURITY_AND_PRIVACY.md) — safety model, threat model
 - [docs/VALIDATION_REPORT.md](docs/VALIDATION_REPORT.md) — automated test results
-- [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) — demo recording script
 - [docs/PUBLIC_RELEASE_AUDIT.md](docs/PUBLIC_RELEASE_AUDIT.md) — what was audited before release
 - [docs/DECISIONS.md](docs/DECISIONS.md) — design decisions log
 - [docs/APK_DISTRIBUTION.md](docs/APK_DISTRIBUTION.md) — how the Bridge APK is distributed
