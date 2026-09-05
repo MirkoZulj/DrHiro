@@ -48,23 +48,34 @@ Pairing / approval bridge      short-lived single-use pairing tokens,
    ▼
 TrueForge runtime              agent execution loop: model calls, tool
    │                           orchestration, approvals, context, sessions
+   ├─ tf-shim                  OpenAI-compatible adapter for OpenClaw
    ▼
-MCP tools                      the bundled tools the agent calls (synthetic data)
+MCP tools                      the tools the agent calls
    ▼
 Model backend                  any OpenAI-compatible endpoint (cloud or local)
 ```
 
-- **TrueForge runs the agent loop.** It owns the model calls, reasoning, tool orchestration,
-  human-approval pauses, context compaction, and persistent per-user sessions.
-- **The pairing/approval bridge** is the thin layer between Telegram and TrueForge: it enforces
-  the authorized-user gate, mints one-use pairing tokens, and surfaces Allow/Deny approval
-  prompts from the agent.
-- **The agent calls real MCP tools**, exposed over MCP: retrieval of a synthetic demo case,
-  creation of a structured care-preparation brief, an approval-gated export action, and a
-  non-sensitive status read.
+- **TrueForge runs the agent loop.** It owns the model calls, reasoning, tool
+  orchestration, human-approval pauses, context compaction, and persistent per-user
+  sessions. The bridge talks to it over its `/api/v1/*` API (sessions, turns, SSE
+  events, tool approvals).
+- **Two real model paths into TrueForge:**
+  - **telegram-bridge → TrueForge `/api/v1/sessions`** — agent turns streamed over SSE,
+    with `tool.approval_required` pauses surfaced as Allow/Deny prompts.
+  - **OpenClaw → tf-shim → TrueForge** — an OpenAI-compatible adapter
+    (`/v1/chat/completions`) that maps each request to a persistent TrueForge session.
+- **The pairing/approval bridge** is the thin layer between Telegram and TrueForge: it
+  enforces the authorized-user gate, mints one-use pairing tokens, and surfaces Allow/Deny
+  prompts.
+- **The agent calls MCP tools** over the MCP surface (SSE).
 - **The model backend** is any OpenAI-compatible endpoint — cloud or a local server.
 
 The agent spec lives in [`agent/drhiro.agent.json`](agent/drhiro.agent.json).
+
+> This package now ships the **complete drHiro application** (health tracking, meals,
+> weight, blood pressure, reminders, Android Bridge) on the same stack, with synthetic
+> fixtures only. The submission-shell synthetic tools remain for evaluation.
+
 
 ## Quick start
 
@@ -118,7 +129,12 @@ All values are provided interactively by `install.sh` and written to a protected
   pinned, and fetched by the installer by artifact reference rather than by mutable clone — so
   a production deployment wires its own tool servers the same way it wires its own model
   backend. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current design.
-- **Extended demo coverage** (installer-to-approval walkthrough video).
+- **Demo walkthrough (text).** Recording in progress; a video will be linked here when
+  available. In the meantime the full flow is: run `sudo ./install.sh`, answer the five
+  prompts, then message the bot — it answers the authorized user's questions, and any
+  gated action (e.g. saving/exporting) pauses with an Allow/Deny prompt in Telegram. On the
+  Android side, `/apk` sends the signed Bridge APK and a `drhiro://pair` deep link; opening
+  it pairs the device with a short-lived, single-use token.
 - **Qodo code-review evidence** on the merged release branch (see
   [docs/PUBLIC_RELEASE_AUDIT.md](docs/PUBLIC_RELEASE_AUDIT.md)).
 

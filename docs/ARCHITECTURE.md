@@ -174,6 +174,7 @@ shell. One `docker-compose.yml` at the root brings up every service:
 | `web` | React/Vite web + Telegram Mini App (incl. Settings screen) | reads/writes the settings store via the api |
 | `reverse-proxy` | Caddy TLS edge | — |
 | `trueforge` | Agent runtime (MIT, cloned by install.sh) | **env + re-provision** via `scripts/configure.sh` |
+| `tf-shim` | OpenAI-compatible adapter: OpenClaw model path → TrueForge session | env (TRUEFORGE_URL/AGENT); no restart needed for model changes (per-request) |
 | `drhiro-tools` | MCP tools server (submission shell) | — |
 | `telegram-bridge` | Telegram comms (long polling) | **restart-applies** (see below) |
 | `openclaw-gateway` | OpenClaw Telegram comms layer | **restart-applies** (see below) |
