@@ -1,0 +1,12 @@
+[project]
+name = "drhiro-nutrition-core"
+version = "0.1.0"
+description = "drHiro nutrition: food catalog abstraction, OFF/USDA adapters"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28,<1",
+    "pydantic>=2.7,<3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

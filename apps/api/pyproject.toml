@@ -1,0 +1,27 @@
+[project]
+name = "drhiro-api"
+version = "0.1.0"
+description = "drHiro Core API - canonical health-data platform"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "sqlalchemy>=2.0.30,<3",
+    "psycopg[binary]>=3.2,<4",
+    "alembic>=1.13,<2",
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.3,<3",
+    "PyJWT>=2.8,<3",
+    "python-multipart>=0.0.9,<1",
+    "rq>=1.16,<2",
+    "redis>=5.0,<6",
+    "drhiro-health-schema>=0.1.0,<1",
+    "drhiro-rule-engine>=0.1.0,<1",
+    "drhiro-nutrition-core>=0.1.0,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "httpx>=0.28,<1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

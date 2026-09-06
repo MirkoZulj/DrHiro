@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 WORKDIR /srv
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/srv/src
 
 COPY requirements.txt ./
 COPY src ./src

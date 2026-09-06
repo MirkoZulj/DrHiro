@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simple heart/pulse glyph for the launcher -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,30 L48,38 L44,34 L38,44 L34,40 L30,50 L42,58 L50,46 L54,52 L58,46 L66,58 L78,50 L74,40 L70,44 L64,34 L60,38 L54,30 Z" />
+</vector>
