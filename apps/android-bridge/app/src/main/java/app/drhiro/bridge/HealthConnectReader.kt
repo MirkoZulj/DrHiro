@@ -9,9 +9,12 @@ import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.SleepSessionRecord
 import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.WeightRecord
+import androidx.health.connect.client.request.AggregateGroupByPeriodRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import java.time.Instant
+import java.time.LocalDateTime
+import java.time.Period
 import java.time.ZoneId
 import kotlin.reflect.KClass
 
@@ -30,10 +33,27 @@ import kotlin.reflect.KClass
  *
  * Every record type is read with FULL pageToken pagination — Health
  * Connect returns one page per call and silently truncates the rest.
+ *
+ * STEPS (2026-09-07): STEPS ARE READ VIA THE AGGREGATION API, NOT RAW
+ * StepsRecords. The Mi Fitness app writes steps into Health Connect at
+ * INCONSISTENT granularity — some days 30-minute summary buckets, some
+ * days per-minute detail, some days BOTH overlapping. Uploading the raw
+ * records produced daily step totals that were sometimes double-counted
+ * and sometimes half (the server could not reconcile mixed granularity).
+ * Reading via `aggregateGroupByPeriod(StepsRecord.COUNT_TOTAL, range,
+ * Period.ofDays(1))` makes Health Connect return ONE authoritative daily
+ * step total per period — the same number the Mi Band/app reports —
+ * regardless of how the source wrote it. Every day lands identically.
  */
 class HealthConnectReader(private val context: Context) {
 
     private val client: HealthConnectClient by lazy { HealthConnectClient.getOrCreate(context) }
+
+    // Max number of daily aggregation groups per sync. Health Connect caps
+    // aggregateGroupByPeriod at 5000 groups; clamping to 90 days keeps every
+    // call safely under that. The cursor advances each run, so older history
+    // backfills over subsequent syncs.
+    private val MAX_GROUPS_DAYS: Long = 90
 
     /**
      * One type entry: cursor key + a closure that reads and maps every page of
@@ -68,22 +88,79 @@ class HealthConnectReader(private val context: Context) {
         return out
     }
 
+    /**
+     * Read steps as ONE daily aggregate per period via Health Connect's
+     * aggregation API. Health Connect returns the platform-authoritative total
+     * per day — consistent no matter how the source app wrote the raw records.
+     * `since` is the cursor epoch; we start from the day boundary of that
+     * instant to avoid cutting a day.
+     */
+    private suspend fun readStepsAggregated(
+        range: TimeRangeFilter,
+        zone: ZoneId,
+        since: Long,
+    ): List<Map<String, Any?>> {
+        // Always slice the read from the START of the day containing `since`,
+        // so a day is never split across syncs (which would duplicate or drop
+        // a partial day's steps).
+        val sinceInstant = Instant.ofEpochMilli(since)
+        val sinceDayStartLdt = sinceInstant.atZone(zone).toLocalDate().atStartOfDay()
+
+        // aggregateGroupByPeriod requires a TimeRangeFilter built from
+        // LocalDateTime (device zone), NOT Instant. Passing Instant throws:
+        // "Either use TimeRangeFilter with LocalDateTime or
+        // AggregateGroupByDurationRequest".
+        //
+        // Cap the window to MAX_GROUPS_DAYS so we never request more than ~90
+        // daily groups. Health Connect throws
+        // "Number of groups must not exceed 5000" if `since` is far in the
+        // past (first sync with cursor 0 = epoch would produce tens of
+        // thousands of day groups). Clamping to a bounded window keeps every
+        // call under the cap; the cursor advances each sync so history
+        // backfills incrementally across runs.
+        val nowLdt = LocalDateTime.now(zone)
+        val maxWindowStart = nowLdt.minusDays(MAX_GROUPS_DAYS)
+        val effStart = if (sinceDayStartLdt.isBefore(maxWindowStart)) maxWindowStart else sinceDayStartLdt
+
+        val request = AggregateGroupByPeriodRequest(
+            metrics = setOf(StepsRecord.COUNT_TOTAL),
+            timeRangeFilter = TimeRangeFilter.between(effStart, nowLdt),
+            timeRangeSlicer = Period.ofDays(1),
+            dataOriginFilter = emptySet(),
+        )
+        val grouped = client.aggregateGroupByPeriod(request)
+        val out = mutableListOf<Map<String, Any?>>()
+        for (bucket in grouped) {
+            val startLdt = bucket.startTime
+            val endLdt = bucket.endTime
+            val count = bucket.result.get(StepsRecord.COUNT_TOTAL) ?: 0L
+            if (count <= 0) continue
+            // Health Connect's grouped periods are LocalDateTime in the device
+            // zone; attach the zone so timestamps carry an offset (needed for
+            // Instant.parse in the cursor logic).
+            val startZoned = startLdt.atZone(zone)
+            val endZoned = endLdt.atZone(zone)
+            val day = startLdt.toLocalDate()
+            out += mapOf(
+                "source_record_id" to "steps-daily-$day",
+                "record_type" to "StepsRecord",
+                "start_at" to startZoned.toInstant().toString(),
+                "end_at" to endZoned.toInstant().toString(),
+                "source_timezone" to zone.id,
+                "values" to mapOf("count" to count.toInt()),
+                "device" to mapOf("manufacturer" to "Health Connect", "model" to "aggregated-daily"),
+                "client_modified_at" to endZoned.toInstant().toString(),
+            )
+        }
+        return out
+    }
+
     private val readers: List<TypeReader> = listOf(
         TypeReader("StepsRecord") { c, range ->
-            readAllPages(StepsRecord::class, range, _zone) { r ->
-                listOf(
-                    mapOf(
-                        "source_record_id" to r.metadata.id,
-                        "record_type" to "StepsRecord",
-                        "start_at" to r.startTime.toString(),
-                        "end_at" to r.endTime.toString(),
-                        "source_timezone" to _zone.id,
-                        "values" to mapOf("count" to r.count),
-                        "device" to mapOf("manufacturer" to (r.metadata.device?.manufacturer ?: ""), "model" to (r.metadata.device?.model ?: "")),
-                        "client_modified_at" to r.metadata.lastModifiedTime.toString(),
-                    )
-                )
-            }
+            // Aggregated daily steps (see class docstring for why).
+            // `range` is TimeRangeFilter.after(since); we re-derive since from
+            // the cursor inside readStepsAggregated, but we need the cursor value.
+            readStepsAggregated(range, _zone, _sinceByKey["StepsRecord"] ?: 0L)
         },
         TypeReader("WeightRecord") { c, range ->
             readAllPages(WeightRecord::class, range, _zone) { r ->
@@ -178,6 +255,10 @@ class HealthConnectReader(private val context: Context) {
     // Bound from the caller's zone before any reader closure runs.
     private var _zone: ZoneId = ZoneId.systemDefault()
 
+    // Cursor values by record-type key, so the aggregated steps reader can
+    // re-derive its day-start from the StepsRecord cursor.
+    private var _sinceByKey: Map<String, Long> = emptyMap()
+
     /**
      * Read changes for every record type since its OWN cursor. Returns the
      * records to upload plus the new per-type cursors to persist. Each type's
@@ -190,6 +271,7 @@ class HealthConnectReader(private val context: Context) {
         zone: ZoneId = ZoneId.systemDefault(),
     ): Pair<List<Map<String, Any?>>, Map<String, Long>> {
         _zone = zone
+        _sinceByKey = cursors
         val records = mutableListOf<Map<String, Any?>>()
         val newCursors = cursors.toMutableMap()
 

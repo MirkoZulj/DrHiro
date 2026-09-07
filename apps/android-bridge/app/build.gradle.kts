@@ -13,14 +13,35 @@ android {
         applicationId = "app.drhiro.bridge"
         minSdk = 28   // Health Connect requires API 28+ (Android 9)
         targetSdk = 35
-        versionCode = 11
-        versionName = "0.1.11"
+        versionCode = 14
+        versionName = "0.1.14"
+    }
+
+    signingConfigs {
+        create("release") {
+            val storeFileEnv = System.getenv("DRHIRO_STORE_FILE")
+            if (storeFileEnv != null) {
+                storeFile = file(storeFileEnv)
+                storePassword = System.getenv("DRHIRO_STORE_PASS")
+                keyAlias = System.getenv("DRHIRO_KEY_ALIAS")
+                keyPassword = System.getenv("DRHIRO_KEY_PASS")
+            }
+        }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            // Minify/R8 disabled: the release build crashed on launch with
+            // isMinifyEnabled=true and no proguard rules (the Health Connect
+            // aggregation classes or Compose were being stripped). The
+            // previously-working install was the non-minified debug 0.1.11.
+            // Disabling minify produces a reliable, signed release APK.
+            isMinifyEnabled = false
+            signingConfig = if (System.getenv("DRHIRO_STORE_FILE") != null) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 
@@ -38,7 +59,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.activity:activity-compose:1.9.0")
 
-    // Health Connect — current stable (Oct 2025) has the API-34 permission
+    // Health Connect - current stable (Oct 2025) has the API-34 permission
     // contract fix. Requires SDK 36 + AGP 8.9.1 (toolchain upgraded to match).
     implementation("androidx.health.connect:connect-client:1.1.0")
 
