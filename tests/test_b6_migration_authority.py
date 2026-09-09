@@ -116,16 +116,16 @@ class TestB6SchemaReconciled:
             conn.commit()
 
             conn.execute(text(
-                "INSERT INTO consumption_operations (id, user_id, source, source_bot_id, source_chat_id, source_message_id, result_json, status) "
-                "VALUES (:id, :uid, 'telegram', 'bot1', 'chat1', 'msg1', '{}', 'completed')"
+                "INSERT INTO consumption_operations (id, user_id, source, source_bot_id, source_chat_id, source_message_id, result_json, status, created_at, updated_at) "
+                "VALUES (:id, :uid, 'telegram', 'bot1', 'chat1', 'msg1', '{}', 'completed', NOW(), NOW())"
             ), {"id": str(uuid.uuid4()), "uid": uid})
             conn.commit()
 
             # Second insert with same telegram key must fail
             with pytest.raises(Exception):
                 conn.execute(text(
-                    "INSERT INTO consumption_operations (id, user_id, source, source_bot_id, source_chat_id, source_message_id, result_json, status) "
-                    "VALUES (:id, :uid, 'telegram', 'bot1', 'chat1', 'msg1', '{}', 'completed')"
+                    "INSERT INTO consumption_operations (id, user_id, source, source_bot_id, source_chat_id, source_message_id, result_json, status, created_at, updated_at) "
+                    "VALUES (:id, :uid, 'telegram', 'bot1', 'chat1', 'msg1', '{}', 'completed', NOW(), NOW())"
                 ), {"id": str(uuid.uuid4()), "uid": uid})
                 conn.commit()
             conn.rollback()
