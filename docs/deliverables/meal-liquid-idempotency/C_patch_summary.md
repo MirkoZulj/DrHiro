@@ -99,6 +99,15 @@
 ### 13. `tests/test_stage3_wired_paths.py` (NEW, 25 tests)
 **Change**: Wired-path regression tests calling real router handlers.
 
+### 16. `apps/api/src/drhiro_api/routers/meals.py` (B7 fix)
+**Change**: `delete_meal` now cascades to BeverageMeasurement + Measurement: eagerly loads items, queries linked beverage rows, deletes their Measurements, deletes the BeverageMeasurement rows, then hard-deletes the meal. No orphaned liquid remains.
+
+### 17. `apps/api/src/drhiro_api/services/consumption.py` (B7 fix)
+**Change**: `propagate_beverage_patch` now uses `_classify_beverage(new_name)` as the source of truth. When the new name is NOT a beverage, it clears `beverage_category` (sets `volume_ml=None`) and removes the BeverageMeasurement + Measurement. When the new name IS a beverage, it adopts the new category and keeps the liquid projection.
+
+### 18. `tests/test_b7_closing_regression.py` (NEW, 7 tests)
+**Change**: `TestDeleteMealCascade` (3 tests: cascade + no-resurrect + ownership-404) and `TestBeverageToSolidRename` (4 tests: rename clears category + drops liquid, rename-by-name, beverage→beverage keeps liquid, ownership-404). Proves both B7 gaps are closed.
+
 ### 14. `docs/deliverables/meal-liquid-idempotency/stage3_entrypoints_coverage_matrix.md` (UPDATED)
 ### 15. `docs/deliverables/meal-liquid-idempotency/stage3_entrypoints_mutations_evidence.md` (UPDATED)
 
@@ -171,7 +180,7 @@ The `service.py` on the VPS (deploy-only) needs to be updated to call `consumpti
 
 ## Test Coverage
 
-126 tests pass. 7 new reconciliation-path tests replace the removed `test_same_drink_manual_plus_meal_counts_twice` (which asserted the wrong 660ml double-count semantics). New tests prove:
+233 tests pass. B7 closing regression suite adds 7 tests. the removed `test_same_drink_manual_plus_meal_counts_twice` (which asserted the wrong 660ml double-count semantics). New tests prove:
 - Same-event meal+liquid = ONE consumption
 - Retry returns saved result, no new contribution
 - Explicit reference reconciles to existing item (no second row)

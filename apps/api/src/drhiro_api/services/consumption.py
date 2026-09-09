@@ -2085,10 +2085,21 @@ def propagate_beverage_patch(
     new_category = item.beverage_category
     new_name = item.display_name
 
-    # Determine if the item is still a beverage after the rename
-    still_bev = new_category is not None or (
-        new_name is not None and _classify_beverage(new_name) is not None
-    ) if new_name else (new_category is not None)
+    # Determine if the item is still a beverage after the rename.
+    # Use the NEW name's classification as the source of truth.
+    if new_name:
+        classified = _classify_beverage(new_name)
+        if classified is not None:
+            # New name is a beverage → keep liquid, adopt category if needed
+            still_bev = True
+            if new_category is None:
+                new_category = classified
+        else:
+            # New name is NOT a beverage → not a beverage, clear category
+            still_bev = False
+            new_category = None
+    else:
+        still_bev = new_category is not None
 
     if bev and not still_bev:
         # Beverage renamed to a solid: remove the liquid projection

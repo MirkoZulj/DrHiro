@@ -403,16 +403,19 @@ class TestWiredBeveragePatch:
         ).first()
         assert meas.value_json["category"] == "non_alcoholic"
 
-    def test_patch_beverage_to_solid_keeps_liquid_with_warning(self, db, user, food_catalog, monkeypatch):
-        """Renaming a beverage to a solid food: document current behavior.
+    def test_patch_beverage_to_solid_drops_liquid(self, db, user, food_catalog, monkeypatch):
+        """Renaming a beverage to a solid food must drop the liquid projection.
 
-        Current wiring limitation: patch_meal_item propagates to Measurement
-        via propagate_beverage_patch, but does NOT clear beverage_category
-        on the item when the name changes. So the item is still classified
-        as a beverage after rename, and the liquid projection is retained.
+        Previously a known gap (B4 partial): patch_meal_item propagated to
+        Measurement via propagate_beverage_patch, but did NOT clear
+        beverage_category on the item when the name changed. So the item
+        was still classified as a beverage after rename, and the liquid
+        projection was retained.
 
-        This is a known gap (B4 partial): the category should be cleared
-        when the new name is not a beverage.
+        FIXED: propagate_beverage_patch now uses the NEW name's classification
+        as the source of truth. When the new name is not a beverage, it clears
+        beverage_category, sets volume_ml=None, and removes the BeverageMeasurement
+        + Measurement.
         """
         # Mock task_queue.enqueue to avoid Redis dependency (fire-and-forget)
         import drhiro_api.services.task_queue as tq
@@ -435,24 +438,26 @@ class TestWiredBeveragePatch:
             mi_id = str(bev.meal_item_id)
             meas_id = str(bev.measurement_id)
 
-            # Patch name to steak (solid food) - but the beverage_category
-            # is not cleared, so the liquid projection is retained.
+            # Patch name to steak (solid food) — liquid projection must be removed
             req_patch = MealItemPatch(display_name="steak")
             out = patch_meal_item(str(meal.id), mi_id, req_patch, user=user, db=db)
 
-            # KNOWN GAP: BeverageMeasurement is NOT removed because the
-            # item's beverage_category ("non_alcoholic") is not cleared.
+            # FIXED: BeverageMeasurement IS removed because the new name is not a beverage
             bev_after = db.query(BeverageMeasurement).filter(
                 BeverageMeasurement.id == bev.id
             ).first()
-            # Current behavior: still exists (known limitation)
-            assert bev_after is not None  # Would be None if fully consistent
+            assert bev_after is None, "BeverageMeasurement should be removed after rename to solid"
 
-            # Measurement still exists
+            # Measurement is removed
             meas_after = db.query(Measurement).filter(
                 Measurement.id == meas_id
             ).first()
-            assert meas_after is not None  # Would be None if fully consistent
+            assert meas_after is None, "Measurement should be removed after rename to solid"
+
+            # Item's beverage_category is cleared
+            mi_after = db.query(MealItem).filter(MealItem.id == mi_id).first()
+            assert mi_after.beverage_category is None
+            assert mi_after.volume_ml is None
         finally:
             tq.enqueue = original_enqueue
 

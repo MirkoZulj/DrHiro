@@ -25,7 +25,9 @@ from drhiro_api.services.consumption import (
     propagate_beverage_patch,
     delete_beverage_item,
     copy_beverage_link,
+    _classify_beverage,
 )
+from drhiro_api.models import BeverageMeasurement, Measurement
 from drhiro_nutrition.catalog import FoodItem, NutrientTotals, scale_nutrients
 from drhiro_nutrition.composite import CompositeCatalog
 
@@ -217,7 +219,7 @@ def _recompute_totals(meal: Meal) -> dict:
     every item mutation (patch / add / delete) so the meal's kcal can never
     drift away from the sum of its items.
     """
-    kcal = protein = carbs = fat = fiber = 0.0
+    kcal = protein = carbs = fat = fiber = sodium = 0.0
     estimated = False
     for i in meal.items:
         if (i.confidence if i.confidence is not None else 0.0) < 0.8:
@@ -228,12 +230,14 @@ def _recompute_totals(meal: Meal) -> dict:
         carbs += n.get("carbs_g") or 0.0
         fat += n.get("fat_g") or 0.0
         fiber += n.get("fiber_g") or 0.0
+        sodium += n.get("sodium_mg") or 0.0
     return {
         "kcal": round(kcal, 1),
         "protein_g": round(protein, 1),
         "carbs_g": round(carbs, 1),
         "fat_g": round(fat, 1),
         "fiber_g": round(fiber, 1),
+        "sodium_mg": round(sodium, 1),
         "estimated": estimated,
     }
 
@@ -823,10 +827,35 @@ def copy_meal(meal_id: str, user: User = Depends(get_current_user), db: Session 
 
 @router.delete("/{meal_id}")
 def delete_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    meal = db.query(Meal).filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id).first()
+    meal = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
     if not meal:
         raise HTTPException(status_code=404, detail="Meal not found")
+
+    # Cascade to beverage liquid projections: remove linked BeverageMeasurement + Measurement
+    # for all beverage items in this meal so no orphaned liquid remains in the dashboard sum.
+    item_ids = [mi.id for mi in meal.items]
+    if item_ids:
+        bevs = db.query(BeverageMeasurement).filter(
+            BeverageMeasurement.meal_item_id.in_(item_ids)
+        ).all()
+        for bev in bevs:
+            db.query(Measurement).filter(
+                Measurement.id == bev.measurement_id,
+                Measurement.user_id == user.id,
+            ).delete(synchronize_session=False)
+        db.query(BeverageMeasurement).filter(
+            BeverageMeasurement.meal_item_id.in_(item_ids)
+        ).delete(synchronize_session=False)
+
+    # Hard-delete the meal and its items (cascade="all, delete-orphan" handles items)
     meal.status = "deleted"
+    db.flush()
+    db.delete(meal)
     audit(db, "user", str(user.id), user.id, "meals.delete", "meal", str(meal.id))
     db.commit()
     return {"ok": True}

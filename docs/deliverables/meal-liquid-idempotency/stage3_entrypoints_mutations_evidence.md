@@ -14,7 +14,7 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 - **Fixed nutrient-basis resolution** to follow ACTUAL source data (mass-primary when both grams and volume present).
 - **Updated Stage 2 test** (`test_mass_vs_volume_beverage_uses_actual_source_basis`) to reflect the corrected semantics.
 - **Added 17 regression tests** in `tests/test_stage3_b4_b7_regression.py`.
-- **All 201 tests pass** (184 Stages 1+2 + 17 Stage 3).
+- **All 233 tests pass** (226 prior + 7 B7 closing regression tests).
 
 ---
 
@@ -40,9 +40,9 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 | # | Entry Point | Route | File | Wires Into | Status |
 |---|---|---|---|---|---|
 | 11 | Patch meal metadata | `PATCH /meals/{meal_id}` | routers/meals.py `patch_meal` | Direct (meal_type/notes/eaten_at) | OK — no item changes |
-| 12 | Patch meal item | `PATCH /meals/{meal_id}/items/{item_id}` | routers/meals.py `patch_meal_item` | `propagate_beverage_patch` → shared domain | WIRED (PARTIAL: beverage→solid rename keeps liquid) |
+| 12 | Patch meal item | `PATCH /meals/{meal_id}/items/{item_id}` | routers/meals.py `patch_meal_item` | `propagate_beverage_patch` → shared domain | WIRED (beverage→solid rename clears category + drops liquid) |
 | 13 | Remove meal item | `DELETE /meals/{meal_id}/items/{item_id}` | routers/meals.py `remove_meal_item` | `delete_beverage_item` for beverages | WIRED |
-| 14 | Delete meal | `DELETE /meals/{meal_id}` | routers/meals.py `delete_meal` | `meal.status = "deleted"` only | BYPASS — beverage measurements orphaned |
+| 14 | Delete meal | `DELETE /meals/{meal_id}` | routers/meals.py `delete_meal` | Cascades to BeverageMeasurement + Measurement → hard-delete | WIRED |
 
 ### Manual Liquid / Water Paths
 
@@ -90,15 +90,15 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 
 **Verification**: `TestWiredBeverageDelete::test_delete_beverage_removes_linked_measurement` — deletes milk item, asserts BeverageMeasurement, MealItem, and Measurement all gone; totals recomputed.
 
-### Blocker B4-0d (WIRED, PARTIAL): patch_meal_item propagates to Measurement
+### Blocker B4-0d (WIRED): patch_meal_item propagates to Measurement
 
 **Path**: `PATCH /meals/{meal_id}/items/{item_id}` for a beverage.
 
 **Wiring**: `patch_meal_item` calls `propagate_beverage_patch(db, user.id, meal_id, item, old_grams)` which detects the BeverageMeasurement link and updates Measurement.value_json (amount_ml, category). Also calls `_sync_totals`.
 
-**Known gap**: When a beverage is renamed to a solid food, `propagate_beverage_patch` does NOT clear `beverage_category` on the item. So `still_bev` remains truthy (because `item.beverage_category` is still set) and the liquid projection is retained. The item is still classified as a beverage after rename.
+**Fix**: `propagate_beverage_patch` now uses `_classify_beverage(new_name)` as the source of truth. When the new name is NOT a beverage, it clears `beverage_category`, sets `volume_ml=None`, and removes the BeverageMeasurement + Measurement. When the new name IS a beverage, it adopts the new category and keeps the liquid projection.
 
-**Verification**: `TestWiredBeveragePatch::test_patch_beverage_grams_propagates_to_measurement` and `test_patch_beverage_name_propagates_to_measurement` — confirm propagation works. `test_patch_beverage_to_solid_keeps_liquid_with_warning` documents the known gap.
+**Verification**: `TestWiredBeveragePatch::test_patch_beverage_grams_propagates_to_measurement`, `test_patch_beverage_name_propagates_to_measurement`, and `test_patch_beverage_to_solid_drops_liquid` confirm correct behavior for all rename directions.
 
 ### Blocker B4-1 (WIRED): Generic datapoint update of beverage updates meal_item + totals
 
@@ -116,15 +116,13 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 
 **Verification**: `TestWiredGenericMeasurementCRUD::test_generic_delete_beverage_cascades`.
 
-### Blocker B4-3: Router delete_meal doesn't cascade to beverage measurements
+### Blocker B4-3 (WIRED): Router delete_meal cascades to beverage measurements
 
 **Affected path**: `DELETE /meals/{meal_id}`.
 
-**Pre-fix behavior**: `routers/meals.py:delete_meal` only sets `meal.status = "deleted"` without removing BeverageMeasurement or Measurement rows.
+**Fix**: `routers/meals.py:delete_meal` now eagerly loads meal items, queries linked BeverageMeasurement rows, deletes their Measurement rows, deletes the BeverageMeasurement rows, then hard-deletes the meal (cascade handles MealItem rows). No orphaned liquid remains.
 
-**Fix**: The domain `delete_meal` function already cascades correctly. Router should delegate to it.
-
-**Verification**: `TestB4EntryPointCoverage::test_delete_meal_domain_cascades_to_beverage_measurements` — confirms domain function removes BeverageMeasurement + Measurement rows.
+**Verification**: `TestB4EntryPointCoverage::test_delete_meal_domain_cascades_to_beverage_measurements` (domain) and `TestDeleteMealCascade` (3 tests in test_b7_closing_regression.py: cascade, no-resurrect, ownership-404).
 
 ---
 
@@ -224,8 +222,9 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 - Stage 1: 154 tests
 - Stage 2: 30 tests (1 updated for corrected nutrient-basis semantics)
 - Stage 3 (B4+B7): 17 new tests
-- Stage 3 (wired paths): 25 new tests
-- **Total**: **226 tests, all passing**
+- Stage 3 (wired paths): 25 tests (1 updated for solid-rename fix)
+- B7 closing regression: 7 new tests (test_b7_closing_regression.py)
+- **Total**: **233 tests, all passing**
 
 ---
 
@@ -255,7 +254,5 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 
 1. **Stage 4 = B9 cutover** — not yet started.
 2. **Recipe consumption** — `POST /meals/recipes` creates a FoodCatalogItem but there is no "consume recipe" endpoint. When implemented, it must call `write_consumption`.
-3. **Meal item patch — beverage→solid rename** — `propagate_beverage_patch` does not clear `beverage_category` when a beverage is renamed to a solid food. The liquid projection is retained because `item.beverage_category` is still set. Documented in `test_patch_beverage_to_solid_keeps_liquid_with_warning`.
-4. **Delete meal** — `routers/meals.py:delete_meal` still bypasses the domain. It sets `meal.status = "deleted"` without cascading to BeverageMeasurement/Measurement. The domain `delete_meal` function exists but the router doesn't call it.
-5. **Manual water / Manual text (water)** — still write bare water rows. The reconciliation-aware `log_manual_liquid` exists but the legacy `/manual/water` path doesn't use it. This is intentional coexistence (per C_patch_summary.md).
-6. **Create ConsumptionOperation** — `add_meal_item`, `copy_meal`, `patch_meal_item`, `remove_meal_item` don't create a `ConsumptionOperation` record. They create BeverageMeasurement links but without the operation identity needed for full replay idempotency.
+3. **Manual water / Manual text (water)** — still write bare water rows. The reconciliation-aware `log_manual_liquid` exists but the legacy `/manual/water` path doesn't use it. This is intentional coexistence (per C_patch_summary.md).
+5. **Create ConsumptionOperation** — `add_meal_item`, `copy_meal`, `patch_meal_item`, `remove_meal_item` don't create a `ConsumptionOperation` record. They create BeverageMeasurement links but without the operation identity needed for full replay idempotency.

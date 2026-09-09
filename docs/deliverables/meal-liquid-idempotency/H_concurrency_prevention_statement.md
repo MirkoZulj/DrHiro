@@ -155,6 +155,35 @@ The unified consumption domain (`consumption.py`) prevents duplicate drink RECOR
 - `TestB4EntryPointCoverage::test_generic_datapoint_update_delegates_for_beverage` — verifies all projections update.
 - `TestB4EntryPointCoverage::test_generic_datapoint_delete_delegates_for_beverage` — verifies cascade.
 
+
+## B7 — Full Closeout (delete_meal cascade + beverage→solid rename)
+
+### Blocker B7-1: delete_meal did not cascade to liquid projections
+**Status**: **FIXED** — `routers/meals.py:delete_meal` now eagerly loads meal items, queries linked BeverageMeasurement rows, deletes their Measurement rows, deletes the BeverageMeasurement rows, then hard-deletes the meal. No orphaned liquid remains.
+
+**Test coverage**: `TestDeleteMealCascade::test_delete_meal_cascades_to_liquid_projections` — verifies BeverageMeasurement, Measurement, and MealItem all gone after delete.
+
+### Blocker B7-2: beverage→solid rename kept obsolete liquid projection
+**Status**: **FIXED** — `propagate_beverage_patch` uses `_classify_beverage(new_name)` as the source of truth. When the new name is not a beverage, it clears `beverage_category`, sets `volume_ml=None`, and removes the BeverageMeasurement + Measurement. Meal totals are recomputed from the solid food's nutrients.
+
+**Test coverage**:
+- `TestBeverageToSolidRename::test_beverage_to_solid_rename_clears_category_and_drops_liquid` — full rename (food_catalog_item_id path): asserts category=None, volume_ml=None, BeverageMeasurement=0, Measurement=0, meal totals match steak (677.5 kcal, 65g protein, 0g carbs, 45g fat, 0g fiber, 137.5mg sodium).
+- `TestBeverageToSolidRename::test_beverage_to_solid_rename_by_name_only` — name-only rename (display_name path): same assertions.
+- `TestBeverageToSolidRename::test_beverage_to_beverage_rename_keeps_liquid` — milk→juice: BeverageMeasurement+Measurement preserved, category updated, meal totals match juice (112.5 kcal, 1.75g protein, 25g carbs, 0.5g fat, 0.5g fiber, 2.5mg sodium).
+- `TestWiredBeveragePatch::test_patch_beverage_to_solid_drops_liquid` — wired-path integration test.
+
+### No-resurrect guarantee
+After a meal with beverages is deleted, retrying the original creation does NOT resurrect the deleted meal's consumption. The new meal is a SEPARATE entity.
+
+**Test coverage**: `TestDeleteMealCascade::test_delete_meal_retry_does_not_resurrect` — creates a meal, deletes it, recreates with same content, asserts only 1 measurement (the new one).
+
+### Ownership isolation
+- `TestDeleteMealCascade::test_delete_meal_ownership_404` — User B cannot delete User A's meal (404, no mutation).
+- `TestBeverageToSolidRename::test_beverage_to_solid_ownership_404` — User B cannot rename User A's meal item (404, no mutation).
+
+### Verdict: B7 FULLY CLOSED
+Both B7 blocker conditions are now closed. Stage 3 = B4 + B7 complete.
+
 ---
 
 ## B7 — Canonical Atomic Mutations
