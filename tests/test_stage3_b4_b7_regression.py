@@ -43,7 +43,7 @@ from drhiro_api.services.consumption import (
 # ---------------------------------------------------------------------------
 
 TEST_DB_URL = os.environ.get(
-    "DRHIRORO_TEST_DB_URL",
+    "DRHIRO_TEST_DB_URL",
     "postgresql+psycopg2://drhiro:drhiro@localhost:5435/drhiro_test",
 )
 
@@ -198,7 +198,7 @@ def _make_item(display_name, grams=None, volume_ml=None, beverage_category=None,
     if food and db:
         _attach_nutrients(db, item, food)
     else:
-        item.nutrients_per_ml = {"kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0, "sodium_mg": 0}
+        item.nutrients_per_100 = {"kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0, "sodium_mg": 0}
         item.nutrients_scaled = {"kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0, "sodium_mg": 0}
     return item
 
