@@ -21,8 +21,12 @@ id_rsa*
 *.p12
 *.pfx
 
+# --- Reference snapshots with live secrets (keep pristine out of history) ---
+# The raw VPS service copy contains real credentials; only the sanitized
+# version is committed.
+docs/reference/intelligent-meal-service.py
+
 # --- Data & runtime state ---
-data/exports/
 data/state/
 data/pairing/
 *.log

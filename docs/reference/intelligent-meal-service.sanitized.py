@@ -32,16 +32,16 @@ log = logging.getLogger("intelligent-meal")
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DB_URL = os.environ.get("DATABASE_URL", "postgresql+psycopg2://drhiro:drhiro@localhost:5432/drhiro")
+DB_URL = os.environ.get("DATABASE_URL", "postgresql+psycopg2://<DB_USER>:<DB_PASS>@<DB_HOST>/<DB_NAME>")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-JWT_SECRET = os.environ.get("DRHIRO_JWT_SECRET", "change-me-in-production")
+JWT_SECRET = os.environ.get("DRHIRO_JWT_SECRET", "<JWT_SECRET>")
 SERVICE_TOKEN = os.environ.get("DRHIRO_SERVICE_TOKEN", "")
-TELEGRAM_ID = os.environ.get("DRHIRO_TELEGRAM_ID", "984523234")
+TELEGRAM_ID = os.environ.get("DRHIRO_TELEGRAM_ID", "<TELEGRAM_ID>")
 
 # Camoufox / Pi SSH config
 PI_HOST = os.environ.get("PI_HOST", "100.75.194.51")
 PI_USER = os.environ.get("PI_USER", "mirko")
-PI_PASS = os.environ.get("PI_PASS", "<redacted-secret>")
+PI_PASS = os.environ.get("PI_PASS", "<PI_PASS>")
 CAMOUFOX_SCRIPT = "/home/mirko/camoufox_nutrition.py"
 
 # ---------------------------------------------------------------------------

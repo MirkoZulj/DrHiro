@@ -459,10 +459,14 @@ def write_consumption(
 
     # Ensure we have an operation
     if operation_id:
+        # Lock the operation row so concurrent confirms serialize here: the
+        # second writer blocks until the first commits, then observes
+        # status='completed' and returns the saved result instead of writing a
+        # duplicate meal. This makes replay durable at the DB level.
         op = db.query(ConsumptionOperation).filter(
             ConsumptionOperation.id == operation_id,
             ConsumptionOperation.user_id == user_id,
-        ).first()
+        ).with_for_update().first()
         if not op:
             raise ValueError("operation_not_found")
         # If already completed, return the stored result (idempotent replay)
@@ -617,6 +621,69 @@ def write_consumption(
 
     db.commit()
     return result
+
+
+# ---------------------------------------------------------------------------
+# Confirm handler bridge
+# ---------------------------------------------------------------------------
+
+def confirm_consumption(
+    db: Session,
+    user_id: str,
+    items: list[ParsedItem],
+    meal_type: Optional[str] = None,
+    eaten_at: Optional[datetime] = None,
+    notes: Optional[str] = None,
+    *,
+    source: str = "telegram",
+    source_chat_id: Optional[str] = None,
+    source_message_id: Optional[str] = None,
+    source_bot_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    raw_text: Optional[str] = None,
+) -> dict:
+    """Single entry point for the /meals/from-text-intelligent/confirm handler.
+
+    Resolves (or creates) the ConsumptionOperation for the caller's source
+    identity FIRST — before any write — so that a retry after the Redis draft
+    is deleted finds the already-completed operation and returns its saved
+    result instead of 404-ing or creating a duplicate meal.
+
+    Flow:
+      1. get_or_create_operation — durable replay lookup by Telegram key or
+         caller idempotency_key. If an existing operation is already
+         'completed', write_consumption returns its saved result.
+      2. write_consumption(items, operation_id=...) — atomic meal + beverage
+         write in ONE transaction, persisted result_json for replay.
+
+    Returns the confirm-shaped result dict with durable replay semantics:
+    calling this twice for the same source identity returns the SAME result
+    (same meal_id) and never creates a second meal or beverage measurement.
+    """
+    op, created = get_or_create_operation(
+        db=db,
+        user_id=user_id,
+        source=source,
+        source_chat_id=source_chat_id,
+        source_message_id=source_message_id,
+        source_bot_id=source_bot_id,
+        idempotency_key=idempotency_key,
+        raw_text=raw_text,
+    )
+    # Commit the pending operation row so concurrent callers can see it
+    # (the row lock in write_consumption serializes the actual write).
+    if created:
+        db.flush()
+
+    return write_consumption(
+        db=db,
+        user_id=user_id,
+        items=items,
+        meal_type=meal_type,
+        eaten_at=eaten_at,
+        operation_id=str(op.id),
+        notes=notes,
+    )
 
 
 # ---------------------------------------------------------------------------
