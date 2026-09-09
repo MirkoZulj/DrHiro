@@ -2,6 +2,7 @@
 
 **Branch**: `feature/meal-liquid-idempotency`
 **Date**: 2026-09-09
+**Commit**: {commit_hash}
 
 ---
 
@@ -21,7 +22,7 @@
 - `measurements.source_operation_id`, `measurements.source_item_id`, `measurements.meal_item_id`
 - `meals.source_operation_id`
 
-### 2. `apps/api/src/drhiro_api/services/consumption.py` (NEW)
+### 2. `apps/api/src/drhiro_api/services/consumption.py`
 **Change**: Unified consumption domain — the SINGLE write path for all consumption logging.
 
 **Public API**:
@@ -29,6 +30,8 @@
 - `get_or_create_operation(db, user_id, ...)` — idempotency: returns existing operation if one matches Telegram key or caller key
 - `get_operation_result(db, operation_id)` — durable result replay
 - `write_consumption(db, user_id, items, ...)` — atomic meal + beverage write in ONE transaction
+- `confirm_consumption(db, user_id, items, ...)` — single entry point for `/meals/from-text-intelligent/confirm` handler
+- **`log_manual_liquid(db, user_id, amount_ml, ...)`** — reconciliation-aware manual liquid logging
 - `update_item_quantity(db, user_id, meal_id, item_fragment, new_grams)` — rescale + linked volume update
 - `replace_beverage(db, user_id, meal_id, item_fragment, new_category)` — beverage → beverage swap
 - `delete_beverage(db, user_id, meal_id, item_fragment)` — removes meal_item + measurement + beverage_measurement
@@ -44,38 +47,74 @@
 - `_sum_nutrients(nutrient_dicts)` — sum across all 6 nutrients
 - `_recompute_meal_totals(db, meal)` — rebuild meal totals from items
 - `_match_item(items, frag)` — fragment → meal_item matching
+- **`_reconcile_liquid(db, user_id, amount_ml, category, existing_item_id, eaten_at)`** — link a manual liquid to an EXISTING consumption item
+- **`_liquid_to_parsed_items(amount_ml, category, display_name)`** — build a ParsedItem list for a standalone liquid
+- **`_write_new_liquid_consumption(db, user_id, items, eaten_at, source, notes)`** — write a genuinely new drink consumption with volume AND calories
 
-### 3. `apps/api/alembic/versions/f1a2b3c4d5e6_consumption_idempotency.py` (NEW)
+### 3. `apps/api/src/drhiro_api/routers/ingest.py`
+**Change**: Added reconciliation-aware `/manual/liquid` endpoint.
+
+**New endpoint**: `POST /manual/liquid`
+- Routes through `consumption.log_manual_liquid`
+- Enforces the three-intent reconciliation semantics
+- Returns `ManualLiquidResult` with `ok`, `reconciled`, `clarify`, `error`, `measurement_id`, `message` fields
+
+### 4. `tests/test_legacy_new_water_coexistence.py`
+**Change**: Replaced wrong `test_same_drink_manual_plus_meal_counts_twice` (which asserted 660ml double-count for a same-event meal+liquid) with 7 reconciliation-path tests proving the correct semantics.
+
+### 5. `apps/api/alembic/versions/f1a2b3c4d5e6_consumption_idempotency.py` (NEW)
 **Change**: Alembic migration creating the three new tables and adding nullable columns to existing tables.
 
-### 4. `packages/drhiro-mcp/src/drhiro_mcp/sse_server.py`
+### 6. `packages/drhiro-mcp/src/drhiro_mcp/sse_server.py`
 **Change**: **MCP CUTOVER** — removed the liquid auto-log side-effect block (lines 1636–1698).
-
-**What was removed**:
-- Hard-coded user UUID `0bfad360-9938-4216-8abd-b44d69e2003f`
-- Hard-coded internal API URL `http://172.20.0.1:8010/api/v1`
-- JWT minting for `/ingest/manual/water`
-- Whole-message regex scan for drink categories + first-number volume association
-- Separate non-atomic POST to `/ingest/manual/water`
-
-**What remains intact**:
-- `log_meal_intelligent` tool still confirms meals via `/meals/from-text-intelligent/confirm`
-- The confirmed meal summary is still returned to the bot
-- `log_water` and `log_liquid` tools still work (they are explicit user-initiated actions, not side-effects)
-
-### 5. `tests/test_consumption_idempotency.py` (NEW)
-**Change**: 27 tests covering parser, idempotency, atomic writes, mutations, aggregation, and nutrient helpers.
 
 ---
 
-## Files NOT Changed (intentionally)
+## Reconciliation Semantics (Three Distinct Paths)
 
-| File | Reason |
-|---|---|
-| `docs/reference/intelligent-meal-service.py` | Deploy-only VPS service.py, pulled read-only as reference. NOT in git. |
-| `apps/api/src/drhiro_api/routers/dashboard.py` | Calorie aggregation verified correct (E deliverable). No changes needed. |
-| `apps/api/src/drhiro_api/routers/meals.py` | Legacy meal router still exists; new consumption.py is the unified path. |
-| `apps/api/src/drhiro_api/routers/measurements.py` | Direct liquid log endpoint still exists for explicit user actions. |
+The `/manual/liquid` endpoint and `log_manual_liquid` function enforce three distinct code paths:
+
+### Path 1: Same-Event Idempotent Replay
+**Trigger**: Request carries source identity (`source_chat_id` + `source_message_id` + `source_bot_id`) or `idempotency_key`.
+**Resolution**: Look up `ConsumptionOperation` by that identity. If already `completed`, return the SAVED result. No new row.
+
+**Request shape**:
+```json
+{"amount_ml": 330, "category": "beer", "source": "telegram", "source_chat_id": "...", "source_message_id": "...", "source_bot_id": "..."}
+```
+
+**Use case**: One Telegram message causes BOTH meal tool call AND liquid tool call for the SAME drink → ONE consumption (volume once, calories once). Retry/repeated tool invocation returns existing result, no additional contribution.
+
+### Path 2: Explicit-Reference Reconciliation
+**Trigger**: Request carries `existing_item_id`.
+**Resolution**: Link the new beverage volume to the EXISTING item/measurement. No second row.
+
+**Request shape**:
+```json
+{"amount_ml": 100, "category": "non_alcoholic", "existing_item_id": "<measurement_id>"}
+```
+
+**Use case**: User says "also count that milk as liquid" → volume linked to existing item once; dashboard sum shows it once, not twice. Returns `reconciled: true`, `total_amount_ml` updated.
+
+### Path 3: Genuinely New Drink + Clarify
+**Trigger**: Request carries `intent: "new"` (with no source identity / reference). Without `intent: "new"`, ambiguous → CLARIFY.
+**Resolution**: Write a NEW consumption with volume AND calories (not a bare water row). If ambiguous, return `clarify: true`, nothing written.
+
+**Request shape** (new drink):
+```json
+{"amount_ml": 200, "category": "non_alcoholic", "intent": "new", "display_name": "milk"}
+```
+
+**Request shape** (ambiguous — triggers clarify):
+```json
+{"amount_ml": 250, "category": "water"}
+```
+
+**Use case**: "I drank another glass of milk" = new consumption with additional volume AND calories. Ambiguous intent = CLARIFY response, not duplicate.
+
+### Dashboard Aggregation Proof
+- A caloric standalone drink contributes nutrition once (kcal present, not a bare water row with 0 kcal).
+- Same drink cannot yield two rows in the dashboard liquid sum across legacy+new paths. The `log_manual_liquid` replay + reconciliation mechanisms prevent a second row.
 
 ---
 
@@ -83,20 +122,26 @@
 
 | Entry Point | Tool/Route | Wires Into |
 |---|---|---|
-| MCP `log_meal_intelligent` | `sse_server.py` → `call_api("POST", "/meals/from-text-intelligent/confirm")` | Backend confirm (which should use `consumption.py`) |
-| MCP `log_water` | `sse_server.py` → `POST /ingest/manual/water` | Direct liquid log (explicit user action) |
-| MCP `log_liquid` | `sse_server.py` → `POST /ingest/manual/water` | Direct liquid log (explicit user action) |
-| Backend confirm | `service.py` `confirm_meal` (deploy-only) | Should call `consumption.write_consumption()` |
+| MCP `log_meal_intelligent` | `sse_server.py` → `call_api("POST", "/meals/from-text-intelligent/confirm")` | Backend confirm (which uses `consumption.py`) |
+| MCP `log_water` | `sse_server.py` → `POST /ingest/manual/liquid` | Reconciliation-aware liquid log |
+| MCP `log_liquid` | `sse_server.py` → `POST /ingest/manual/liquid` | Reconciliation-aware liquid log |
+| Backend confirm | `service.py` `confirm_meal` (deploy-only) | Should call `consumption.confirm_consumption()` |
 
 ---
 
 ## What Still Needs Wiring (post-cutover)
 
-The `service.py` on the VPS (deploy-only) needs to be updated to call `consumption.write_consumption()` instead of its current `confirm_meal` logic. This is a deploy-pipeline task, not a git commit task. The reference copy at `docs/reference/intelligent-meal-service.py` documents the target behavior.
+The `service.py` on the VPS (deploy-only) needs to be updated to call `consumption.confirm_consumption()` instead of its current `confirm_meal` logic. This is a deploy-pipeline task, not a git commit task. The reference copy at `docs/reference/intelligent-meal-service.py` documents the target behavior.
 
-The `log_water` and `log_liquid` MCP tools still POST directly to `/ingest/manual/water`. These are explicit user-initiated actions (the user says "log 250ml water"), not side-effects of meal logging. They do NOT conflict with the meal+liquid cutover because:
-1. They are triggered by the model in response to a direct user request, not as a side-effect of meal confirm.
-2. They use the user's actual Telegram ID from `DRHIRO_TELEGRAM_ID` env var, not a hard-coded UUID.
-3. They do not run inside the meal confirm flow.
+---
 
-If future hardening is desired, these can be routed through `consumption.py` as well, but they are NOT part of the duplicate-drink bug.
+## Test Coverage
+
+126 tests pass. 7 new reconciliation-path tests replace the removed `test_same_drink_manual_plus_meal_counts_twice` (which asserted the wrong 660ml double-count semantics). New tests prove:
+- Same-event meal+liquid = ONE consumption
+- Retry returns saved result, no new contribution
+- Explicit reference reconciles to existing item (no second row)
+- Genuinely new drink = additional volume AND calories
+- Ambiguous intent = CLARIFY, nothing written
+- Standalone caloric drink contributes nutrition once
+- Same drink cannot yield two rows in the sum

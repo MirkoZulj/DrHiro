@@ -63,6 +63,15 @@ printed; all are shown as `<REDACTED>`.
 - **Severity**: Low.
 - **Action**: Move to env var.
 
+## Reconciliation Note
+
+The new `/manual/liquid` endpoint (`apps/api/src/drhiro_api/routers/ingest.py`) routes through `consumption.log_manual_liquid` which enforces three-intent reconciliation:
+- Same-event idempotent replay (source identity)
+- Explicit-reference reconciliation (`existing_item_id`)
+- Genuinely new drink (`intent: "new"`) + CLARIFY for ambiguous intent
+
+This endpoint does NOT mint JWTs or use hard-coded credentials. It uses the standard `get_current_user` dependency (same as all other `/manual/*` endpoints).
+
 ## Verification
 
 - Grep for `0bfad360-9938-4216-8abd-b44d69e2003f` in sse_server.py: only a

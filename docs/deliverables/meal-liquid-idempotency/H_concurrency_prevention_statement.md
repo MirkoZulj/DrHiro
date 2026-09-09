@@ -150,6 +150,29 @@ The unified consumption domain (`consumption.py`) prevents duplicate drink RECOR
 
 ---
 
+## Manual-Liquid Reconciliation (Three-Intent Model)
+
+**Scenario**: The same drink is referenced by a meal tool call and a manual-liquid log in the same Telegram event. How is double-counting prevented?
+
+**Answer**: Through three distinct code paths in `consumption.log_manual_liquid`:
+
+1. **Same-Event Idempotent Replay**: The manual-liquid log carries the same source identity (`chat_id` + `message_id` + `bot_id`) as the meal confirm. `get_or_create_operation` finds the already-completed operation and returns its saved result — no new row, no double count.
+
+2. **Explicit-Reference Reconciliation**: The agent model sends `existing_item_id` (a reference to an existing measurement or consumption item). `_reconcile_liquid` updates the existing measurement's `amount_ml` in place — no second row.
+
+3. **Genuinely New Drink**: The agent model sends `intent: "new"` with a new source identity. A new consumption is written with volume AND calories. Without `intent: "new"`, ambiguous intent returns a CLARIFY response — nothing is written.
+
+**Test coverage** (in `tests/test_legacy_new_water_coexistence.py`):
+- `test_same_event_meal_plus_liquid_one_consumption` — same source identity → one consumption, one measurement (330ml, not 660ml)
+- `test_retry_returns_saved_result` — retry returns existing meal_id, no new contribution
+- `test_reconcile_existing_item_links_once` — explicit reference updates existing item (250+100=350ml total, not 500)
+- `test_genuinely_new_drink_additional_volume_and_calories` — new message + intent=new → two distinct drinks (250+200=450ml)
+- `test_ambiguous_intent_clarifies` — no identity, no reference, no intent → CLARIFY response, nothing written
+- `test_standalone_caloric_drink_contributes_nutrition` — caloric drink via manual path has real kcal in meal totals
+- `test_same_drink_cannot_yield_two_rows_in_sum` — logging same (operation, item) twice via both paths → one measurement row
+
+---
+
 ## Cross-User Isolation
 
 **Scenario**: Could user A's operation affect user B's data?

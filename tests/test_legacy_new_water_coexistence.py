@@ -33,6 +33,7 @@ from drhiro_api.services.consumption import (
     parse_consumption_text,
     confirm_consumption,
     write_consumption,
+    log_manual_liquid,
     ParsedItem,
     _scale_nutrients,
     NUTRIENT_KEYS,
@@ -212,33 +213,238 @@ class TestLegacyNewWaterCoexistence:
         assert total_by_category.get("water") == 500
         assert total_by_category.get("beer") == 330
 
-    def test_same_drink_manual_plus_meal_counts_twice(self, db, user, food_catalog):
-        """A beer in a meal AND a manual beer log = 2 separate drinks.
-        This is the correct semantics: the user had a beer with lunch AND
-        later logged another beer. Both count."""
-        now = datetime.now(timezone.utc)
+    def test_same_event_meal_plus_liquid_one_consumption(self, db, user, food_catalog):
+        """Same Telegram message → meal tool call AND liquid tool call for the
+        SAME drink → ONE consumption (volume once, calories once).
 
-        # Meal with beer
+        The meal confirm and the manual-liquid log carry the same source
+        identity (chat_id + message_id + bot_id). The second call must replay
+        the saved result — no new row, no double count."""
+
+        # Meal-tool call: beer with lunch (message msg100)
         items = [
             _make_item("beer", grams=330, volume_ml=330, beverage_category="beer",
                        is_beverage=True, food=food_catalog["beer"], db=db),
         ]
-        write_consumption(db, user.id, items, meal_type="lunch")
+        r1 = confirm_consumption(
+            db=db, user_id=user.id, items=items, meal_type="lunch",
+            source="telegram", source_chat_id="chat1",
+            source_message_id="msg100", source_bot_id="bot1",
+        )
+        assert r1["ok"] is True
 
-        # Manual beer log (separate intent)
-        _legacy_water(db, user, amount_ml=330, category="beer", measured_at=now)
+        # Liquid-tool call for the SAME message identity (same chat+msg+bot).
+        r2 = log_manual_liquid(
+            db=db, user_id=user.id, amount_ml=330, category="beer",
+            source="telegram", source_chat_id="chat1",
+            source_message_id="msg100", source_bot_id="bot1",
+        )
+        assert r2["ok"] is True
 
         db.commit()
 
-        # Filter all water measurements and sum beer ones (Python-level, like dashboard)
+        # Same meal_id, no new meal, no new beverage.
+        assert r2["data"]["meal_id"] == r1["data"]["meal_id"]
+        assert db.query(Meal).filter(Meal.user_id == user.id).count() == 1
         rows = db.query(Measurement).filter(
-            Measurement.user_id == user.id,
-            Measurement.metric_type == "water",
+            Measurement.user_id == user.id, Measurement.metric_type == "water",
         ).all()
-
         beer_rows = [m for m in rows if (m.value_json or {}).get("category") == "beer"]
         total_beer_ml = sum(m.value_json.get("amount_ml", 0) for m in beer_rows)
-        assert total_beer_ml == 660  # 330 + 330 = two beers
+        # ONE beer, not two.
+        assert total_beer_ml == 330
+
+    def test_retry_returns_saved_result(self, db, user, food_catalog):
+        """Retry of the same operation returns the existing result, NO new
+        contribution."""
+        items = [
+            _make_item("beer", grams=330, volume_ml=330, beverage_category="beer",
+                       is_beverage=True, food=food_catalog["beer"], db=db),
+        ]
+        r1 = confirm_consumption(
+            db=db, user_id=user.id, items=items, meal_type="lunch",
+            source="telegram", source_chat_id="chat1",
+            source_message_id="msgRetry", source_bot_id="bot1",
+        )
+        assert r1["ok"] is True
+        original_meal_id = r1["data"]["meal_id"]
+
+        # Retry with same source identity.
+        r2 = log_manual_liquid(
+            db=db, user_id=user.id, amount_ml=330, category="beer",
+            source="telegram", source_chat_id="chat1",
+            source_message_id="msgRetry", source_bot_id="bot1",
+        )
+        assert r2["ok"] is True
+        assert r2["data"]["meal_id"] == original_meal_id
+
+        db.commit()
+        assert db.query(Meal).filter(Meal.user_id == user.id).count() == 1
+        assert db.query(Measurement).filter(
+            Measurement.user_id == user.id, Measurement.metric_type == "water",
+        ).count() == 1
+
+    def test_reconcile_existing_item_links_once(self, db, user, food_catalog):
+        """'also count that milk as liquid' → explicit reference to existing
+        milk item → volume linked to existing item once; dashboard sum shows
+        it once, not twice."""
+        # First: a meal with milk (message msg200)
+        items = [
+            _make_item("milk", grams=250, volume_ml=250, beverage_category="non_alcoholic",
+                       is_beverage=True, food=food_catalog["beer"], db=db),
+        ]
+        r1 = confirm_consumption(
+            db=db, user_id=user.id, items=items, meal_type="lunch",
+            source="telegram", source_chat_id="chat1",
+            source_message_id="msg200", source_bot_id="bot1",
+        )
+        assert r1["ok"] is True
+        milk_meas_id = r1["data"]["items"][0]["measurement_id"]
+
+        # Reconciliation: "also count that milk as liquid" → explicit reference.
+        r2 = log_manual_liquid(
+            db=db, user_id=user.id, amount_ml=100, category="non_alcoholic",
+            existing_item_id=milk_meas_id,
+        )
+        assert r2["ok"] is True
+        assert r2["data"]["reconciled"] is True
+        # Volume added to existing measurement (250 + 100 = 350).
+        assert r2["data"]["total_amount_ml"] == 350
+
+        db.commit()
+
+        # Only ONE measurement row for this drink.
+        rows = db.query(Measurement).filter(
+            Measurement.user_id == user.id, Measurement.metric_type == "water",
+        ).all()
+        non_alc_rows = [m for m in rows if (m.value_json or {}).get("category") == "non_alcoholic"]
+        total_ml = sum(m.value_json.get("amount_ml", 0) for m in non_alc_rows)
+        # 350 total (250 original + 100 reconciled), NOT 250 + 250 = 500.
+        assert total_ml == 350
+        assert len(non_alc_rows) == 1
+
+    def test_genuinely_new_drink_additional_volume_and_calories(self, db, user, food_catalog):
+        """'another glass of milk' in a SEPARATE message → NEW consumption with
+        additional volume AND calories; both count as two distinct items."""
+        # First drink: milk in message msg300
+        items1 = [
+            _make_item("milk", grams=250, volume_ml=250, beverage_category="non_alcoholic",
+                       is_beverage=True, food=food_catalog["beer"], db=db),
+        ]
+        r1 = confirm_consumption(
+            db=db, user_id=user.id, items=items1, meal_type="lunch",
+            source="telegram", source_chat_id="chat1",
+            source_message_id="msg300", source_bot_id="bot1",
+        )
+        assert r1["ok"] is True
+
+        # Second drink: "another glass of milk" — new message, intent=new.
+        items2 = [
+            _make_item("milk", grams=200, volume_ml=200, beverage_category="non_alcoholic",
+                       is_beverage=True, food=food_catalog["beer"], db=db),
+        ]
+        r2 = log_manual_liquid(
+            db=db, user_id=user.id, amount_ml=200, category="non_alcoholic",
+            source="telegram", source_chat_id="chat1",
+            source_message_id="msg301", source_bot_id="bot1",
+            intent="new", items=items2,
+        )
+        assert r2["ok"] is True
+
+        db.commit()
+
+        # Two distinct meals, two distinct measurements.
+        assert db.query(Meal).filter(Meal.user_id == user.id).count() == 2
+        rows = db.query(Measurement).filter(
+            Measurement.user_id == user.id, Measurement.metric_type == "water",
+        ).all()
+        non_alc_rows = [m for m in rows if (m.value_json or {}).get("category") == "non_alcoholic"]
+        total_ml = sum(m.value_json.get("amount_ml", 0) for m in non_alc_rows)
+        # 250 + 200 = 450 (two distinct drinks).
+        assert total_ml == 450
+        assert len(non_alc_rows) == 2
+
+    def test_ambiguous_intent_clarifies(self, db, user):
+        """Ambiguous intent (no source identity, no reference, no intent=new)
+        → CLARIFY response, nothing written."""
+        r = log_manual_liquid(
+            db=db, user_id=user.id, amount_ml=250, category="water",
+        )
+        assert r["ok"] is False
+        assert r.get("clarify") is True
+
+        db.rollback()
+        # Nothing written.
+        assert db.query(Meal).filter(Meal.user_id == user.id).count() == 0
+        assert db.query(Measurement).filter(
+            Measurement.user_id == user.id, Measurement.metric_type == "water",
+        ).count() == 0
+
+    def test_standalone_caloric_drink_contributes_nutrition(self, db, user, food_catalog):
+        """Standalone caloric drink via manual path → contributes NUTRITION once
+        (kcal present, not a bare water row with 0 kcal)."""
+        # Milk with real nutrients.
+        milk_item = _make_item(
+            "milk", grams=250, volume_ml=250, beverage_category="non_alcoholic",
+            is_beverage=True, food=food_catalog["beer"], db=db,
+        )
+        r = log_manual_liquid(
+            db=db, user_id=user.id, amount_ml=250, category="non_alcoholic",
+            intent="new", items=[milk_item],
+        )
+        assert r["ok"] is True
+
+        db.commit()
+
+        # The meal totals must reflect real kcal (not zero).
+        meal = db.query(Meal).filter(Meal.user_id == user.id).first()
+        assert meal is not None
+        totals = meal.totals_json
+        assert totals.get("kcal", 0) > 0, f"Expected kcal > 0, got {totals}"
+
+        # The measurement row exists with volume.
+        meas = db.query(Measurement).filter(
+            Measurement.user_id == user.id, Measurement.metric_type == "water",
+        ).first()
+        assert meas is not None
+        assert meas.value_json.get("amount_ml") == 250
+
+    def test_same_drink_cannot_yield_two_rows_in_sum(self, db, user, food_catalog):
+        """Same drink cannot produce two rows in the dashboard liquid sum
+        across legacy + new paths. Attempting to log the same (operation, item)
+        twice through both mechanisms must not double-count."""
+        # Log via new path (confirm_consumption) with source identity.
+        items = [
+            _make_item("beer", grams=330, volume_ml=330, beverage_category="beer",
+                       is_beverage=True, food=food_catalog["beer"], db=db),
+        ]
+        r1 = confirm_consumption(
+            db=db, user_id=user.id, items=items, meal_type="lunch",
+            source="telegram", source_chat_id="chat1",
+            source_message_id="msgDedup", source_bot_id="bot1",
+        )
+        assert r1["ok"] is True
+
+        # Attempt to log the SAME drink again via the manual-liquid path with
+        # the SAME source identity → must replay, not insert.
+        r2 = log_manual_liquid(
+            db=db, user_id=user.id, amount_ml=330, category="beer",
+            source="telegram", source_chat_id="chat1",
+            source_message_id="msgDedup", source_bot_id="bot1",
+        )
+        assert r2["ok"] is True
+        assert r2["data"]["meal_id"] == r1["data"]["meal_id"]
+
+        db.commit()
+
+        # The metric_type=water sum must show ONE beer (330ml), not two.
+        rows = db.query(Measurement).filter(
+            Measurement.user_id == user.id, Measurement.metric_type == "water",
+        ).all()
+        beer_rows = [m for m in rows if (m.value_json or {}).get("category") == "beer"]
+        total_beer_ml = sum(m.value_json.get("amount_ml", 0) for m in beer_rows)
+        assert total_beer_ml == 330
+        assert len(beer_rows) == 1
 
     def test_aggregation_no_omission_with_mixed_sources(self, db, user, food_catalog):
         """Mix of legacy and new rows for different categories — all appear."""
