@@ -690,16 +690,24 @@ def resolve_item_nutrition(db: Session, item: ParsedItem) -> ParsedItem:
             return item
 
     # Determine nutrient basis
-    if item.is_beverage and item.volume_ml is not None:
-        item.nutrient_basis = "per_100_ml"
-        factor = item.volume_ml / 100.0
+    # Nutrient basis follows the ACTUAL source data, not the item type.
+    # If the item was measured by mass (grams set, no volume), use per_100_g.
+    # If the item was measured by volume (volume_ml set, no grams), use per_100_ml.
+    # If both are present (e.g. "250 g milk"), the mass is the primary measurement
+    # and volume is derived — use per_100_g.
+    if item.grams is not None and item.volume_ml is not None:
+        # Both present: mass is primary, volume derived via documented density
+        item.nutrient_basis = "per_100_g"
+        factor = item.grams / 100.0
     elif item.grams is not None:
         item.nutrient_basis = "per_100_g"
         factor = item.grams / 100.0
+    elif item.volume_ml is not None:
+        item.nutrient_basis = "per_100_ml"
+        factor = item.volume_ml / 100.0
     else:
-        # Default: assume grams
         item.nutrient_basis = "per_100_g" if not item.is_beverage else "per_100_ml"
-        factor = (item.grams or item.volume_ml or 100.0) / 100.0
+        factor = 1.0
 
     # Scale nutrients (None → 0)
     item.nutrients_scaled = _scale_nutrients(
@@ -1796,3 +1804,207 @@ def _write_new_liquid_consumption(
 
     db.commit()
     return result
+
+
+# ---------------------------------------------------------------------------
+# B7 — Canonical atomic mutations for generic datapoints + timestamp/group
+# ---------------------------------------------------------------------------
+
+def update_measurement_value(
+    db: Session,
+    user_id: str,
+    measurement_id: str,
+    new_value_json: dict,
+) -> dict:
+    """Generic measurement update that delegates to beverage logic when the
+    measurement is linked to a beverage (via BeverageMeasurement).
+
+    For a beverage measurement, this updates:
+      - Measurement.value_json
+      - MealItem.volume_ml, MealItem.nutrients_json (rescaled)
+      - MealItem.grams
+      - Meal.totals_json
+    All in one transaction.
+
+    For a non-beverage measurement, updates only the Measurement.value_json.
+    """
+    meas = db.query(Measurement).filter(
+        Measurement.id == measurement_id,
+        Measurement.user_id == user_id,
+    ).first()
+    if not meas:
+        return {"ok": False, "error": "measurement_not_found"}
+
+    # Check if this measurement is a beverage
+    bev = db.query(BeverageMeasurement).filter(
+        BeverageMeasurement.measurement_id == measurement_id,
+        BeverageMeasurement.user_id == user_id,
+    ).first()
+
+    if bev:
+        # Beverage path: update all projections atomically
+        mi = db.query(MealItem).filter(MealItem.id == bev.meal_item_id).first()
+        if not mi:
+            # Orphaned beverage_measurement — clean up and update measurement only
+            db.delete(bev)
+            meas.value_json = new_value_json
+            db.commit()
+            return {"ok": True, "measurement_id": measurement_id, "orphan_cleaned": True}
+
+        old_ml = meas.value_json.get("amount_ml", 0) if isinstance(meas.value_json, dict) else 0
+        new_ml = new_value_json.get("amount_ml", old_ml)
+
+        # Update measurement
+        meas.value_json = new_value_json
+
+        # Rescale meal_item
+        if old_ml > 0 and new_ml != old_ml:
+            factor = new_ml / old_ml
+            old_nj = mi.nutrients_json or {}
+            new_nj = {}
+            for k in NUTRIENT_KEYS:
+                try:
+                    new_nj[k] = round(float(old_nj.get(k) or 0) * factor, 2)
+                except (TypeError, ValueError):
+                    new_nj[k] = 0.0
+            mi.nutrients_json = new_nj
+            mi.volume_ml = new_ml
+            if mi.grams is not None:
+                mi.grams = new_ml  # 1ml ≈ 1g for beverages
+        elif new_ml == old_ml:
+            # Value unchanged, no rescale needed
+            pass
+        else:
+            # old_ml was 0, can't rescale; just set new values
+            mi.volume_ml = new_ml
+
+        # Recompute meal totals
+        meal = db.query(Meal).filter(Meal.id == mi.meal_id).first()
+        if meal:
+            _recompute_meal_totals(db, meal)
+            db.commit()
+            return {"ok": True, "measurement_id": measurement_id,
+                    "meal_item_id": str(mi.id), "meal_totals": meal.totals_json}
+
+    # Non-beverage path: just update the value
+    meas.value_json = new_value_json
+    db.commit()
+    return {"ok": True, "measurement_id": measurement_id}
+
+
+def delete_measurement(
+    db: Session,
+    user_id: str,
+    measurement_id: str,
+) -> dict:
+    """Generic measurement delete that cascades to beverage projections when
+    the measurement is a beverage.
+
+    For a beverage measurement, this deletes:
+      - Measurement
+      - BeverageMeasurement link
+      - MealItem (the beverage item)
+      - Recomputes Meal.totals_json
+
+    For a non-beverage measurement, just deletes the Measurement.
+    """
+    meas = db.query(Measurement).filter(
+        Measurement.id == measurement_id,
+        Measurement.user_id == user_id,
+    ).first()
+    if not meas:
+        return {"ok": False, "error": "measurement_not_found"}
+
+    bev = db.query(BeverageMeasurement).filter(
+        BeverageMeasurement.measurement_id == measurement_id,
+        BeverageMeasurement.user_id == user_id,
+    ).first()
+
+    if bev:
+        mi = db.query(MealItem).filter(MealItem.id == bev.meal_item_id).first()
+        meal_id = mi.meal_id if mi else None
+
+        db.delete(bev)
+        if mi:
+            db.delete(mi)
+
+        if meal_id:
+            meal = db.query(Meal).filter(Meal.id == meal_id).first()
+            if meal:
+                _recompute_meal_totals(db, meal)
+
+        db.delete(meas)
+        db.commit()
+        return {"ok": True, "measurement_id": measurement_id,
+                "cascade": "beverage", "meal_id": meal_id}
+
+    db.delete(meas)
+    db.commit()
+    return {"ok": True, "measurement_id": measurement_id}
+
+
+def update_meal_timestamp(
+    db: Session,
+    user_id: str,
+    meal_id: str,
+    new_eaten_at: datetime,
+) -> dict:
+    """Update a meal's timestamp and propagate to all linked measurements
+    and consumption items atomically.
+    """
+    meal = db.query(Meal).filter(Meal.id == meal_id, Meal.user_id == user_id).first()
+    if not meal:
+        return {"ok": False, "error": "meal_not_found"}
+
+    meal.eaten_at = new_eaten_at
+
+    # Update all linked beverage measurements
+    for mi in meal.items:
+        bev = db.query(BeverageMeasurement).filter(
+            BeverageMeasurement.meal_item_id == mi.id
+        ).first()
+        if bev:
+            meas = db.query(Measurement).filter(
+                Measurement.id == bev.measurement_id,
+                Measurement.user_id == user_id,
+            ).first()
+            if meas:
+                meas.start_at = new_eaten_at
+                meas.end_at = new_eaten_at
+
+    # Update consumption items
+    ci_list = db.query(ConsumptionItem).filter(
+        ConsumptionItem.operation_id == meal.source_operation_id
+    ).all()
+    for ci in ci_list:
+        ci.updated_at = datetime.now(timezone.utc)
+
+    db.commit()
+    return {"ok": True, "meal_id": meal_id, "eaten_at": new_eaten_at.isoformat()}
+
+
+def update_meal_group(
+    db: Session,
+    user_id: str,
+    meal_id: str,
+    new_meal_type: str,
+) -> dict:
+    """Update a meal's group (breakfast/lunch/dinner/snack) and propagate
+    to all linked consumption items atomically.
+    """
+    meal = db.query(Meal).filter(Meal.id == meal_id, Meal.user_id == user_id).first()
+    if not meal:
+        return {"ok": False, "error": "meal_not_found"}
+
+    meal_type = _normalize_meal_type(new_meal_type)
+    meal.meal_type = meal_type
+
+    # Update consumption items
+    ci_list = db.query(ConsumptionItem).filter(
+        ConsumptionItem.operation_id == meal.source_operation_id
+    ).all()
+    for ci in ci_list:
+        ci.meal_type = meal_type
+
+    db.commit()
+    return {"ok": True, "meal_id": meal_id, "meal_type": meal_type}

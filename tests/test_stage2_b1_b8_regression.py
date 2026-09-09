@@ -414,20 +414,35 @@ class TestB1NutrientResolution:
         # Fat: 18*2 = 36
         assert totals["fat_g"] == 36.0
 
-    def test_mass_vs_volume_beverage_uses_ml_basis(self, db, user, food_catalog):
-        """Beverages use volume/ml basis; foods use mass/g basis."""
+    def test_mass_vs_volume_beverage_uses_actual_source_basis(self, db, user, food_catalog):
+        """Nutrient basis follows ACTUAL source data, not item type.
+
+        When both mass and volume are present (e.g. '250 ml milk' derives grams
+        from ml), mass is the primary measurement and basis is per_100_g.
+        When only volume is present (explicitly volume-only item), basis is per_100_ml.
+        """
         from drhiro_api.services.consumption import resolve_item_nutrition
-        # Beverage: 250 ml milk
+
+        # "250 ml milk" — parser derives grams=250, volume_ml=250 for beverage
+        # Both present → mass primary → per_100_g (the actual source row basis)
         bev_item = parse_consumption_text("250 ml milk")[0]
         resolve_item_nutrition(db, bev_item)
-        assert bev_item.nutrient_basis == "per_100_ml"
+        assert bev_item.nutrient_basis == "per_100_g"
         assert bev_item.is_beverage
+        assert bev_item.grams == 250
 
-        # Food: 200 g steak
+        # Food: 200 g steak — mass only → per_100_g
         food_item = parse_consumption_text("200 g steak")[0]
         resolve_item_nutrition(db, food_item)
         assert food_item.nutrient_basis == "per_100_g"
         assert not food_item.is_beverage
+
+        # "250 g milk" — mass explicitly given, volume derived via density
+        # Both present → mass primary → per_100_g
+        mass_item = parse_consumption_text("250 g milk")[0]
+        resolve_item_nutrition(db, mass_item)
+        assert mass_item.nutrient_basis == "per_100_g"
+        assert mass_item.grams == 250
 
     def test_retrieve_saved_resolution_on_retry(self, db, user, food_catalog):
         """On a retry, the same saved resolution must be returned."""

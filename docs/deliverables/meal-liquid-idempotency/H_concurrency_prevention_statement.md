@@ -96,6 +96,10 @@ The unified consumption domain (`consumption.py`) prevents duplicate drink RECOR
 - `TestMutations::test_drink_volume_corrected_once_each` — verifies volume update doesn't create duplicates.
 - `TestMutations::test_drink_deleted_removes_both` — verifies deletion removes both meal_item and measurement.
 - `TestMutations::test_beverage_to_solid_removes_liquid` — verifies beverage→solid swap removes the liquid record.
+- `TestB7CanonicalMutations::test_quantity_change_updates_all_projections` — verifies all projections (meal_item, measurement, totals) update atomically.
+- `TestB7CanonicalMutations::test_all_six_nutrients_recomputed_on_mutation` — verifies all 6 nutrients (kcal/protein/carbs/fat/fiber/sodium) recomputed.
+- `TestB7CanonicalMutations::test_timestamp_mutation_updates_all_projections` — verifies Meal.eaten_at + Measurement.start_at/end_at updated.
+- `TestB7CanonicalMutations::test_meal_group_mutation_updates_all_projections` — verifies Meal.meal_type + ConsumptionItem.meal_type updated.
 
 ---
 
@@ -125,6 +129,64 @@ The unified consumption domain (`consumption.py`) prevents duplicate drink RECOR
 **Test coverage**:
 - `TestMutations::test_delete_meal_cascades_to_beverage_measurements` — verifies cascade delete.
 - `TestMutations::test_drink_deleted_removes_both` — verifies beverage-only delete.
+
+## (e) Generic Datapoint CRUD (B4/B7)
+
+**Scenario**: A beverage measurement is updated or deleted via the generic `/data-points` CRUD endpoints.
+
+**Prevention mechanism**:
+
+1. **update_measurement_value()** — detects if the measurement is linked to a beverage (via `BeverageMeasurement`). If yes, it updates:
+   - `Measurement.value_json`
+   - `MealItem.volume_ml`, `MealItem.nutrients_json` (rescaled by volume ratio)
+   - `Meal.totals_json` (via `_recompute_meal_totals`)
+   All in one transaction. If the measurement is not a beverage, only `Measurement.value_json` is updated.
+
+2. **delete_measurement()** — detects if the measurement is linked to a beverage. If yes, it cascades:
+   - Deletes `BeverageMeasurement` link
+   - Deletes `MealItem`
+   - Deletes `Measurement`
+   - Recomputes `Meal.totals_json`
+   If not a beverage, just deletes the `Measurement`.
+
+3. **Orphan handling** — if a `BeverageMeasurement` row exists but the `MealItem` is missing, the orphan is cleaned up and the measurement is updated/deleted normally.
+
+**Test coverage**:
+- `TestB4EntryPointCoverage::test_generic_datapoint_update_delegates_for_beverage` — verifies all projections update.
+- `TestB4EntryPointCoverage::test_generic_datapoint_delete_delegates_for_beverage` — verifies cascade.
+
+---
+
+## B7 — Canonical Atomic Mutations
+
+**Stage 3 adds four mutation functions that update ALL projections atomically from one canonical record**:
+
+1. **update_meal_timestamp(db, user_id, meal_id, new_eaten_at)**:
+   - Updates `Meal.eaten_at`
+   - Updates all linked `Measurement.start_at` / `end_at` (via `BeverageMeasurement` join)
+   - Updates all linked `ConsumptionItem.updated_at`
+
+2. **update_meal_group(db, user_id, meal_id, new_meal_type)**:
+   - Updates `Meal.meal_type` (normalized via `_normalize_meal_type`)
+   - Updates all linked `ConsumptionItem.meal_type`
+
+3. **update_measurement_value(db, user_id, measurement_id, new_value_json)**:
+   - For beverages: detects `BeverageMeasurement` link, rescales `MealItem.nutrients_json` by volume ratio, updates `MealItem.volume_ml`, updates `Meal.totals_json`
+   - For non-beverages: only updates `Measurement.value_json`
+
+4. **delete_measurement(db, user_id, measurement_id)**:
+   - For beverages: cascades delete to `BeverageMeasurement`, `MealItem`, and recomputes `Meal.totals_json`
+   - For non-beverages: just deletes `Measurement`
+
+**Test coverage**:
+- `TestB7CanonicalMutations::test_timestamp_mutation_updates_all_projections`
+- `TestB7CanonicalMutations::test_meal_group_mutation_updates_all_projections`
+- `TestB7CanonicalMutations::test_quantity_change_updates_all_projections`
+- `TestB7CanonicalMutations::test_all_six_nutrients_recomputed_on_mutation`
+- `TestB7CanonicalMutations::test_ownership_check_on_mutation`
+- `TestB7CanonicalMutations::test_repeated_mutation_is_idempotent`
+- `TestB7CanonicalMutations::test_transaction_rollback_on_error`
+- `TestB7CanonicalMutations::test_replay_after_mutation_does_not_resurrect`
 
 ---
 

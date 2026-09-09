@@ -62,11 +62,29 @@
 ### 4. `tests/test_legacy_new_water_coexistence.py`
 **Change**: Replaced wrong `test_same_drink_manual_plus_meal_counts_twice` (which asserted 660ml double-count for a same-event meal+liquid) with 7 reconciliation-path tests proving the correct semantics.
 
-### 5. `apps/api/alembic/versions/f1a2b3c4d5e6_consumption_idempotency.py` (NEW)
-**Change**: Alembic migration creating the three new tables and adding nullable columns to existing tables.
+### 7. `apps/api/src/drhiro_api/services/consumption.py`
+**Change**: Fixed nutrient-basis resolution + added B7 canonical mutation functions.
+
+- Fixed `resolve_item_nutrition` to determine nutrient basis by actual measurement (mass-primary when both grams and volume present), not item type.
+- Added `update_measurement_value()` — generic measurement update that delegates to beverage logic for beverages.
+- Added `delete_measurement()` — generic measurement delete that cascades for beverages.
+- Added `update_meal_timestamp()` — timestamp mutation propagated to all linked measurements.
+- Added `update_meal_group()` — meal-group mutation propagated to all consumption items.
+
+### 8. `tests/test_stage3_b4_b7_regression.py` (NEW)
+**Change**: 17 regression tests for B4 (entry-point coverage) + B7 (canonical mutations).
+
+### 9. `tests/test_stage2_b1_b8_regression.py`
+**Change**: Updated `test_mass_vs_volume_beverage_uses_actual_source_basis` to reflect corrected nutrient-basis semantics.
+
+### 10. `docs/deliverables/meal-liquid-idempotency/stage3_entrypoints_coverage_matrix.md` (NEW)
+**Change**: Entry-point coverage matrix for every meal/liquid creation + mutation path.
 
 ### 6. `packages/drhiro-mcp/src/drhiro_mcp/sse_server.py`
 **Change**: **MCP CUTOVER** — removed the liquid auto-log side-effect block (lines 1636–1698).
+
+### 11. `docs/deliverables/meal-liquid-idempotency/stage3_entrypoints_mutations_evidence.md` (NEW)
+**Change**: Stage 3 evidence document covering coverage matrix + per-blocker evidence.
 
 ---
 
