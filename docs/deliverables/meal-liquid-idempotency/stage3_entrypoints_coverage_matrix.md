@@ -13,8 +13,6 @@
 - **N/A** = not a consumption path (e.g., recipe storage, food catalog)
 - **PARTIAL** = some shared rules applied but not all projections updated atomically
 
----
-
 ## 1. Creation Paths
 
 | # | Entry Point | Route | File | Wires Into | Status |
@@ -27,8 +25,8 @@
 | 6 | Barcode meal | `POST /meals/from-barcode` | routers/meals.py `create_meal_from_barcode` | ✗ direct Meal + MealItem, no totals recompute, no operation | BYPASS — no beverage support but also no ConsumptionOperation |
 | 7 | Recipe storage | `POST /meals/recipes` | routers/meals.py `create_recipe` | N/A — creates FoodCatalogItem, not a Meal | Not a consumption path |
 | 8 | Recipe consume | (missing) | — | ✗ not implemented | GAP: consuming a recipe should call write_consumption |
-| 9 | Add item to meal | `POST /meals/{meal_id}/items` | routers/meals.py `add_meal_item` | ✗ direct MealItem + _sync_totals, no ConsumptionItem / BeverageMeasurement | BYPASS — beverages added this way have no liquid projection |
-| 10 | Copy meal | `POST /meals/{meal_id}/copy` | routers/meals.py `copy_meal` | ✗ direct Meal + MealItem copies, no new operation, no BeverageMeasurement links | BYPASS — copied beverages lose liquid linkage |
+| 9 | Add item to meal | `POST /meals/{meal_id}/items` | routers/meals.py `add_meal_item` | ✓ `_classify_beverage` → `create_beverage_projection` | WIRED — beverages create linked BeverageMeasurement + Measurement |
+| 10 | Copy meal | `POST /meals/{meal_id}/copy` | routers/meals.py `copy_meal` | ✓ `copy_beverage_link` per beverage item | WIRED — copied beverages carry liquid linkage |
 | 11 | MCP meal from text | `POST /tools/create_meal_from_text` | routers/openclaw_tools.py `tool_meal_from_text` | ✗ calls meals.create_meal | BYPASS (same as #1) |
 
 ## 2. Meal Item Mutation Paths
@@ -36,8 +34,8 @@
 | # | Entry Point | Route | File | Wires Into | Status |
 |---|---|---|---|---|---|
 | 12 | Patch meal metadata | `PATCH /meals/{meal_id}` | routers/meals.py `patch_meal` | ✗ direct field update, no ConsumptionItem/totals recomputation from canonical | BYPASS — but only updates meal_type/notes/eaten_at (not items) |
-| 13 | Patch meal item | `PATCH /meals/{meal_id}/items/{item_id}` | routers/meals.py `patch_meal_item` | ✗ _apply_explicit_food / _resolve_item_nutrition + _sync_totals, no ConsumptionItem / Measurement update | BYPASS — beverage volume/name/category changes don't propagate to Measurement |
-| 14 | Remove meal item | `DELETE /meals/{meal_id}/items/{item_id}` | routers/meals.py `remove_meal_item` | ✗ db.delete(item) + _sync_totals, no BeverageMeasurement/Measurement cleanup | BYPASS — beverage deletion orphans liquid measurement |
+| 13 | Patch meal item | `PATCH /meals/{meal_id}/items/{item_id}` | routers/meals.py `patch_meal_item` | ✓ `propagate_beverage_patch` → shared domain | WIRED — beverage volume/name changes propagate to Measurement + totals (PARTIAL: beverage→solid rename does NOT clear liquid because beverage_category not cleared on rename) |
+| 14 | Remove meal item | `DELETE /meals/{meal_id}/items/{item_id}` | routers/meals.py `remove_meal_item` | ✓ `delete_beverage_item` for beverages | WIRED — beverage deletion cascades to BeverageMeasurement + Measurement |
 | 15 | Confirm meal | `POST /meals/{meal_id}/confirm` | routers/meals.py `confirm_meal` | ✗ status flip only | N/A — status transition, no nutrition |
 | 16 | Delete meal | `DELETE /meals/{meal_id}` | routers/meals.py `delete_meal` | ✗ `meal.status = "deleted"`, no BeverageMeasurement/Measurement cleanup, no ConsumptionOperation | BYPASS — beverage measurements orphaned |
 
@@ -56,8 +54,8 @@
 | # | Entry Point | Route | File | Wires Into | Status |
 |---|---|---|---|---|---|
 | 22 | Log any measurement | `POST /data-points` | routers/datapoints.py `log_data_point` | ✗ direct Measurement write | BYPASS — but creates a new row, not a mutation of existing |
-| 23 | Update measurement | `PATCH /data-points/{mid}` | routers/datapoints.py `update_data_point` | ✗ direct field write | BYPASS — updating a beverage measurement orphans the MealItem/BeverageMeasurement projections |
-| 24 | Delete measurement | `DELETE /data-points/{mid}` | routers/datapoints.py `delete_data_point` | ✗ `db.delete(m)` | BYPASS — deleting a beverage measurement orphans the MealItem + BeverageMeasurement link + leaves meal totals stale |
+| 20 | Update measurement | `PATCH /data-points/{mid}` | routers/datapoints.py `update_data_point` | ✓ `consumption.update_measurement_value` for beverages | WIRED — beverage measurements delegate to domain (update MealItem + totals) |
+| 21 | Delete measurement | `DELETE /data-points/{mid}` | routers/datapoints.py `delete_data_point` | ✓ `consumption.delete_measurement` for beverages | WIRED — cascade to BeverageMeasurement + MealItem + recompute totals |
 | 25 | Health Connect batch | `POST /ingest/health-connect/batch` | routers/ingest.py | ✗ direct Measurement writes | SEPARATE — these are source Provider readings, not consumption. Intentionally separate path. |
 
 ---

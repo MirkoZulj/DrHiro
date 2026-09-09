@@ -2008,3 +2008,234 @@ def update_meal_group(
 
     db.commit()
     return {"ok": True, "meal_id": meal_id, "meal_type": meal_type}
+
+
+# ---------------------------------------------------------------------------
+# Meal-item bridge helpers — used by routers/meals.py to delegate add/patch/
+# delete/copy through the shared domain so beverages keep their liquid
+# projection and mutations update all projections atomically.
+# ---------------------------------------------------------------------------
+
+def create_beverage_projection(
+    db: Session,
+    user_id: str,
+    meal_item: MealItem,
+    volume_ml: float,
+    beverage_category: str,
+    eaten_at: datetime,
+) -> str | None:
+    """Create the liquid Measurement + BeverageMeasurement link for an
+    already-persisted beverage MealItem.
+
+    Returns the new measurement_id, or None if volume_ml is not positive.
+    """
+    if not volume_ml or volume_ml <= 0:
+        return None
+
+    measurement_id = str(uuid.uuid4())
+    meas = Measurement(
+        id=measurement_id,
+        user_id=user_id,
+        metric_type="water",
+        start_at=eaten_at,
+        end_at=eaten_at,
+        value_json={"amount_ml": volume_ml, "category": beverage_category or "water"},
+        unit="ml",
+        source_provider="consumption",
+        source_record_id=f"meal-item:{meal_item.id}",
+        recording_method="automatic",
+        confidence=meal_item.confidence,
+        meal_item_id=meal_item.id,
+    )
+    db.add(meas)
+    db.flush()
+
+    bev = BeverageMeasurement(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        meal_item_id=meal_item.id,
+        measurement_id=measurement_id,
+    )
+    db.add(bev)
+
+    meal_item.volume_ml = volume_ml
+    meal_item.beverage_category = beverage_category
+    return measurement_id
+
+
+def propagate_beverage_patch(
+    db: Session,
+    user_id: str,
+    meal_id: str,
+    item: MealItem,
+    old_grams: float | None,
+) -> None:
+    """After a PATCH /meals/{id}/items/{id} mutates a beverage item, propagate
+    the change to the linked Measurement (volume + category) and recompute
+    meal totals.
+
+    Safe to call for non-beverage items (no-op). Handles grams→volume
+    proportional scaling and beverage→solid declassification.
+    """
+    bev = db.query(BeverageMeasurement).filter(
+        BeverageMeasurement.meal_item_id == item.id
+    ).first()
+
+    new_grams = item.grams
+    new_category = item.beverage_category
+    new_name = item.display_name
+
+    # Determine if the item is still a beverage after the rename
+    still_bev = new_category is not None or (
+        new_name is not None and _classify_beverage(new_name) is not None
+    ) if new_name else (new_category is not None)
+
+    if bev and not still_bev:
+        # Beverage renamed to a solid: remove the liquid projection
+        db.query(Measurement).filter(
+            Measurement.id == bev.measurement_id,
+            Measurement.user_id == user_id,
+        ).delete()
+        db.delete(bev)
+        item.volume_ml = None
+        item.beverage_category = None
+    elif bev:
+        # Still a beverage: update the linked measurement
+        meas = db.query(Measurement).filter(
+            Measurement.id == bev.measurement_id,
+            Measurement.user_id == user_id,
+        ).first()
+        if meas:
+            old_vj = dict(meas.value_json or {})
+            old_ml = old_vj.get("amount_ml") or 0
+            old_g = old_grams or old_ml  # best-effort basis
+            if old_g and new_grams is not None and new_grams != old_g:
+                factor = new_grams / old_g
+                new_ml = round(old_ml * factor, 1)
+                old_vj["amount_ml"] = new_ml
+                item.volume_ml = new_ml
+            if new_category:
+                old_vj["category"] = new_category
+            meas.value_json = old_vj
+    elif still_bev:
+        # Solid renamed to a beverage: create a liquid projection
+        meal = db.query(Meal).filter(Meal.id == meal_id).first()
+        if meal:
+            vol = item.volume_ml
+            if vol is None and new_grams is not None:
+                vol = float(new_grams)  # 1ml ≈ 1g for beverages
+            if vol and vol > 0:
+                cat = new_category or _classify_beverage(new_name) or "water"
+                create_beverage_projection(db, user_id, item, vol, cat, meal.eaten_at)
+
+    # Recompute totals from current items
+    meal = db.query(Meal).filter(Meal.id == meal_id).first()
+    if meal:
+        _recompute_meal_totals(db, meal)
+
+
+def delete_beverage_item(
+    db: Session,
+    user_id: str,
+    meal_id: str,
+    item_id: str,
+) -> dict:
+    """Delete a meal_item (by id) and its linked BeverageMeasurement + Measurement.
+
+    Replacement for the router's bare db.delete(item) + _sync_totals so
+    beverage deletions don't orphan liquid rows. Safe for non-beverage
+    items (equivalent to db.delete + recompute).
+    """
+    from fastapi import HTTPException
+    try:
+        item_uuid = uuid.UUID(str(item_id))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    mi = db.query(MealItem).filter(
+        MealItem.id == item_uuid, MealItem.meal_id == meal_id
+    ).first()
+    if not mi:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    bev = db.query(BeverageMeasurement).filter(
+        BeverageMeasurement.meal_item_id == item_id
+    ).first()
+    if bev:
+        db.query(Measurement).filter(
+            Measurement.id == bev.measurement_id,
+            Measurement.user_id == user_id,
+        ).delete()
+        db.delete(bev)
+
+    db.delete(mi)
+
+    meal = db.query(Meal).filter(Meal.id == meal_id).first()
+    if meal:
+        _recompute_meal_totals(db, meal)
+
+    return {"ok": True, "item_id": item_id, "meal_totals": meal.totals_json if meal else {}}
+
+
+def copy_beverage_link(
+    db: Session,
+    user_id: str,
+    source_meal_item_id: str,
+    new_meal_item_id: str,
+    eaten_at: datetime,
+) -> str | None:
+    """When copying a meal, replicate the BeverageMeasurement + Measurement
+    for a copied beverage item so the copy is consistent with the source.
+
+    Returns the new measurement_id, or None if the source item was not a
+    beverage.
+    """
+    bev = db.query(BeverageMeasurement).filter(
+        BeverageMeasurement.meal_item_id == source_meal_item_id
+    ).first()
+    if not bev:
+        return None
+
+    source_meas = db.query(Measurement).filter(
+        Measurement.id == bev.measurement_id,
+        Measurement.user_id == user_id,
+    ).first()
+    if not source_meas:
+        # Orphaned link — clean up
+        db.delete(bev)
+        return None
+
+    new_measurement_id = str(uuid.uuid4())
+    new_value = dict(source_meas.value_json or {})
+    new_meas = Measurement(
+        id=new_measurement_id,
+        user_id=user_id,
+        metric_type="water",
+        start_at=eaten_at,
+        end_at=eaten_at,
+        value_json=new_value,
+        unit="ml",
+        source_provider="consumption",
+        source_record_id=f"copy:{source_meas.id}",
+        recording_method="automatic",
+        confidence=source_meas.confidence,
+        meal_item_id=new_meal_item_id,
+    )
+    db.add(new_meas)
+    db.flush()
+
+    new_bev = BeverageMeasurement(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        meal_item_id=new_meal_item_id,
+        measurement_id=new_measurement_id,
+    )
+    db.add(new_bev)
+
+    # Sync the new meal_item's liquid fields from the copied measurement
+    new_mi = db.query(MealItem).filter(MealItem.id == new_meal_item_id).first()
+    if new_mi:
+        new_mi.volume_ml = new_value.get("amount_ml")
+        new_mi.beverage_category = new_value.get("category")
+
+    return new_measurement_id

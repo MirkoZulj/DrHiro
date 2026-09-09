@@ -31,8 +31,8 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 | 5 | Photo draft | `POST /meals/from-photo` | routers/meals.py `create_meal_from_photo` | Draft only (no consumption yet) | N/A |
 | 6 | Barcode meal | `POST /meals/from-barcode` | routers/meals.py `create_meal_from_barcode` | Direct Meal + MealItem | OK — no beverages |
 | 7 | Recipe storage | `POST /meals/recipes` | routers/meals.py `create_recipe` | Creates FoodCatalogItem | Not a consumption path |
-| 8 | Add item to meal | `POST /meals/{meal_id}/items` | routers/meals.py `add_meal_item` | Direct MealItem | **BYPASS** — beverages have no liquid projection |
-| 9 | Copy meal | `POST /meals/{meal_id}/copy` | routers/meals.py `copy_meal` | Direct Meal+MealItem | **BYPASS** — copied beverages lose linkage |
+| 8 | Add item to meal | `POST /meals/{meal_id}/items` | routers/meals.py `add_meal_item` | `_classify_beverage` → `create_beverage_projection` | WIRED |
+| 9 | Copy meal | `POST /meals/{meal_id}/copy` | routers/meals.py `copy_meal` | `copy_beverage_link` per beverage item | WIRED |
 | 10 | MCP meal from text | `POST /tools/create_meal_from_text` | routers/openclaw_tools.py `tool_meal_from_text` | Calls meals.create_meal | OK — food only |
 
 ### Meal Item Mutation Paths
@@ -40,17 +40,17 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 | # | Entry Point | Route | File | Wires Into | Status |
 |---|---|---|---|---|---|
 | 11 | Patch meal metadata | `PATCH /meals/{meal_id}` | routers/meals.py `patch_meal` | Direct (meal_type/notes/eaten_at) | OK — no item changes |
-| 12 | Patch meal item | `PATCH /meals/{meal_id}/items/{item_id}` | routers/meals.py `patch_meal_item` | Direct (re-resolve + sync_totals) | **BYPASS** — beverage volume/name changes don't propagate to Measurement |
-| 13 | Remove meal item | `DELETE /meals/{meal_id}/items/{item_id}` | routers/meals.py `remove_meal_item` | Direct delete + sync_totals | **BYPASS** — beverage deletion orphans liquid measurement |
-| 14 | Delete meal | `DELETE /meals/{meal_id}` | routers/meals.py `delete_meal` | `meal.status = "deleted"` only | **BYPASS** — beverage measurements orphaned |
+| 12 | Patch meal item | `PATCH /meals/{meal_id}/items/{item_id}` | routers/meals.py `patch_meal_item` | `propagate_beverage_patch` → shared domain | WIRED (PARTIAL: beverage→solid rename keeps liquid) |
+| 13 | Remove meal item | `DELETE /meals/{meal_id}/items/{item_id}` | routers/meals.py `remove_meal_item` | `delete_beverage_item` for beverages | WIRED |
+| 14 | Delete meal | `DELETE /meals/{meal_id}` | routers/meals.py `delete_meal` | `meal.status = "deleted"` only | BYPASS — beverage measurements orphaned |
 
 ### Manual Liquid / Water Paths
 
 | # | Entry Point | Route | File | Wires Into | Status |
 |---|---|---|---|---|---|
-| 15 | Manual water | `POST /ingest/manual/water` | routers/ingest.py `manual_water` | Direct Measurement write | **BYPASS** — bare water row |
+| 15 | Manual water | `POST /ingest/manual/water` | routers/ingest.py `manual_water` | Direct Measurement write | BYPASS — bare water row |
 | 16 | Manual liquid | `POST /ingest/manual/liquid` | routers/ingest.py `manual_liquid` | `log_manual_liquid` | WIRED |
-| 17 | Manual text (water) | `POST /ingest/manual/text` | routers/ingest.py `manual_text` | Direct for water metric | **BYPASS** — bare water row |
+| 17 | Manual text (water) | `POST /ingest/manual/text` | routers/ingest.py `manual_text` | Direct for water metric | BYPASS — bare water row |
 | 18 | MCP log_water / log_liquid | MCP tool | sse_server.py | → `/ingest/manual/liquid` | WIRED (via #16) |
 
 ### Generic Measurement (datapoint) Paths
@@ -58,33 +58,63 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 | # | Entry Point | Route | File | Wires Into | Status |
 |---|---|---|---|---|---|
 | 19 | Log any measurement | `POST /data-points` | routers/datapoints.py `log_data_point` | Direct Measurement write | SEPARATE (new row creation) |
-| 20 | Update measurement | `PATCH /data-points/{mid}` | routers/datapoints.py `update_data_point` | Direct field write | **FIXED** — domain provides `update_measurement_value` that delegates for beverages |
-| 21 | Delete measurement | `DELETE /data-points/{mid}` | routers/datapoints.py `delete_data_point` | `db.delete(m)` | **FIXED** — domain provides `delete_measurement` that cascades for beverages |
+| 20 | Update measurement | `PATCH /data-points/{mid}` | routers/datapoints.py `update_data_point` | `consumption.update_measurement_value` for beverages | WIRED |
+| 21 | Delete measurement | `DELETE /data-points/{mid}` | routers/datapoints.py `delete_data_point` | `consumption.delete_measurement` for beverages | WIRED |
 | 22 | Health Connect batch | `POST /ingest/health-connect/batch` | routers/ingest.py | Direct Measurements | SEPARATE — source Provider readings |
 
 ---
 
 ## B4 — Per-Blocker Evidence
 
-### Blocker B4-1: Generic datapoint update of beverage doesn't update meal_item or totals
+### Blocker B4-0 (WIRED): add_meal_item creates liquid projection for beverages
 
-**Affected path**: `PATCH /data-points/{mid}` for a beverage measurement.
+**Path**: `POST /meals/{meal_id}/items` for a beverage.
 
-**Pre-fix behavior**: `routers/datapoints.py:update_data_point` only updates `Measurement.value_json` — the `MealItem.volume_ml`, `MealItem.nutrients_json`, and `Meal.totals_json` remain stale.
+**Wiring**: `add_meal_item` calls `_classify_beverage(req.display_name)`. If the item is a beverage with positive grams, it calls `create_beverage_projection(db, user.id, mi, float(req.grams), bev_category, meal.eaten_at)` which creates a `Measurement` (metric_type=water) + `BeverageMeasurement` link.
 
-**Fix**: Added `consumption.update_measurement_value()` which detects the `BeverageMeasurement` link and updates all projections atomically (measurement, meal_item volume+nutrients, meal totals).
+**Verification**: `TestWiredBeverageAdd::test_add_beverage_creates_linked_measurement` — adds milk via router, asserts BeverageMeasurement + Measurement exist, volume=250, category=non_alcoholic, all 6 nutrients present on meal_item.
 
-**Verification**: `TestB4EntryPointCoverage::test_generic_datapoint_update_delegates_for_beverage` — confirms updating a beverage measurement to 500ml updates the meal_item volume to 500 and meal totals kcal to 210.0.
+### Blocker B4-0b (WIRED): copy_meal replicates beverage linkage
 
-### Blocker B4-2: Generic datapoint delete of beverage orphans BeverageMeasurement + leaves stale totals
+**Path**: `POST /meals/{meal_id}/copy` for a meal with beverages.
 
-**Affected path**: `DELETE /data-points/{mid}` for a beverage measurement.
+**Wiring**: `copy_meal` calls `copy_beverage_link(db, user.id, str(i.id), str(new_mi.id), eaten_at)` for each source item with `beverage_category or volume_ml`. This replicates the BeverageMeasurement + Measurement for the copied item.
 
-**Pre-fix behavior**: `routers/datapoints.py:delete_data_point` only deletes the Measurement — the `BeverageMeasurement` link, `MealItem`, and `Meal.totals_json` remain.
+**Verification**: `TestWiredMealCopy::test_copy_carries_beverage_linkage` — copies a meal with milk, asserts 2 BeverageMeasurement rows (original + copy) and 2 Measurement rows.
 
-**Fix**: Added `consumption.delete_measurement()` which cascades: deletes BeverageMeasurement + MealItem + Measurement, then recomputes meal totals.
+### Blocker B4-0c (WIRED): remove_meal_item cascades for beverages
 
-**Verification**: `TestB4EntryPointCoverage::test_generic_datapoint_delete_delegates_for_beverage` — confirms cascade removes BeverageMeasurement and MealItem, and meal totals are recomputed.
+**Path**: `DELETE /meals/{meal_id}/items/{item_id}` for a beverage.
+
+**Wiring**: `remove_meal_item` detects `item.beverage_category or _classify_beverage(item.display_name)` and calls `delete_beverage_item(db, user.id, meal_id, item_id)` which deletes BeverageMeasurement + Measurement + MealItem, then recomputes totals.
+
+**Verification**: `TestWiredBeverageDelete::test_delete_beverage_removes_linked_measurement` — deletes milk item, asserts BeverageMeasurement, MealItem, and Measurement all gone; totals recomputed.
+
+### Blocker B4-0d (WIRED, PARTIAL): patch_meal_item propagates to Measurement
+
+**Path**: `PATCH /meals/{meal_id}/items/{item_id}` for a beverage.
+
+**Wiring**: `patch_meal_item` calls `propagate_beverage_patch(db, user.id, meal_id, item, old_grams)` which detects the BeverageMeasurement link and updates Measurement.value_json (amount_ml, category). Also calls `_sync_totals`.
+
+**Known gap**: When a beverage is renamed to a solid food, `propagate_beverage_patch` does NOT clear `beverage_category` on the item. So `still_bev` remains truthy (because `item.beverage_category` is still set) and the liquid projection is retained. The item is still classified as a beverage after rename.
+
+**Verification**: `TestWiredBeveragePatch::test_patch_beverage_grams_propagates_to_measurement` and `test_patch_beverage_name_propagates_to_measurement` — confirm propagation works. `test_patch_beverage_to_solid_keeps_liquid_with_warning` documents the known gap.
+
+### Blocker B4-1 (WIRED): Generic datapoint update of beverage updates meal_item + totals
+
+**Path**: `PATCH /data-points/{mid}` for a beverage measurement.
+
+**Wiring**: `update_data_point` detects BeverageMeasurement and calls `consumption.update_measurement_value` which updates Measurement + MealItem.volume_ml + MealItem.nutrients_json + Meal.totals_json atomically.
+
+**Verification**: `TestWiredGenericMeasurementCRUD::test_generic_patch_beverage_updates_meal_item_and_totals`.
+
+### Blocker B4-2 (WIRED): Generic datapoint delete of beverage cascades
+
+**Path**: `DELETE /data-points/{mid}` for a beverage measurement.
+
+**Wiring**: `delete_data_point` detects BeverageMeasurement and calls `consumption.delete_measurement` which cascades: deletes BeverageMeasurement + MealItem + Measurement, recomputes totals.
+
+**Verification**: `TestWiredGenericMeasurementCRUD::test_generic_delete_beverage_cascades`.
 
 ### Blocker B4-3: Router delete_meal doesn't cascade to beverage measurements
 
@@ -193,8 +223,9 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 
 - Stage 1: 154 tests
 - Stage 2: 30 tests (1 updated for corrected nutrient-basis semantics)
-- Stage 3: 17 new tests
-- **Total**: **201 tests, all passing**
+- Stage 3 (B4+B7): 17 new tests
+- Stage 3 (wired paths): 25 new tests
+- **Total**: **226 tests, all passing**
 
 ---
 
@@ -224,6 +255,7 @@ Stage 3 fixes **B4 (Entry-Point Coverage)** and **B7 (Canonical Mutations)** and
 
 1. **Stage 4 = B9 cutover** — not yet started.
 2. **Recipe consumption** — `POST /meals/recipes` creates a FoodCatalogItem but there is no "consume recipe" endpoint. When implemented, it must call `write_consumption`.
-3. **Meal copy / Add item** — these routers still bypass the domain (see B4 matrix). Beverages added/copied via these routes won't have a liquid projection. Wire them through `write_consumption` for beverage items.
-4. **Meal item patch/delete** — `routers/meals.py:patch_meal_item` and `remove_meal_item` still bypass the domain for beverages. The domain functions (`update_item_quantity`, `delete_beverage`, `replace_beverage`) exist but the routers don't delegate to them.
+3. **Meal item patch — beverage→solid rename** — `propagate_beverage_patch` does not clear `beverage_category` when a beverage is renamed to a solid food. The liquid projection is retained because `item.beverage_category` is still set. Documented in `test_patch_beverage_to_solid_keeps_liquid_with_warning`.
+4. **Delete meal** — `routers/meals.py:delete_meal` still bypasses the domain. It sets `meal.status = "deleted"` without cascading to BeverageMeasurement/Measurement. The domain `delete_meal` function exists but the router doesn't call it.
 5. **Manual water / Manual text (water)** — still write bare water rows. The reconciliation-aware `log_manual_liquid` exists but the legacy `/manual/water` path doesn't use it. This is intentional coexistence (per C_patch_summary.md).
+6. **Create ConsumptionOperation** — `add_meal_item`, `copy_meal`, `patch_meal_item`, `remove_meal_item` don't create a `ConsumptionOperation` record. They create BeverageMeasurement links but without the operation identity needed for full replay idempotency.

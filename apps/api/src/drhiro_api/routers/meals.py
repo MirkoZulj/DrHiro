@@ -20,6 +20,12 @@ from drhiro_api.deps import get_current_user
 from drhiro_api.food_search import nutrient_map, resolve_food
 from drhiro_api.models import Food, FoodCatalogItem, FoodNutrient, Meal, MealItem, Nutrient, User
 from drhiro_api.security import audit
+from drhiro_api.services.consumption import (
+    create_beverage_projection,
+    propagate_beverage_patch,
+    delete_beverage_item,
+    copy_beverage_link,
+)
 from drhiro_nutrition.catalog import FoodItem, NutrientTotals, scale_nutrients
 from drhiro_nutrition.composite import CompositeCatalog
 
@@ -603,6 +609,7 @@ def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User =
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
     old_display_name = item.display_name
+    old_grams = item.grams
     if req.display_name is not None:
         item.display_name = req.display_name
     if req.quantity is not None:
@@ -622,6 +629,11 @@ def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User =
         # keeps the Atwater kcal fallback).
         _resolve_item_nutrition(db, item, user)
     item.user_corrected = True
+
+    # Propagate beverage changes to linked Measurement (volume/category) via
+    # shared domain so the liquid projection stays consistent.
+    propagate_beverage_patch(db, user.id, meal_id, item, old_grams)
+
     _sync_totals(db, meal)
     audit(db, "user", str(user.id), user.id, "meals.item_patch", "meal", str(meal.id), {"item_id": str(item_id)})
     # Detect a display_name CORRECTION: remember the original text before the
@@ -653,9 +665,22 @@ def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User =
 
 @router.post("/{meal_id}/items", response_model=MealOut)
 def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Add one item to an existing meal, resolving nutrition like create does."""
+    """Add one item to an existing meal, resolving nutrition like create does.
+
+    For beverages, also creates the liquid Measurement + BeverageMeasurement
+    projection so the drink contributes to the water tile and the meal
+    carries a consistent projection (delegates to ``create_beverage_projection``).
+    """
     meal = _owned_meal(db, meal_id, user)
     nutrients, conf, source = _lookup_nutrients(db, req, user)
+
+    # Detect beverage: explicit food_catalog_item_id won't classify, but if
+    # _lookup_nutrients matched a liquid food, the source is "usda" with
+    # is_liquid — we still rely on _classify_beverage on the display_name.
+    from drhiro_api.services.consumption import _classify_beverage
+    bev_category = _classify_beverage(req.display_name)
+    is_beverage = bev_category is not None
+
     mi = MealItem(
         meal_id=meal.id,
         food_catalog_item_id=req.food_catalog_item_id,
@@ -666,8 +691,16 @@ def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_curren
         nutrients_json=nutrients,
         source=source or "manual",
         confidence=conf,
+        beverage_category=bev_category,
+        volume_ml=req.grams if (is_beverage and req.grams) else None,
     )
     db.add(mi)
+    db.flush()
+
+    # For beverages, create the linked liquid projection via shared domain
+    if is_beverage and req.grams and req.grams > 0:
+        create_beverage_projection(db, user.id, mi, float(req.grams), bev_category, meal.eaten_at)
+
     _sync_totals(db, meal)
     audit(db, "user", str(user.id), user.id, "meals.item_add", "meal", str(meal.id), {"display_name": req.display_name})
     db.commit()
@@ -677,11 +710,33 @@ def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_curren
 
 @router.delete("/{meal_id}/items/{item_id}", response_model=MealOut)
 def remove_meal_item(meal_id: str, item_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Remove one item from a meal and recompute the meal's totals."""
+    """Remove one item from a meal, recomputing the meal's totals.
+
+    For beverages, delegates to ``delete_beverage_item`` which also removes
+    the linked BeverageMeasurement + Measurement so no liquid row is orphaned.
+    """
     meal = _owned_meal(db, meal_id, user)
     item = next((i for i in meal.items if str(i.id) == str(item_id)), None)
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
+
+    # If the item is a beverage, delegate to the shared domain so the linked
+    # BeverageMeasurement + Measurement are removed atomically (no orphan).
+    bev = None
+    from drhiro_api.services.consumption import _classify_beverage
+    if item.beverage_category or _classify_beverage(item.display_name):
+        bev = True
+    if bev:
+        delete_beverage_item(db, user.id, meal_id, item_id)
+        # delete_beverage_item already recomputes meal totals; refresh + return
+        db.flush()
+        db.expire(meal, ["items"])
+        _sync_totals(db, meal)
+        audit(db, "user", str(user.id), user.id, "meals.item_remove", "meal", str(meal.id), {"item_id": str(item_id)})
+        db.commit()
+        db.refresh(meal)
+        return _meal_to_out(meal)
+
     db.delete(item)
     _sync_totals(db, meal)
     audit(db, "user", str(user.id), user.id, "meals.item_remove", "meal", str(meal.id), {"item_id": str(item_id)})
@@ -711,6 +766,12 @@ def confirm_meal(meal_id: str, user: User = Depends(get_current_user), db: Sessi
 
 @router.post("/{meal_id}/copy", response_model=MealOut)
 def copy_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Copy a meal, including beverage liquid projections.
+
+    For each source item that has a linked BeverageMeasurement + Measurement,
+    the copy replicates the link so the copied drink carries a consistent
+    liquid projection (delegates to ``copy_beverage_link``).
+    """
     source = (
         db.query(Meal)
         .options(selectinload(Meal.items))
@@ -731,20 +792,30 @@ def copy_meal(meal_id: str, user: User = Depends(get_current_user), db: Session 
     )
     db.add(meal)
     db.flush()
+    new_meal_id = meal.id
+    eaten_at = meal.eaten_at
+
     for i in source.items:
-        db.add(
-            MealItem(
-                meal_id=meal.id,
-                food_catalog_item_id=i.food_catalog_item_id,
-                display_name=i.display_name,
-                quantity=i.quantity,
-                unit=i.unit,
-                grams=i.grams,
-                nutrients_json=i.nutrients_json,
-                source=i.source,
-                confidence=i.confidence,
-            )
+        new_mi = MealItem(
+            meal_id=new_meal_id,
+            food_catalog_item_id=i.food_catalog_item_id,
+            display_name=i.display_name,
+            quantity=i.quantity,
+            unit=i.unit,
+            grams=i.grams,
+            nutrients_json=i.nutrients_json,
+            source=i.source,
+            confidence=i.confidence,
+            beverage_category=i.beverage_category,
+            volume_ml=i.volume_ml,
         )
+        db.add(new_mi)
+        db.flush()
+
+        # Replicate the BeverageMeasurement + Measurement for beverage items
+        if i.beverage_category or i.volume_ml:
+            copy_beverage_link(db, user.id, str(i.id), str(new_mi.id), eaten_at)
+
     db.commit()
     db.refresh(meal)
     return _meal_to_out(meal)

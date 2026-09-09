@@ -52,6 +52,7 @@
 - **`_write_new_liquid_consumption(db, user_id, items, eaten_at, source, notes)`** — write a genuinely new drink consumption with volume AND calories
 
 ### 3. `apps/api/src/drhiro_api/routers/ingest.py`
+
 **Change**: Added reconciliation-aware `/manual/liquid` endpoint.
 
 **New endpoint**: `POST /manual/liquid`
@@ -83,8 +84,23 @@
 ### 6. `packages/drhiro-mcp/src/drhiro_mcp/sse_server.py`
 **Change**: **MCP CUTOVER** — removed the liquid auto-log side-effect block (lines 1636–1698).
 
-### 11. `docs/deliverables/meal-liquid-idempotency/stage3_entrypoints_mutations_evidence.md` (NEW)
-**Change**: Stage 3 evidence document covering coverage matrix + per-blocker evidence.
+### 11. `apps/api/src/drhiro_api/routers/meals.py` (B4 wiring)
+**Change**: Four previously-bypassing paths now route through shared domain:
+- `add_meal_item` → `_classify_beverage` → `create_beverage_projection`
+- `copy_meal` → `copy_beverage_link` per beverage item
+- `patch_meal_item` → `propagate_beverage_patch`
+- `remove_meal_item` → `delete_beverage_item` for beverages
+
+### 12. `apps/api/src/drhiro_api/routers/datapoints.py` (B4 wiring)
+**Change**: Generic measurement CRUD delegates to domain for beverages:
+- `update_data_point` → `consumption.update_measurement_value` for beverages
+- `delete_data_point` → `consumption.delete_measurement` for beverages
+
+### 13. `tests/test_stage3_wired_paths.py` (NEW, 25 tests)
+**Change**: Wired-path regression tests calling real router handlers.
+
+### 14. `docs/deliverables/meal-liquid-idempotency/stage3_entrypoints_coverage_matrix.md` (UPDATED)
+### 15. `docs/deliverables/meal-liquid-idempotency/stage3_entrypoints_mutations_evidence.md` (UPDATED)
 
 ---
 
