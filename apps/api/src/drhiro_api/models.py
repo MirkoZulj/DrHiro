@@ -547,6 +547,13 @@ class ConsumptionItem(Base, TimestampMixin):
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     meal_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     measurement_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Stage 2: nutrient resolution provenance
+    nutrient_basis: Mapped[str | None] = mapped_column(String(16), nullable=True)  # 'per_100_g' | 'per_100_ml'
+    resolution_source: Mapped[str | None] = mapped_column(String(32), nullable=True)  # 'db' | 'external' | 'unmatched'
+    food_catalog_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("foods.id"), nullable=True
+    )
+    nutrition_complete: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
 class BeverageMeasurement(Base, TimestampMixin):

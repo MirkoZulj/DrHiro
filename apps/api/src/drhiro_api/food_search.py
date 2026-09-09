@@ -124,10 +124,9 @@ def _preparation_penalty(query: str):
         for word in PREPARATION_QUALIFIERS
         if word not in q
     ]
-    if not conditions:
-        return literal(0)
-
-    return case((or_(*conditions), 1), else_=0)
+    # Always return a CASE expression so the ORDER BY clause is valid SQL.
+    # When no conditions apply, all rows get 0 (no penalty).
+    return case((or_(*conditions), 1), else_=0) if conditions else case((literal(1) == literal(1), 0), else_=0)
 
 
 def _head_category_penalty(query: str):
@@ -140,7 +139,8 @@ def _head_category_penalty(query: str):
     """
     terms = _HEAD_CATEGORY_EXCLUSIONS.get(query.lower())
     if not terms:
-        return literal(0)
+        # Always return a CASE expression so the ORDER BY clause is valid SQL.
+        return case((literal(1) == literal(1), 0), else_=0)
 
     head = func.lower(func.split_part(Food.display_name, ",", 1))
     q = query.lower()

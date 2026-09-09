@@ -43,7 +43,10 @@ from drhiro_api.models import (
     MealItem,
     Measurement,
     User,
+    Food,
+    Nutrient,
 )
+from drhiro_api.food_search import resolve_food, nutrient_map
 
 log = logging.getLogger("drhiro.consumption")
 
@@ -82,12 +85,15 @@ _LIQUID_KEYWORDS: list[tuple[str, re.Pattern]] = [
 _VOLUME_UNITS = {
     "ml": 1.0, "milliliter": 1.0, "millilitre": 1.0, "milliliters": 1.0, "millilitres": 1.0,
     "l": 1000.0, "liter": 1000.0, "litre": 1000.0, "liters": 1000.0, "litres": 1000.0,
+    "cl": 10.0, "centiliter": 10.0, "centilitre": 10.0, "centiliters": 10.0, "centilitres": 10.0,
+    "dl": 100.0, "deciliter": 100.0, "decilitre": 100.0, "deciliters": 100.0, "decilitres": 100.0,
+    "dcl": 100.0,  # alternate abbreviation for deciliter
     "cup": 240.0, "cups": 240.0,
     "glass": 250.0, "glasses": 250.0,
     "bottle": 500.0, "bottles": 500.0,
     "can": 330.0, "cans": 330.0,
-    "espresso": 30.0, "shot": 30.0, "shots": 30.0,
-    "mug": 300.0,
+    "espresso": 30.0, "espressos": 30.0, "shot": 30.0, "shots": 30.0,
+    "mug": 300.0, "mugs": 300.0,
 }
 
 # Container gram defaults (for food items)
@@ -128,6 +134,11 @@ class ParsedItem:
     confidence: float = 0.8
     # Provenance
     explicit_qty_assumption: Optional[str] = None
+    # Stage 2: nutrient resolution provenance
+    nutrient_basis: Optional[str] = None  # 'per_100_g' | 'per_100_ml'
+    resolution_source: Optional[str] = None  # 'db' | 'external' | 'unmatched'
+    food_catalog_item_id: Optional[str] = None
+    nutrition_complete: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +148,33 @@ class ParsedItem:
 def _to_float(num: str) -> float:
     """Parse a number that may use comma as decimal separator."""
     return float(num.replace(",", "."))
+
+
+def _strip_nl_prefix(text: str) -> str:
+    """Strip natural-language prefixes like 'I drank', 'Yesterday I drank'.
+
+    Returns the text with the prefix removed, or the original text if no
+    prefix matched. Also handles date references like 'Yesterday', 'Today'.
+    """
+    if not text:
+        return text
+    t = text.strip()
+    # Remove leading date references + optional "I drank/ate/had"
+    t = re.sub(
+        r'^(?:yesterday|today|last\s+\w+day|on\s+\w+day)\s*,?\s*',
+        '', t, flags=re.I,
+    )
+    # Remove leading "I drank/ate/had" etc.
+    t = re.sub(
+        r'^(?:i\s+(?:drank|ate|had)|i\s+had\s+and\s+ate)\s+',
+        '', t, flags=re.I,
+    )
+    # Remove leading "I had/ate for breakfast/lunch/dinner"
+    t = re.sub(
+        r'^(?:i\s+(?:had|ate)\s+(?:for\s+)?(?:breakfast|lunch|dinner|snack))\s+',
+        '', t, flags=re.I,
+    )
+    return t.strip()
 
 
 def _normalize_meal_type(mt: Optional[str]) -> str:
@@ -249,7 +287,8 @@ def _sum_nutrients(nutrient_dicts: list[dict]) -> dict:
 # Regex: number + unit + "of" + food — handles decimal commas without splitting
 _NUM_UNIT_RE = re.compile(
     r'(?P<qty>\d+(?:[.,]\d+)?)\s*'
-    r'(?P<unit>g|grams?|kg|ml|milliliters?|millilitres?|l|liters?|litres?|dcl|dl|'
+    r'(?P<unit>g|grams?|kg|ml|milliliters?|millilitres?|l|liters?|litres?|'
+    r'cl|centiliters?|centilitres?|dl|deciliters?|decilitres?|dcl|'
     r'tbsp|tsp|tablespoons?|teaspoons?|slices?|pieces?|cups?|glass(?:es)?|bottles?|cans?|mugs?|shots?|espressos?)?'
     r'\s+(?:of\s+)?(?P<food>.+)',
     re.IGNORECASE,
@@ -278,8 +317,9 @@ WORD_NUM_MAP = {
 }
 
 # Separators: comma, "and", "with", "plus" — but NOT inside a number like "0,5"
-# We split on comma only when NOT between two digits (negative lookahead/lookbehind)
-_ITEM_SPLIT_RE = re.compile(r'(?<!\d)\s*,\s*(?!\d)|\band\b|\bwith\b|\bplus\b|\+|;', re.I)
+# Split on comma only when NOT preceded by a digit (negative lookbehind).
+# We do NOT require the following char to be non-digit, so "milk,330ml" splits.
+_ITEM_SPLIT_RE = re.compile(r'(?<!\d)\s*[,،]\s*|\band\b|\bwith\b|\bplus\b|\+|;', re.I)
 
 
 def parse_consumption_text(text: str) -> list[ParsedItem]:
@@ -311,6 +351,11 @@ def parse_consumption_text(text: str) -> list[ParsedItem]:
 
 def _parse_single_item(part: str) -> Optional[ParsedItem]:
     """Parse a single item fragment into a ParsedItem."""
+
+    # Strip NL prefixes (e.g. "I drank", "Yesterday I drank")
+    part = _strip_nl_prefix(part)
+    if not part:
+        return None
 
     # Try numeric: "500 g of steak", "250ml milk", "0,5 l beer"
     m = _NUM_UNIT_RE.match(part)
@@ -344,12 +389,27 @@ def _parse_single_item(part: str) -> Optional[ParsedItem]:
         cnt = WORD_NUM_MAP[m.group("num").lower()]
         food = m.group("food").strip()
         grams = cnt * ITEM_GRAMS.get(food.lower().rstrip("s"), 100)
+        # Check if the food is a beverage
+        bev_cat = _classify_beverage(food)
+        if bev_cat:
+            vol = cnt * 250  # default beverage volume
+            return ParsedItem(
+                display_name=food, quantity=cnt, grams=grams,
+                volume_ml=vol, beverage_category=bev_cat, is_beverage=True,
+            )
         return ParsedItem(display_name=food, quantity=cnt, grams=grams)
 
     # Bare food word
     if part.strip():
         food = part.strip()
         grams = ITEM_GRAMS.get(food.lower().rstrip("s"), 100)
+        # Check if the bare word is a beverage
+        bev_cat = _classify_beverage(food)
+        if bev_cat:
+            return ParsedItem(
+                display_name=food, quantity=1, grams=grams,
+                volume_ml=250, beverage_category=bev_cat, is_beverage=True,
+            )
         return ParsedItem(display_name=food, quantity=1, grams=grams)
 
     return None
@@ -359,7 +419,9 @@ def _build_item(qty: float, unit: str, food: str) -> ParsedItem:
     """Build a ParsedItem from qty+unit+food."""
     gram_units = {"g", "gram", "grams", "kg"}
     volume_units = {"ml", "milliliter", "millilitre", "milliliters", "millilitres",
-                    "l", "liter", "litres", "liters", "dcl", "dl",
+                    "l", "liter", "litres", "liters",
+                    "cl", "centiliter", "centilitre", "centiliters", "centilitres",
+                    "dl", "deciliter", "decilitre", "deciliters", "decilitres", "dcl",
                     "cup", "cups", "glass", "glasses", "bottle", "bottles",
                     "can", "cans", "espresso", "espressos", "shot", "shots",
                     "mug", "mugs"}
@@ -374,17 +436,30 @@ def _build_item(qty: float, unit: str, food: str) -> ParsedItem:
             grams = qty * 1000
         else:
             grams = qty
+        # Mass unit: preserve beverage identity (e.g. '250 g milk' is still a beverage)
+        if bev_cat:
+            return ParsedItem(
+                display_name=food, quantity=qty, unit=unit, grams=grams,
+                beverage_category=bev_cat, is_beverage=True,
+                volume_ml=grams,  # 1g ≈ 1ml for beverages
+            )
         return ParsedItem(display_name=food, quantity=qty, unit=unit, grams=grams)
     elif unit in volume_units:
         ml = qty * _VOLUME_UNITS.get(unit, 1.0)
-        # Volume unit implies beverage
-        if not bev_cat:
-            bev_cat = "non_alcoholic"
-        return ParsedItem(
-            display_name=food, quantity=qty, unit=unit,
-            volume_ml=ml, beverage_category=bev_cat, is_beverage=True,
-            grams=ml,  # 1ml ≈ 1g for water-like
-        )
+        # Volume unit + beverage food name → beverage
+        # Volume unit + non-beverage food name → food measured by volume (e.g. "1 cup rice")
+        if bev_cat:
+            return ParsedItem(
+                display_name=food, quantity=qty, unit=unit,
+                volume_ml=ml, beverage_category=bev_cat, is_beverage=True,
+                grams=ml,  # 1ml ≈ 1g for water-like
+            )
+        else:
+            # Non-beverage measured by volume (e.g. "1 cup rice")
+            return ParsedItem(
+                display_name=food, quantity=qty, unit=unit,
+                grams=ml,  # approximate using 1ml ≈ 1g
+            )
     elif unit in count_units:
         gram_map = {
             "slice": 28, "slices": 28, "piece": 5, "pieces": 5,
@@ -417,6 +492,221 @@ def _build_item(qty: float, unit: str, food: str) -> ParsedItem:
         return ParsedItem(display_name=food, quantity=qty, grams=grams,
                           volume_ml=grams if bev_cat else None,
                           beverage_category=bev_cat, is_beverage=bool(bev_cat))
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 B1 — Nutrient resolution
+# ---------------------------------------------------------------------------
+
+def _external_nutrition_search(food_name: str, limit: int = 3) -> list[dict]:
+    """Search for food nutrition via external providers (USDA API, DDG).
+
+    This is the BOUNDARY for external lookups. Callers can mock this function
+    to inject fake responses for testing without pre-enriching items.
+
+    Returns a list of candidate dicts with keys:
+        display_name, kcal_per_100g, protein_g_per_100g, carbs_g_per_100g,
+        fat_g_per_100g, fiber_g_per_100g, sodium_mg_per_100g, source,
+        confidence, food_id
+    """
+    # Try USDA API first (structured, authoritative)
+    try:
+        candidates = _usda_search(food_name, limit=limit)
+        if candidates:
+            return candidates
+    except Exception:
+        pass
+    # Fall back to DDG via the VPS host service
+    try:
+        return _ddg_nutrition_search(food_name)
+    except Exception:
+        return []
+
+
+def _usda_search(query: str, limit: int = 3) -> list[dict]:
+    """Query USDA FoodData Central for structured per-100g nutrition.
+
+    Restricted to Foundation/SR Legacy/Survey data types to avoid branded
+    products (which often have misleading descriptions).
+    """
+    import os
+    import time
+    import httpx
+
+    key = query.strip().lower()
+    now = time.time()
+    if key in _USDA_CACHE and now - _USDA_CACHE[key][0] < 900:
+        return _USDA_CACHE[key][1]
+
+    try:
+        api_key = os.environ.get("USDA_API_KEY", "")
+        if not api_key:
+            return []
+        r = httpx.get(
+            "https://api.nal.usda.gov/fdc/v1/foods/search",
+            params={
+                "query": query,
+                "api_key": api_key,
+                "pageSize": limit,
+                "dataType": ["Foundation", "SR Legacy", "Survey (FNDDS)"],
+            },
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        foods = data.get("foods", [])
+        out = []
+        for f in foods:
+            desc = f.get("description", "")
+            if not desc:
+                continue
+            nuts = {n.get("nutrientName"): n.get("value") for n in f.get("foodNutrients", [])}
+            out.append({
+                "display_name": desc.title(),
+                "kcal_per_100g": _norm_usda_val(nuts.get("Energy")),
+                "protein_g_per_100g": _norm_usda_val(nuts.get("Protein")),
+                "carbs_g_per_100g": _norm_usda_val(nuts.get("Carbohydrate, by difference")),
+                "fat_g_per_100g": _norm_usda_val(nuts.get("Total lipid (fat)")),
+                "fiber_g_per_100g": _norm_usda_val(nuts.get("Fiber, total dietary")),
+                "sodium_mg_per_100g": _norm_usda_val(nuts.get("Sodium, Na")),
+                "source": "usda",
+                "confidence": 0.85,
+            })
+        _USDA_CACHE[key] = (now, out)
+        return out
+    except Exception:
+        return []
+
+
+_USDA_CACHE: dict = {}
+
+
+def _norm_usda_val(value):
+    """Coerce a possibly-str value to float or None."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ddg_nutrition_search(query: str) -> list[dict]:
+    """DuckDuckGo nutrition fallback via the VPS-host ddg-http service.
+
+    Env: DDG_HTTP_URL. The host service runs Camoufox egressing through a
+    residential tunnel. Returns [] if unreachable.
+    """
+    import os
+    import httpx
+
+    url = os.environ.get("DDG_HTTP_URL", "")
+    if not url:
+        return []
+    try:
+        r = httpx.post(f"{url}/lookup", json={"query": query}, timeout=75)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        cands = data.get("candidates", [])
+        for c in cands:
+            c["display_name"] = query.strip().title()
+            c.setdefault("source", "duckduckgo")
+        return cands
+    except Exception:
+        return []
+
+
+def resolve_item_nutrition(db: Session, item: ParsedItem) -> ParsedItem:
+    """Resolve nutrition for a ParsedItem through DB → external fallback.
+
+    This is the REAL food resolution path. It:
+    1. Searches the local DB via resolve_food (tiered ranking).
+    2. If no DB match, calls _external_nutrition_search (mockable boundary).
+    3. Scales per-100 nutrients by the item's grams/100 or ml/100.
+    4. Sets nutrient_basis (per_100_g vs per_100_ml) based on item type.
+    5. Sets nutrition_complete=False if no resolution was found.
+
+    UNKNOWN ≠ KNOWN-ZERO: a lookup failure sets nutrition_complete=False
+    and leaves nutrients as empty/zero, so downstream code can distinguish
+    "we know this has 0 kcal" from "we couldn't find it".
+    """
+    if item.nutrients_per_100:
+        # Already resolved (e.g. from a saved operation)
+        return item
+
+    food_name = item.display_name
+    if not food_name:
+        item.nutrition_complete = False
+        return item
+
+    # 1. Try local DB
+    code_by_id = {n.id: n.nutrient_code for n in db.query(Nutrient).all()}
+    result = resolve_food(db, food_name, limit=5)
+    food = result.best if result else None
+
+    if food is not None:
+        # Found in DB
+        nmap = nutrient_map(food, code_by_id)
+        item.nutrients_per_100 = {
+            "kcal": nmap.get("energy"),
+            "protein_g": nmap.get("protein"),
+            "carbs_g": nmap.get("carbs"),
+            "fat_g": nmap.get("fat"),
+            "fiber_g": nmap.get("fiber"),
+            "sodium_mg": nmap.get("sodium"),
+        }
+        # Fill missing with None → 0 when scaling
+        for k in NUTRIENT_KEYS:
+            item.nutrients_per_100.setdefault(k, None)
+        item.food_catalog_item_id = str(food.id)
+        item.resolution_source = "db"
+        item.confidence = 0.9
+    else:
+        # 2. No DB match — try external
+        external = _external_nutrition_search(food_name)
+        if external:
+            best = external[0]
+            item.nutrients_per_100 = {
+                "kcal": best.get("kcal_per_100g"),
+                "protein_g": best.get("protein_g_per_100g"),
+                "carbs_g": best.get("carbs_g_per_100g"),
+                "fat_g": best.get("fat_g_per_100g"),
+                "fiber_g": best.get("fiber_g_per_100g"),
+                "sodium_mg": best.get("sodium_mg_per_100g"),
+            }
+            item.food_catalog_item_id = best.get("food_id")
+            item.resolution_source = best.get("source", "external")
+            item.confidence = best.get("confidence", 0.7)
+        else:
+            # 3. Nothing found — mark incomplete
+            item.nutrients_per_100 = {k: None for k in NUTRIENT_KEYS}
+            item.resolution_source = "unmatched"
+            item.confidence = 0.3
+            item.nutrition_complete = False
+            # Still scale to 0 for storage (distinguished by nutrition_complete=False)
+            item.nutrients_scaled = {k: 0.0 for k in NUTRIENT_KEYS}
+            return item
+
+    # Determine nutrient basis
+    if item.is_beverage and item.volume_ml is not None:
+        item.nutrient_basis = "per_100_ml"
+        factor = item.volume_ml / 100.0
+    elif item.grams is not None:
+        item.nutrient_basis = "per_100_g"
+        factor = item.grams / 100.0
+    else:
+        # Default: assume grams
+        item.nutrient_basis = "per_100_g" if not item.is_beverage else "per_100_ml"
+        factor = (item.grams or item.volume_ml or 100.0) / 100.0
+
+    # Scale nutrients (None → 0)
+    item.nutrients_scaled = _scale_nutrients(
+        {k: (v if v is not None else 0.0) for k, v in item.nutrients_per_100.items()},
+        factor,
+    )
+    return item
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +995,11 @@ def write_consumption(
             meal_type=meal_type,
             source=item.source,
             confidence=item.confidence,
+            # Stage 2: nutrient resolution provenance
+            nutrient_basis=item.nutrient_basis,
+            resolution_source=item.resolution_source,
+            food_catalog_item_id=item.food_catalog_item_id,
+            nutrition_complete=item.nutrition_complete,
         )
         db.add(ci)
         db.flush()
@@ -781,6 +1076,9 @@ def write_consumption(
     totals = _sum_nutrients(all_nutrient_dicts)
     meal.totals_json = totals
 
+    # Stage 2: track whether all items have complete nutrition
+    meal_nutrition_complete = all(item.nutrition_complete for item in items)
+
     # Update operation status and store durable result
     op.status = "completed"
     op.updated_at = now
@@ -792,6 +1090,7 @@ def write_consumption(
             "totals": totals,
             "items": item_details,
             "auto_confirmed": True,
+            "nutrition_complete": meal_nutrition_complete,
         },
         "message": "Meal logged with best available matches.",
     }
