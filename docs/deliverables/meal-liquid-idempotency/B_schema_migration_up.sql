@@ -1,6 +1,8 @@
 -- B. Schema Migration: Operation Identity, Item Identity, Durable Result, Liquid-Meal Linkage
 -- Branch: feature/meal-liquid-idempotency
 -- Target: apps/api/src/drhiro_api/models.py + Alembic migration
+-- Single authority: Alembic migration f1a2b3c4d5e6_consumption_idempotency.py
+-- This raw SQL is regenerated to be EXACTLY equivalent to the Alembic migration.
 --
 -- New tables:
 --   1. consumption_operations  — idempotency key + durable result (Telegram update_id scope)
@@ -44,15 +46,13 @@ CREATE TABLE consumption_operations (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Uniqueness: one operation per Telegram message
+-- Uniqueness: one operation per Telegram message (unconditional, matches ORM)
 CREATE UNIQUE INDEX uq_consumption_op_telegram
-    ON consumption_operations (user_id, source_bot_id, source_chat_id, source_message_id)
-    WHERE source = 'telegram';
+    ON consumption_operations (user_id, source_bot_id, source_chat_id, source_message_id);
 
--- Uniqueness: one operation per caller-supplied idempotency key
+-- Uniqueness: one operation per caller-supplied idempotency key (unconditional, matches ORM)
 CREATE UNIQUE INDEX uq_consumption_op_idempotency
-    ON consumption_operations (user_id, idempotency_key)
-    WHERE idempotency_key IS NOT NULL AND source != 'telegram';
+    ON consumption_operations (user_id, idempotency_key);
 
 CREATE INDEX ix_consumption_ops_user_created
     ON consumption_operations (user_id, created_at DESC);
@@ -68,7 +68,7 @@ CREATE TABLE consumption_items (
     operation_id        UUID NOT NULL REFERENCES consumption_operations(id) ON DELETE CASCADE,
     user_id             UUID NOT NULL REFERENCES users(id),
     -- Stable identity within the operation
-    item_key            VARCHAR(64) NOT NULL,  # e.g. "item-0", "item-1", or a hash
+    item_key            VARCHAR(64) NOT NULL,
     -- Classification
     item_kind           VARCHAR(16) NOT NULL DEFAULT 'food',  -- food | beverage
     -- Parsed canonical data
@@ -91,7 +91,8 @@ CREATE TABLE consumption_items (
     -- Links to the actual written rows (populated after write)
     meal_item_id        UUID,  -- references meal_items.id (set after write)
     measurement_id      UUID,  -- references measurements.id (set after write for liquids)
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE UNIQUE INDEX uq_consumption_item_op_key
@@ -118,7 +119,8 @@ CREATE TABLE beverage_measurements (
     meal_item_id        UUID NOT NULL UNIQUE,  -- the meal_items row
     measurement_id      UUID NOT NULL UNIQUE,  -- the measurements row
     consumption_item_id UUID REFERENCES consumption_items(id),
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX ix_bev_meal_item ON beverage_measurements (meal_item_id);

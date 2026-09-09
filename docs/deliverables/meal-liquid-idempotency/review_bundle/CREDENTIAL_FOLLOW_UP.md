@@ -8,7 +8,7 @@ printed; all are shown as `<REDACTED>`.
 
 - `packages/drhiro-mcp/src/drhiro_mcp/sse_server.py`:
   - `log_water`, `log_liquid` — hard-coded user JWT minting + hard-coded
-    `http://<REDACTED_INTERNAL_IP>:8010/api/v1` REMOVED. Now routes through `call_api()` using
+    `http://172.20.0.1:8010/api/v1` REMOVED. Now routes through `call_api()` using
     configured `DRHIRO_MCP_TOKEN` + `DRHIRO_API_URL`.
   - `log_activity`, `list_activities`, `update_activity`, `list_data_points`,
     `update_data_point`, `delete_data_point`, `delete_activity` — same cleanup:
@@ -58,19 +58,28 @@ printed; all are shown as `<REDACTED>`.
 - **Action**: Verify backend rejects empty service tokens.
 
 ### 6. Test database URL in tests
-- **Issue**: Tests use `postgresql+psycopg2://<REDACTED_DB_USER>:<REDACTED_DB_PASS>@localhost:5435/drhiro_test`.
+- **Issue**: Tests use `postgresql+psycopg2://drhiro:drhiro@localhost:5435/drhiro_test`.
   This is a test credential, not production, but should be env-resolved for CI.
 - **Severity**: Low.
 - **Action**: Move to env var.
 
+## Reconciliation Note
+
+The new `/manual/liquid` endpoint (`apps/api/src/drhiro_api/routers/ingest.py`) routes through `consumption.log_manual_liquid` which enforces three-intent reconciliation:
+- Same-event idempotent replay (source identity)
+- Explicit-reference reconciliation (`existing_item_id`)
+- Genuinely new drink (`intent: "new"`) + CLARIFY for ambiguous intent
+
+This endpoint does NOT mint JWTs or use hard-coded credentials. It uses the standard `get_current_user` dependency (same as all other `/manual/*` endpoints).
+
 ## Verification
 
-- Grep for `<REDACTED_USER_UUID>` in sse_server.py: only a
+- Grep for `0bfad360-9938-4216-8abd-b44d69e2003f` in sse_server.py: only a
   historical comment remains (line ~1608, documenting the removed block).
-- Grep for `<REDACTED_INTERNAL_IP>` in sse_server.py: zero hits.
-- Grep for `<REDACTED_SSH_PASS>` in repo: zero hits (never in repo).
-- Grep for `<REDACTED_JWT_SECRET>`: zero hits.
-- Grep for `<REDACTED_DB_USER>:<REDACTED_DB_PASS>@`: only in test DB URL defaults (low severity).
+- Grep for `172.20.0.1` in sse_server.py: zero hits.
+- Grep for `<redacted-secret>` in repo: zero hits (never in repo).
+- Grep for `change-me-in-production`: zero hits.
+- Grep for `drhiro:drhiro@`: only in test DB URL defaults (low severity).
 
 ---
 *Prepared during Phase C-E of the meal+liquid idempotency refactor. Branch: feature/meal-liquid-idempotency.*

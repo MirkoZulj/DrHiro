@@ -36,15 +36,9 @@ def upgrade() -> None:
         sa.Column('status', sa.String(32), nullable=False, server_default='pending'),
         sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.text('NOW()')),
         sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.text('NOW()')),
+        sa.UniqueConstraint('user_id', 'source_bot_id', 'source_chat_id', 'source_message_id', name='uq_consumption_op_telegram'),
+        sa.UniqueConstraint('user_id', 'idempotency_key', name='uq_consumption_op_idempotency'),
     )
-    op.create_index('uq_consumption_op_telegram', 'consumption_operations',
-                    ['user_id', 'source_bot_id', 'source_chat_id', 'source_message_id'],
-                    unique=True,
-                    postgresql_where=sa.text("source = 'telegram'"))
-    op.create_index('uq_consumption_op_idempotency', 'consumption_operations',
-                    ['user_id', 'idempotency_key'],
-                    unique=True,
-                    postgresql_where=sa.text("idempotency_key IS NOT NULL AND source != 'telegram'"))
     op.create_index('ix_consumption_ops_user_created', 'consumption_operations',
                     ['user_id', sa.text('created_at DESC')])
 
@@ -74,9 +68,8 @@ def upgrade() -> None:
         sa.Column('measurement_id', postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.text('NOW()')),
         sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.text('NOW()')),
+        sa.UniqueConstraint('operation_id', 'item_key', name='uq_consumption_item_op_key'),
     )
-    op.create_index('uq_consumption_item_op_key', 'consumption_items',
-                    ['operation_id', 'item_key'], unique=True)
     op.create_index('ix_consumption_items_user_op', 'consumption_items',
                     ['user_id', 'operation_id'])
     op.create_index('ix_consumption_items_meal_item', 'consumption_items',
@@ -96,11 +89,9 @@ def upgrade() -> None:
         sa.Column('consumption_item_id', postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.text('NOW()')),
         sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False, server_default=sa.text('NOW()')),
+        sa.UniqueConstraint('meal_item_id', name='uq_bev_meal_item'),
+        sa.UniqueConstraint('measurement_id', name='uq_bev_measurement'),
     )
-    op.create_index('uq_bev_meal_item', 'beverage_measurements',
-                    ['meal_item_id'], unique=True)
-    op.create_index('uq_bev_measurement', 'beverage_measurements',
-                    ['measurement_id'], unique=True)
     op.create_index('ix_bev_user', 'beverage_measurements', ['user_id'])
 
     # ---------------------------------------------------------------------------
@@ -149,6 +140,7 @@ def downgrade() -> None:
     op.drop_column('meal_items', 'source_item_id')
     op.drop_column('meal_items', 'source_operation_id')
 
+    op.drop_index('ix_consumption_ops_user_created', table_name='consumption_operations')
     op.drop_table('beverage_measurements')
     op.drop_table('consumption_items')
     op.drop_table('consumption_operations')

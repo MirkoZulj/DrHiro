@@ -229,37 +229,61 @@ def handler_confirm(redis, db, *, draft_id, user, selections=None,
     calls — so this test exercises the actual wiring, not a re-implementation.
     Returns (result_dict, status_code). status_code 404 means draft gone AND
     no durable operation exists (the old non-idempotent behavior).
+
+    B2: When the Redis draft is missing, the handler now resolves the
+    completed ConsumptionOperation by source identity via
+    find_completed_result_by_identity, so a retry after draft deletion
+    returns the saved result.
     """
     import json
+    from drhiro_api.services.consumption import find_completed_result_by_identity
+
     raw = redis.get(_draft_key(draft_id))
     draft = json.loads(raw) if raw else None
 
-    # Parse items ONCE from the draft (or from the caller path). The real
-    # draft stores structured items; here we reconstruct ParsedItems from the
-    # parser output that was saved at draft time.
-    parsed_items = [ParsedItem(**it) for it in (draft["items"] if draft else [])]
+    if draft:
+        # Parse items ONCE from the draft (or from the caller path). The real
+        # draft stores structured items; here we reconstruct ParsedItems from the
+        # parser output that was saved at draft time.
+        parsed_items = [ParsedItem(**it) for it in draft["items"]]
 
-    # The unified confirm path: confirm_consumption resolves or creates the
-    # operation by (chat_id, message_id, bot_id) BEFORE writing, so even if
-    # the draft is gone the operation identity is durable.
-    result = confirm_consumption(
+        # The unified confirm path: confirm_consumption resolves or creates the
+        # operation by (chat_id, message_id, bot_id) BEFORE writing, so even if
+        # the draft is gone the operation identity is durable.
+        result = confirm_consumption(
+            db=db,
+            user_id=user.id,
+            items=parsed_items,
+            meal_type=draft.get("meal_type"),
+            notes=draft.get("text"),
+            source="telegram",
+            source_chat_id=source_chat_id,
+            source_message_id=source_message_id,
+            source_bot_id=source_bot_id,
+            raw_text=draft.get("text"),
+        )
+
+        # On success, delete the Redis draft (real endpoint does this).
+        if result.get("ok"):
+            redis.delete(_draft_key(draft_id))
+
+        return result, 200
+
+    # B2: Draft is gone. Resolve the completed operation WITHOUT the draft.
+    completed_result = find_completed_result_by_identity(
         db=db,
         user_id=user.id,
-        items=parsed_items,
-        meal_type=draft.get("meal_type") if draft else "snack",
-        notes=draft.get("text") if draft else None,
         source="telegram",
         source_chat_id=source_chat_id,
         source_message_id=source_message_id,
         source_bot_id=source_bot_id,
-        raw_text=draft.get("text") if draft else None,
     )
+    if completed_result is not None:
+        # Durable replay: return the saved result from the prior successful confirm.
+        return completed_result, 200
 
-    # On success, delete the Redis draft (real endpoint does this).
-    if result.get("ok"):
-        redis.delete(_draft_key(draft_id))
-
-    return result, 200
+    # No draft and no completed operation → explicit error (never an empty meal).
+    return {"ok": False, "error": "no_draft_and_no_completed_operation"}, 404
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +453,128 @@ class TestConfirmDurableReplay:
         assert db.query(Measurement).filter(
             Measurement.user_id == user.id, Measurement.metric_type == "water"
         ).count() == 1
+
+
+class TestB2DurableReplayWithoutDraft:
+    """B2: Durable replay WITHOUT requiring the Redis draft.
+
+    Verifies the confirm handler resolves the completed ConsumptionOperation
+    by source identity (not the draft) so a retry after the Redis draft is
+    deleted returns the saved result. Missing draft + no completed op →
+    explicit error, NOT an empty meal.
+    """
+
+    def _parsed_from_text(self, db, food_catalog, text, meal_type="lunch"):
+        """Run the text parser and attach food-catalog nutrients."""
+        parsed = parse_consumption_text(text)
+        out = []
+        for it in parsed:
+            matched_food = None
+            for f in food_catalog.values():
+                if it.display_name.lower() in f.display_name.lower():
+                    matched_food = f
+                    break
+            it_conf = _make_item(
+                it.display_name, grams=it.grams, volume_ml=it.volume_ml,
+                beverage_category=it.beverage_category, is_beverage=it.is_beverage,
+                food=matched_food, db=db,
+            )
+            out.append(it_conf)
+        return out
+
+    def test_response_lost_after_commit_replay_returns_saved_result(self, db, user, food_catalog):
+        """Response lost after commit → retry with deleted draft returns saved result."""
+        redis = FakeRedis()
+        items = self._parsed_from_text(db, food_catalog, "250ml milk")
+        draft_items = [
+            {"display_name": i.display_name, "grams": i.grams, "volume_ml": i.volume_ml,
+             "beverage_category": i.beverage_category, "is_beverage": i.is_beverage}
+            for i in items
+        ]
+        draft_id = handler_create_draft(
+            redis, user_id=user.id, text="250ml milk",
+            meal_type="breakfast", items=draft_items,
+        )
+
+        # First confirm succeeds and deletes the Redis draft.
+        result1, _ = handler_confirm(
+            redis, db, draft_id=draft_id, user=user,
+            source_chat_id="chat1", source_message_id="msg1", source_bot_id="bot1",
+        )
+        assert result1["ok"] is True
+        original_meal_id = result1["data"]["meal_id"]
+        assert redis.get(_draft_key(draft_id)) is None  # draft deleted
+
+        # Simulate response loss: retry the confirm with the same identity.
+        # The draft is gone but the operation is durable by Telegram key.
+        result2, code2 = handler_confirm(
+            redis, db, draft_id=draft_id, user=user,
+            source_chat_id="chat1", source_message_id="msg1", source_bot_id="bot1",
+        )
+        assert code2 == 200
+        assert result2["ok"] is True
+        assert result2["data"]["meal_id"] == original_meal_id
+
+        # No duplicate meal or beverage.
+        assert db.query(Meal).filter(Meal.user_id == user.id).count() == 1
+
+    def test_expired_draft_replay_returns_saved_result(self, db, user, food_catalog):
+        """Expired (deleted) draft but completed op exists → returns saved result."""
+        redis = FakeRedis()
+        items = self._parsed_from_text(db, food_catalog, "200g steak")
+        draft_items = [
+            {"display_name": i.display_name, "grams": i.grams, "volume_ml": i.volume_ml,
+             "beverage_category": i.beverage_category, "is_beverage": i.is_beverage}
+            for i in items
+        ]
+        draft_id = handler_create_draft(
+            redis, user_id=user.id, text="200g steak",
+            meal_type="dinner", items=draft_items,
+        )
+
+        # First confirm succeeds → draft deleted.
+        result1, _ = handler_confirm(
+            redis, db, draft_id=draft_id, user=user,
+            source_chat_id="chat2", source_message_id="msg2", source_bot_id="bot2",
+        )
+        assert result1["ok"] is True
+        original_meal_id = result1["data"]["meal_id"]
+
+        # Expire the draft (simulating TTL expiry).
+        redis.delete(_draft_key(draft_id))
+
+        # Retry: draft is gone, but the completed op is durable.
+        result2, code2 = handler_confirm(
+            redis, db, draft_id=draft_id, user=user,
+            source_chat_id="chat2", source_message_id="msg2", source_bot_id="bot2",
+        )
+        assert code2 == 200
+        assert result2["ok"] is True
+        assert result2["data"]["meal_id"] == original_meal_id
+        # No duplicate meals.
+        assert db.query(Meal).filter(Meal.user_id == user.id).count() == 1
+
+    def test_missing_draft_no_completed_op_returns_explicit_error(self, db, user, food_catalog):
+        """Missing draft + NO completed operation → explicit error, NOT an empty meal."""
+        redis = FakeRedis()
+        # Never create a draft or a completed op; just try to confirm a
+        # non-existent draft.
+        result, code = handler_confirm(
+            redis, db, draft_id="nonexistent-draft", user=user,
+            source_chat_id="chat3", source_message_id="msg3", source_bot_id="bot3",
+        )
+        # Must return 404 with an explicit error.
+        assert code == 404
+        assert result["ok"] is False
+        assert "error" in result
+        # NO meal was created (empty-meal anti-pattern is NOT triggered).
+        assert db.query(Meal).filter(Meal.user_id == user.id).count() == 0
+        # NO measurement was created.
+        assert db.query(Measurement).filter(Measurement.user_id == user.id).count() == 0
+        # NO operation was created.
+        assert db.query(ConsumptionOperation).filter(
+            ConsumptionOperation.user_id == user.id
+        ).count() == 0
 
 
 class TestConfirmIntegrationEdge:

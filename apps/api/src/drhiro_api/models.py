@@ -512,6 +512,8 @@ class ConsumptionOperation(Base, TimestampMixin):
     raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    # Payload hash for detecting conflicting reuse of the same identity key
+    payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class ConsumptionItem(Base, TimestampMixin):

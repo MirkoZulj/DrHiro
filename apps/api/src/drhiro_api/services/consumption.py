@@ -166,6 +166,55 @@ def _compute_source_record_id(operation_id: str, item_key: str) -> str:
     return raw[:255]
 
 
+def _compute_payload_hash(items: list, meal_type: Optional[str] = None) -> str:
+    """Compute a stable hash of the payload for identity comparison.
+
+    The hash covers the items only (not meal_type). Rationale:
+    - The operation identity (telegram chat/msg/bot or idempotency_key) already
+      establishes WHICH event this is.
+    - The payload hash detects "same event, DIFFERENT content" conflicts.
+    - Meal type is contextual metadata (breakfast/lunch/dinner) that does NOT
+      change the drink's identity — the same message can be interpreted as
+      "lunch" by one caller and left unspecified by another, but the drinks
+      are the same. Including it would cause false conflicts between
+      confirm_consumption (which passes meal_type) and log_manual_liquid
+      (which does not).
+
+    Canonicalization for beverages: when volume_ml is set, unit is normalized
+    to "ml" and quantity to 1, because volume_ml is the source of truth for
+    beverage volume. This ensures semantically identical drinks produce the
+    same hash regardless of whether the caller set unit="ml"/quantity=1
+    explicitly or left them as defaults (e.g. _liquid_to_parsed_items vs a
+    hand-built ParsedItem).
+    """
+    def _canonical_unit(it):
+        if it.is_beverage and it.volume_ml is not None:
+            return "ml"
+        return it.unit
+
+    def _canonical_quantity(it):
+        if it.is_beverage and it.volume_ml is not None:
+            return 1
+        return it.quantity
+
+    payload = {
+        "items": [
+            {
+                "display_name": it.display_name,
+                "quantity": _canonical_quantity(it),
+                "unit": _canonical_unit(it),
+                "grams": it.grams,
+                "volume_ml": it.volume_ml,
+                "beverage_category": it.beverage_category,
+                "is_beverage": it.is_beverage,
+            }
+            for it in items
+        ],
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 def _scale_nutrients(per100: dict, factor: float) -> dict:
     """Scale per-100 nutrients by factor (grams/100 or ml/100)."""
     out = {}
@@ -383,10 +432,41 @@ def get_or_create_operation(
     source_bot_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     raw_text: Optional[str] = None,
+    payload_hash: Optional[str] = None,
 ) -> tuple[ConsumptionOperation, bool]:
-    """Get existing operation or create a new one. Returns (operation, created)."""
-    # Try Telegram key
-    if source == "telegram" and source_chat_id and source_message_id:
+    """Get existing operation or create a new one. Returns (operation, created).
+
+    B3: Trusted identity enforcement:
+    - If idempotency_key is provided, it takes precedence (works for any source).
+    - Telegram source without idempotency_key REQUIRES (source_chat_id, source_message_id, source_bot_id).
+      Missing identity → fail closed with an explicit error.
+    - If an existing operation is found but its payload_hash differs from the new
+      payload_hash, reject (conflicting payload reuse).
+    """
+    # --- Fail-closed identity enforcement ---
+    # If idempotency_key is provided, use it (works for any source)
+    if idempotency_key:
+        op = db.query(ConsumptionOperation).filter(
+            ConsumptionOperation.user_id == user_id,
+            ConsumptionOperation.idempotency_key == idempotency_key,
+        ).first()
+        if op:
+            if payload_hash and op.payload_hash and op.payload_hash != payload_hash:
+                raise ValueError(
+                    "conflicting_payload_reuse: same idempotency_key but different payload."
+                )
+            return op, False
+        # No existing op found → create new one with this idempotency_key
+        # (fall through to creation below)
+
+    # Telegram source requires full identity
+    elif source == "telegram":
+        if not (source_chat_id and source_message_id and source_bot_id):
+            raise ValueError(
+                "telegram_source_requires_identity: "
+                "source_chat_id, source_message_id, and source_bot_id are required "
+                "for telegram source to enable retry protection."
+            )
         op = db.query(ConsumptionOperation).filter(
             ConsumptionOperation.user_id == user_id,
             ConsumptionOperation.source_bot_id == source_bot_id,
@@ -394,32 +474,93 @@ def get_or_create_operation(
             ConsumptionOperation.source_message_id == source_message_id,
         ).first()
         if op:
+            if payload_hash and op.payload_hash and op.payload_hash != payload_hash:
+                raise ValueError(
+                    "conflicting_payload_reuse: same Telegram identity but different payload."
+                )
             return op, False
 
-    # Try idempotency key
+    else:
+        # Non-Telegram source without idempotency_key → fail closed
+        raise ValueError(
+            "missing_identity: either telegram source identity or idempotency_key is required."
+        )
+
+    # --- Atomic first creation (B5) ---
+    # Use INSERT ... ON CONFLICT DO NOTHING to handle concurrent first creation
+    # safely. If two callers try to create the same operation simultaneously,
+    # only one INSERT succeeds; the other gets (existing_op, False).
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    # Build the insert values
+    insert_id = uuid.uuid4()
+    insert_values = {
+        "id": insert_id,
+        "user_id": user_id,
+        "source": source,
+        "source_chat_id": source_chat_id,
+        "source_message_id": source_message_id,
+        "source_bot_id": source_bot_id,
+        "idempotency_key": idempotency_key,
+        "raw_text": raw_text,
+        "status": "pending",
+        "result_json": {},
+        "payload_hash": payload_hash,
+    }
+
+    # Determine the unique constraint to conflict on
     if idempotency_key:
+        # Conflict on (user_id, idempotency_key)
+        stmt = pg_insert(ConsumptionOperation).values(insert_values)
+        stmt = stmt.on_conflict_do_nothing(
+            index_elements=["user_id", "idempotency_key"]
+        )
+        db.execute(stmt)
+        db.flush()
+        # Re-select the winner (either our insert or the existing one)
         op = db.query(ConsumptionOperation).filter(
             ConsumptionOperation.user_id == user_id,
             ConsumptionOperation.idempotency_key == idempotency_key,
         ).first()
-        if op:
-            return op, False
+        if op is None:
+            raise RuntimeError("Failed to create or find operation after insert")
+        # Determine if we created it or found an existing one
+        created = op.id == insert_id
+        if not created:
+            # Check payload hash conflict
+            if payload_hash and op.payload_hash and op.payload_hash != payload_hash:
+                raise ValueError(
+                    "conflicting_payload_reuse: same idempotency_key but different payload."
+                )
+        return op, created
 
-    op = ConsumptionOperation(
-        id=str(uuid.uuid4()),
-        user_id=user_id,
-        source=source,
-        source_chat_id=source_chat_id,
-        source_message_id=source_message_id,
-        source_bot_id=source_bot_id,
-        idempotency_key=idempotency_key,
-        raw_text=raw_text,
-        status="pending",
-        result_json={},
-    )
-    db.add(op)
-    db.flush()
-    return op, True
+    elif source == "telegram":
+        # Conflict on (user_id, source_bot_id, source_chat_id, source_message_id)
+        stmt = pg_insert(ConsumptionOperation).values(insert_values)
+        stmt = stmt.on_conflict_do_nothing(
+            index_elements=["user_id", "source_bot_id", "source_chat_id", "source_message_id"]
+        )
+        db.execute(stmt)
+        db.flush()
+        # Re-select the winner
+        op = db.query(ConsumptionOperation).filter(
+            ConsumptionOperation.user_id == user_id,
+            ConsumptionOperation.source_bot_id == source_bot_id,
+            ConsumptionOperation.source_chat_id == source_chat_id,
+            ConsumptionOperation.source_message_id == source_message_id,
+        ).first()
+        if op is None:
+            raise RuntimeError("Failed to create or find operation after insert")
+        created = op.id == insert_id
+        if not created:
+            if payload_hash and op.payload_hash and op.payload_hash != payload_hash:
+                raise ValueError(
+                    "conflicting_payload_reuse: same Telegram identity but different payload."
+                )
+        return op, created
+    else:
+        # This should never be reached due to the identity check above
+        raise RuntimeError("Unreachable: identity check failed")
 
 
 def get_operation_result(db: Session, operation_id: str) -> Optional[dict]:
@@ -427,6 +568,43 @@ def get_operation_result(db: Session, operation_id: str) -> Optional[dict]:
     op = db.query(ConsumptionOperation).filter(
         ConsumptionOperation.id == operation_id,
     ).first()
+    if op and op.status == "completed" and op.result_json:
+        return op.result_json
+    return None
+
+
+def find_completed_result_by_identity(
+    db: Session,
+    user_id: str,
+    source: str = "telegram",
+    source_chat_id: Optional[str] = None,
+    source_message_id: Optional[str] = None,
+    source_bot_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> Optional[dict]:
+    """Look up a COMPLETED operation by source identity and return its saved result.
+
+    B2 (durable replay without Redis draft): when the Redis draft is gone but a
+    completed operation already exists for this source identity, return the
+    persisted result_json so the caller gets the original meal instead of a 404
+    or an empty meal. Returns None if no completed operation exists for the
+    given identity.
+    """
+    if idempotency_key:
+        op = db.query(ConsumptionOperation).filter(
+            ConsumptionOperation.user_id == user_id,
+            ConsumptionOperation.idempotency_key == idempotency_key,
+        ).first()
+    elif source == "telegram" and source_chat_id and source_message_id and source_bot_id:
+        op = db.query(ConsumptionOperation).filter(
+            ConsumptionOperation.user_id == user_id,
+            ConsumptionOperation.source_bot_id == source_bot_id,
+            ConsumptionOperation.source_chat_id == source_chat_id,
+            ConsumptionOperation.source_message_id == source_message_id,
+        ).first()
+    else:
+        return None
+
     if op and op.status == "completed" and op.result_json:
         return op.result_json
     return None
@@ -660,6 +838,10 @@ def confirm_consumption(
     calling this twice for the same source identity returns the SAME result
     (same meal_id) and never creates a second meal or beverage measurement.
     """
+    # Compute payload hash BEFORE calling get_or_create so we can detect
+    # conflicting reuse of the same identity key.
+    payload_hash = _compute_payload_hash(items, meal_type) if items else None
+
     op, created = get_or_create_operation(
         db=db,
         user_id=user_id,
@@ -669,6 +851,7 @@ def confirm_consumption(
         source_bot_id=source_bot_id,
         idempotency_key=idempotency_key,
         raw_text=raw_text,
+        payload_hash=payload_hash,
     )
     # Commit the pending operation row so concurrent callers can see it
     # (the row lock in write_consumption serializes the actual write).
@@ -970,17 +1153,25 @@ def log_manual_liquid(
         )
 
     # --- 2. Source-identity idempotent replay --------------------------------
-    if (source == "telegram" and source_chat_id and source_message_id) or idempotency_key:
-        op, created = get_or_create_operation(
-            db=db,
-            user_id=user_id,
-            source=source,
-            source_chat_id=source_chat_id,
-            source_message_id=source_message_id,
-            source_bot_id=source_bot_id,
-            idempotency_key=idempotency_key,
-            raw_text=notes,
-        )
+    if (source == "telegram" and source_chat_id and source_message_id and source_bot_id) or idempotency_key:
+        # Compute payload hash for identity comparison
+        _payload_items = items if items is not None else _liquid_to_parsed_items(amount_ml, category, display_name)
+        ph = _compute_payload_hash(_payload_items, None)
+        try:
+            op, created = get_or_create_operation(
+                db=db,
+                user_id=user_id,
+                source=source,
+                source_chat_id=source_chat_id,
+                source_message_id=source_message_id,
+                source_bot_id=source_bot_id,
+                idempotency_key=idempotency_key,
+                raw_text=notes,
+                payload_hash=ph,
+            )
+        except ValueError as e:
+            # Fail-closed: identity missing or conflicting payload
+            return {"ok": False, "error": "identity_required", "message": str(e)}
         if not created and op.status == "completed" and op.result_json:
             # Same originating event already logged this drink → replay saved result
             return op.result_json
@@ -996,6 +1187,19 @@ def log_manual_liquid(
             operation_id=str(op.id),
             notes=notes,
         )
+
+    # --- 2b. Telegram source without identity → FAIL CLOSED ------------------
+    # If the caller explicitly signals telegram source but omits the required
+    # identity, reject immediately. Do NOT fall through to ambiguous/clarify.
+    if source == "telegram":
+        return {
+            "ok": False,
+            "error": "identity_required",
+            "message": (
+                "telegram_source_requires_identity: source_chat_id, source_message_id, "
+                "and source_bot_id are required for telegram source to enable retry protection."
+            ),
+        }
 
     # --- 3. Ambiguous intent → CLARIFY ---------------------------------------
     # No source identity, no explicit reference. Without an explicit "new"

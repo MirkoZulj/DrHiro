@@ -38,7 +38,9 @@ The unified consumption domain (`consumption.py`) prevents duplicate drink RECOR
    - The entire meal + beverage write happens in a single DB transaction (`db.commit()` at the end).
    - If any part fails, the whole transaction rolls back — no partial writes.
 
-**Test coverage**: `TestIdempotency::test_concurrent_submit_one_set` — verifies that two concurrent submissions with the same idempotency key produce only one set of meal items and one measurement.
+**Test coverage**:
+- `TestIdempotency::test_concurrent_submit_one_set` — sequential dedup: same key → same op.id, first creates (created=True), second finds (created=False).
+- `TestB5ConcurrentFirstCreation::test_concurrent_first_creation_two_sessions_barrier` — genuine concurrent first creation: two separate DB sessions + `threading.Barrier(2)` on PostgreSQL. Both callers attempt first creation simultaneously → exactly ONE operation, ONE meal, ONE measurement. Both callers receive the SAME meal_id. Stable across repeated runs.
 
 ---
 
@@ -147,6 +149,29 @@ The unified consumption domain (`consumption.py`) prevents duplicate drink RECOR
 **Answer**: No. The dashboard aggregation (`dashboard.py` lines 251–257) sums `totals_json.kcal` from **meals only**. Liquid `Measurement` rows contribute `amount_ml` to the liquid tile but **zero** to calorie totals. The `consumption.py` unified write path ensures that beverage nutrition is included in the meal's `totals_json` (via the meal_item's `nutrients_json`), and the `Measurement` row only stores `amount_ml` + `category` — no calorie data.
 
 **Test coverage**: `TestAggregation::test_aggregation_no_fan_out` — verifies that after logging a meal with milk + beer, the meal totals reflect the sum while liquid measurements contribute only volume.
+
+---
+
+## Manual-Liquid Reconciliation (Three-Intent Model)
+
+**Scenario**: The same drink is referenced by a meal tool call and a manual-liquid log in the same Telegram event. How is double-counting prevented?
+
+**Answer**: Through three distinct code paths in `consumption.log_manual_liquid`:
+
+1. **Same-Event Idempotent Replay**: The manual-liquid log carries the same source identity (`chat_id` + `message_id` + `bot_id`) as the meal confirm. `get_or_create_operation` finds the already-completed operation and returns its saved result — no new row, no double count.
+
+2. **Explicit-Reference Reconciliation**: The agent model sends `existing_item_id` (a reference to an existing measurement or consumption item). `_reconcile_liquid` updates the existing measurement's `amount_ml` in place — no second row.
+
+3. **Genuinely New Drink**: The agent model sends `intent: "new"` with a new source identity. A new consumption is written with volume AND calories. Without `intent: "new"`, ambiguous intent returns a CLARIFY response — nothing is written.
+
+**Test coverage** (in `tests/test_legacy_new_water_coexistence.py`):
+- `test_same_event_meal_plus_liquid_one_consumption` — same source identity → one consumption, one measurement (330ml, not 660ml)
+- `test_retry_returns_saved_result` — retry returns existing meal_id, no new contribution
+- `test_reconcile_existing_item_links_once` — explicit reference updates existing item (250+100=350ml total, not 500)
+- `test_genuinely_new_drink_additional_volume_and_calories` — new message + intent=new → two distinct drinks (250+200=450ml)
+- `test_ambiguous_intent_clarifies` — no identity, no reference, no intent → CLARIFY response, nothing written
+- `test_standalone_caloric_drink_contributes_nutrition` — caloric drink via manual path has real kcal in meal totals
+- `test_same_drink_cannot_yield_two_rows_in_sum` — logging same (operation, item) twice via both paths → one measurement row
 
 ---
 

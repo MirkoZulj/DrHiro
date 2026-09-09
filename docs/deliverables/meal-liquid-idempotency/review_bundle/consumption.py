@@ -889,3 +889,407 @@ def _match_item(items: list[MealItem], frag: str) -> Optional[MealItem]:
                 best = it
                 best_score = score
     return best if best_score >= 0.5 else None
+
+
+# ---------------------------------------------------------------------------
+# Manual liquid logging with reconciliation
+# ---------------------------------------------------------------------------
+#
+# Three distinct intents must NOT be collapsed:
+#
+#   1. SAME-EVENT / IDEMPOTENT REPLAY
+#      The same originating Telegram event already logged this drink (e.g. via
+#      a meal confirm) OR this is a tool-invocation retry. The call carries a
+#      SOURCE IDENTITY (chat_id + message_id + bot_id or idempotency_key).
+#      Resolution: look up the ConsumptionOperation by that identity. If it is
+#      already `completed`, return the SAVED result. No new row.
+#
+#   2. EXPLICIT-REFERENCE RECONCILIATION
+#      The user says "also count that milk as liquid" — an explicit reference
+#      to an EXISTING consumption item (item_id). Resolution: link the new
+#      beverage volume to the EXISTING item/measurement. No second row.
+#
+#   3. GENUINELY NEW DRINK
+#      The user says "another glass of milk" — a new drink in a new event.
+#      Neither source identity nor existing-item reference. Resolution: write
+#      a NEW consumption with volume AND calories (not a bare water row).
+#
+#   4. AMBIGUOUS
+#      Cannot determine existing vs new. Resolution: return a CLARIFY response
+#      — do NOT silently duplicate.
+#
+# Tool names (log_liquid, log_water) must NOT determine consumption identity.
+# Identity is determined by source identity + explicit reference only.
+# ---------------------------------------------------------------------------
+
+
+def log_manual_liquid(
+    db: Session,
+    user_id: str,
+    amount_ml: float,
+    category: str = "water",
+    *,
+    # Source identity (idempotent replay / same-event meal+liquid)
+    source: str = "telegram",
+    source_chat_id: Optional[str] = None,
+    source_message_id: Optional[str] = None,
+    source_bot_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    # Explicit-reference reconciliation (also count that X as liquid)
+    existing_item_id: Optional[str] = None,
+    # Genuinely new drink context
+    display_name: Optional[str] = None,
+    eaten_at: Optional[datetime] = None,
+    notes: Optional[str] = None,
+    # Intent signaling
+    intent: Optional[str] = None,  # "new" for genuinely new drink; None = ambiguous
+    # Pre-enriched items (optional — for caloric drinks with real nutrients)
+    items: Optional[list] = None,
+) -> dict:
+    """Reconciliation-aware manual liquid logging.
+
+    Returns a dict with `ok` plus one of:
+      - `data`: the saved/linked result (same-event, reconciliation, new drink)
+      - `clarify`: True + `message` when intent is ambiguous
+
+    The caller (MCP agent model) signals intent via request shape:
+      - Omit both source identity AND existing_item_id → AMBIGUOUS → CLARIFY
+        (unless `intent="new"` is set).
+      - Provide source identity (chat_id+message_id+bot_id) → SAME-EVENT:
+        replay saved result if already completed.
+      - Provide existing_item_id → RECONCILIATION: link to existing item.
+      - intent="new" (with no source identity / reference) → GENUINELY NEW drink.
+    """
+    now = datetime.now(timezone.utc)
+    eaten_at = eaten_at or now
+
+    # --- 1. Explicit-reference reconciliation --------------------------------
+    if existing_item_id:
+        return _reconcile_liquid(
+            db, user_id, amount_ml, category, existing_item_id, eaten_at
+        )
+
+    # --- 2. Source-identity idempotent replay --------------------------------
+    if (source == "telegram" and source_chat_id and source_message_id) or idempotency_key:
+        op, created = get_or_create_operation(
+            db=db,
+            user_id=user_id,
+            source=source,
+            source_chat_id=source_chat_id,
+            source_message_id=source_message_id,
+            source_bot_id=source_bot_id,
+            idempotency_key=idempotency_key,
+            raw_text=notes,
+        )
+        if not created and op.status == "completed" and op.result_json:
+            # Same originating event already logged this drink → replay saved result
+            return op.result_json
+        # If the operation exists but is not completed (pending), fall through
+        # to write a new consumption under that operation. The row lock in
+        # write_consumption will serialize concurrent writers.
+        built_items = items if items is not None else _liquid_to_parsed_items(amount_ml, category, display_name)
+        return write_consumption(
+            db=db,
+            user_id=user_id,
+            items=built_items,
+            eaten_at=eaten_at,
+            operation_id=str(op.id),
+            notes=notes,
+        )
+
+    # --- 3. Ambiguous intent → CLARIFY ---------------------------------------
+    # No source identity, no explicit reference. Without an explicit "new"
+    # intent, we cannot safely determine whether this is a new drink or a
+    # duplicate of an existing one. Return a CLARIFY response — do NOT
+    # silently duplicate.
+    if intent != "new":
+        return {
+            "ok": False,
+            "clarify": True,
+            "message": (
+                "Should I log this as a new drink, or add it to an existing one? "
+                "Please clarify — e.g. 'another glass' for a new drink, or "
+                "'also count that milk as liquid' to add to an existing one."
+            ),
+        }
+
+    # --- 4. Genuinely new drink (no source identity, no reference) ----------
+    # The caller explicitly signals a new drink. We write a full consumption
+    # with volume AND calories — NOT a bare water row.
+    built_items = items if items is not None else _liquid_to_parsed_items(amount_ml, category, display_name)
+    return _write_new_liquid_consumption(
+        db, user_id, built_items, eaten_at, source, notes
+    )
+
+
+def _reconcile_liquid(
+    db: Session,
+    user_id: str,
+    amount_ml: float,
+    category: str,
+    existing_item_id: str,
+    eaten_at: datetime,
+) -> dict:
+    """Link a manual liquid to an EXISTING consumption item.
+
+    Finds the existing item (by ConsumptionItem.id or BeverageMeasurement.id
+    or Measurement.id) and updates its volume in place. Does NOT insert a
+    second row.
+    """
+    # Try ConsumptionItem.id first
+    ci = db.query(ConsumptionItem).filter(
+        ConsumptionItem.id == existing_item_id,
+        ConsumptionItem.user_id == user_id,
+    ).first()
+
+    if ci and ci.measurement_id:
+        meas = db.query(Measurement).filter(
+            Measurement.id == ci.measurement_id,
+            Measurement.user_id == user_id,
+        ).first()
+        if meas:
+            old_vj = dict(meas.value_json or {})
+            old_ml = old_vj.get("amount_ml") or 0
+            old_vj["amount_ml"] = round(old_ml + amount_ml, 1)
+            meas.value_json = old_vj
+            db.commit()
+            return {
+                "ok": True,
+                "data": {
+                    "reconciled": True,
+                    "measurement_id": str(meas.id),
+                    "total_amount_ml": old_vj["amount_ml"],
+                    "category": old_vj.get("category", category),
+                },
+                "message": f"Added {int(amount_ml)} ml to existing drink (now {int(old_vj['amount_ml'])} ml total).",
+            }
+
+    # Try BeverageMeasurement.id
+    bev = db.query(BeverageMeasurement).filter(
+        BeverageMeasurement.id == existing_item_id,
+        BeverageMeasurement.user_id == user_id,
+    ).first()
+    if bev:
+        meas = db.query(Measurement).filter(
+            Measurement.id == bev.measurement_id,
+            Measurement.user_id == user_id,
+        ).first()
+        if meas:
+            old_vj = dict(meas.value_json or {})
+            old_ml = old_vj.get("amount_ml") or 0
+            old_vj["amount_ml"] = round(old_ml + amount_ml, 1)
+            meas.value_json = old_vj
+            db.commit()
+            return {
+                "ok": True,
+                "data": {
+                    "reconciled": True,
+                    "measurement_id": str(meas.id),
+                    "total_amount_ml": old_vj["amount_ml"],
+                    "category": old_vj.get("category", category),
+                },
+                "message": f"Added {int(amount_ml)} ml to existing drink (now {int(old_vj['amount_ml'])} ml total).",
+            }
+
+    # Try Measurement.id directly
+    meas = db.query(Measurement).filter(
+        Measurement.id == existing_item_id,
+        Measurement.user_id == user_id,
+    ).first()
+    if meas:
+        old_vj = dict(meas.value_json or {})
+        old_ml = old_vj.get("amount_ml") or 0
+        old_vj["amount_ml"] = round(old_ml + amount_ml, 1)
+        meas.value_json = old_vj
+        db.commit()
+        return {
+            "ok": True,
+            "data": {
+                "reconciled": True,
+                "measurement_id": str(meas.id),
+                "total_amount_ml": old_vj["amount_ml"],
+                "category": old_vj.get("category", category),
+            },
+            "message": f"Added {int(amount_ml)} ml to existing drink (now {int(old_vj['amount_ml'])} ml total).",
+        }
+
+    return {"ok": False, "error": "item_not_found", "message": "No existing drink found to reconcile with."}
+
+
+def _liquid_to_parsed_items(
+    amount_ml: float,
+    category: str,
+    display_name: Optional[str] = None,
+) -> list:
+    """Build a ParsedItem list for a standalone liquid."""
+    name = display_name or category or "water"
+    item = ParsedItem(
+        display_name=name,
+        quantity=1,
+        unit="ml" if amount_ml != int(amount_ml) else "ml",
+        grams=amount_ml,
+        volume_ml=amount_ml,
+        beverage_category=category,
+        is_beverage=True,
+    )
+    # Standalone drinks have zero calories unless the caller enriches them.
+    item.nutrients_per_100 = {k: 0 for k in NUTRIENT_KEYS}
+    item.nutrients_scaled = {k: 0 for k in NUTRIENT_KEYS}
+    return [item]
+
+
+def _write_new_liquid_consumption(
+    db: Session,
+    user_id: str,
+    items: list,
+    eaten_at: datetime,
+    source: str = "manual",
+    notes: Optional[str] = None,
+) -> dict:
+    """Write a genuinely new drink consumption with volume AND calories.
+
+    Unlike the legacy /manual/water endpoint (which writes a bare metric_type=water
+    Measurement bypassing the consumption domain), this creates a proper
+    ConsumptionOperation + BeverageMeasurement link so the drink contributes
+    nutrition once and is trackable as a distinct consumption item.
+    """
+    op = ConsumptionOperation(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        source=source,
+        status="pending",
+        result_json={},
+    )
+    db.add(op)
+    db.flush()
+
+    # For a standalone caloric drink, we write a Measurement row directly
+    # (beverage item) under the operation so it contributes nutrition.
+    meal_type = DEFAULT_MEAL_TYPE
+    meal_id = str(uuid.uuid4())
+    meal = Meal(
+        id=meal_id,
+        user_id=user_id,
+        eaten_at=eaten_at,
+        meal_type=meal_type,
+        status="confirmed",
+        input_method="text_manual",
+        notes=notes,
+        totals_json={k: 0.0 for k in NUTRIENT_KEYS},
+        confidence=0.8,
+        confirmed_at=eaten_at,
+        source_operation_id=op.id,
+    )
+    db.add(meal)
+    db.flush()
+
+    item_details = []
+    for idx, item in enumerate(items):
+        item_key = _stable_item_key(str(op.id), idx)
+        source_record_id = _compute_source_record_id(str(op.id), item_key)
+
+        ci = ConsumptionItem(
+            id=str(uuid.uuid4()),
+            operation_id=op.id,
+            user_id=user_id,
+            item_key=item_key,
+            item_kind="beverage",
+            display_name=item.display_name,
+            quantity=item.quantity,
+            unit=item.unit,
+            grams=item.grams,
+            volume_ml=item.volume_ml,
+            nutrients_per_100=item.nutrients_per_100,
+            nutrients_scaled=item.nutrients_scaled,
+            beverage_category=item.beverage_category,
+            meal_type=meal_type,
+            source=source,
+            confidence=item.confidence,
+        )
+        db.add(ci)
+        db.flush()
+
+        meal_item_id = str(uuid.uuid4())
+        mi = MealItem(
+            id=meal_item_id,
+            meal_id=meal_id,
+            display_name=item.display_name,
+            quantity=item.quantity,
+            unit=item.unit,
+            grams=item.grams,
+            nutrients_json=item.nutrients_scaled,
+            source=source,
+            confidence=item.confidence,
+            source_operation_id=op.id,
+            source_item_id=ci.id,
+            volume_ml=item.volume_ml,
+            beverage_category=item.beverage_category,
+        )
+        db.add(mi)
+        db.flush()
+
+        ci.meal_item_id = mi.id
+
+        measurement_id = None
+        if item.is_beverage and item.volume_ml:
+            measurement_id = str(uuid.uuid4())
+            meas = Measurement(
+                id=measurement_id,
+                user_id=user_id,
+                metric_type="water",
+                start_at=eaten_at,
+                end_at=eaten_at,
+                value_json={"amount_ml": item.volume_ml, "category": item.beverage_category or "water"},
+                unit="ml",
+                source_provider="consumption",
+                source_record_id=source_record_id,
+                recording_method="manual",
+                confidence=item.confidence,
+                source_operation_id=op.id,
+                source_item_id=ci.id,
+                meal_item_id=meal_item_id,
+            )
+            db.add(meas)
+            db.flush()
+
+            ci.measurement_id = meas.id
+
+            bev = BeverageMeasurement(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                meal_item_id=meal_item_id,
+                measurement_id=measurement_id,
+                consumption_item_id=ci.id,
+            )
+            db.add(bev)
+
+        item_details.append({
+            "display_name": item.display_name,
+            "grams": item.grams,
+            "volume_ml": item.volume_ml,
+            "beverage_category": item.beverage_category,
+            "source": source,
+            "meal_item_id": meal_item_id,
+            "measurement_id": measurement_id,
+        })
+
+    totals = _sum_nutrients([item.nutrients_scaled for item in items])
+    meal.totals_json = totals
+
+    op.status = "completed"
+    op.updated_at = eaten_at
+    result = {
+        "ok": True,
+        "data": {
+            "meal_id": meal_id,
+            "status": "confirmed",
+            "totals": totals,
+            "items": item_details,
+            "auto_confirmed": True,
+        },
+        "message": "Drink logged.",
+    }
+    op.result_json = result
+
+    db.commit()
+    return result

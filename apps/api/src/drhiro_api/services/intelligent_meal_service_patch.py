@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from typing import Optional
 
 import redis
@@ -46,6 +47,7 @@ from sqlalchemy.orm import sessionmaker, Session
 from drhiro_api.services.consumption import (
     parse_consumption_text,
     confirm_consumption,
+    find_completed_result_by_identity,
     ParsedItem,
 )
 
@@ -212,46 +214,69 @@ async def confirm_meal(
 ):
     """Confirm a draft and write via the unified consumption domain.
 
-    Durable replay: confirm_consumption resolves the ConsumptionOperation by
-    (chat_id, message_id, bot_id) BEFORE writing. On a retry after the Redis
-    draft was deleted, the persisted result_json is returned (no 404, no
-    duplicate meal / beverage).
+    B2 — Durable replay WITHOUT the Redis draft:
+      1. If the Redis draft exists, parse items from it and call
+         confirm_consumption (which resolves the ConsumptionOperation by
+         Telegram source identity BEFORE writing).
+      2. If the Redis draft is gone (expired / deleted after a prior
+         successful confirm), look up a COMPLETED ConsumptionOperation by
+         the caller's Telegram source identity. If found, return its saved
+         result_json (the original meal) — no 404, no duplicate meal.
+      3. If no draft AND no completed operation exist, return an explicit
+         error (NOT an empty meal).
     """
     draft = get_draft(req.draft_id)
-    if not draft:
-        raise HTTPException(status_code=404, detail="Draft not found or expired")
-    if draft["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Not your draft")
 
-    # Rebuild ParsedItems from the draft (parsed ONCE at draft time).
-    items = [ParsedItem(**it) for it in draft["items"]]
+    if draft:
+        if draft["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="Not your draft")
 
-    # Unified write with durable replay + idempotency via Telegram source identity.
-    result = confirm_consumption(
+        # Rebuild ParsedItems from the draft (parsed ONCE at draft time).
+        items = [ParsedItem(**it) for it in draft["items"]]
+
+        # Unified write with durable replay + idempotency via Telegram source identity.
+        result = confirm_consumption(
+            db=db,
+            user_id=user["id"],
+            items=items,
+            meal_type=draft.get("meal_type"),
+            eaten_at=_parse_eaten_at(draft.get("eaten_at")),
+            notes=draft.get("text"),
+            source="telegram",
+            source_chat_id=user.get("telegram_chat_id"),
+            source_message_id=user.get("telegram_message_id"),
+            source_bot_id=user.get("telegram_bot_id"),
+            raw_text=draft.get("text"),
+        )
+
+        # Delete the Redis draft (best-effort; durable replay makes this safe).
+        redis_client.delete(f"intelligent_draft:{req.draft_id}")
+        return result
+
+    # B2: Draft is gone. Resolve the completed operation WITHOUT the draft.
+    completed_result = find_completed_result_by_identity(
         db=db,
         user_id=user["id"],
-        items=items,
-        meal_type=draft.get("meal_type"),
-        eaten_at=_parse_eaten_at(draft.get("eaten_at")),
-        notes=draft.get("text"),
         source="telegram",
         source_chat_id=user.get("telegram_chat_id"),
         source_message_id=user.get("telegram_message_id"),
         source_bot_id=user.get("telegram_bot_id"),
-        raw_text=draft.get("text"),
+    )
+    if completed_result is not None:
+        # Durable replay: return the saved result from the prior successful confirm.
+        return completed_result
+
+    # No draft and no completed operation → explicit error (never an empty meal).
+    raise HTTPException(
+        status_code=404,
+        detail="No draft and no completed operation found for this identity. "
+               "The draft may have expired before confirmation.",
     )
 
-    # Delete the Redis draft (best-effort; durable replay makes this safe).
-    redis_client.delete(f"intelligent_draft:{req.draft_id}")
 
-    return result
-
-
-def _parse_eaten_at(value) -> Optional[object]:
-    """Parse an ISO datetime string, or None."""
+def _parse_eaten_at(value) -> Optional[datetime]:
     if not value:
         return None
-    from datetime import datetime
     try:
         return datetime.fromisoformat(value)
     except Exception:

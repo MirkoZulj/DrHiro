@@ -1,7 +1,10 @@
 -- B. Schema Migration ROLLBACK
 -- Reverses B_schema_migration_up.sql in dependency order.
--- Run this to undo the migration if the cutover fails.
-
+-- Single authority: Alembic migration f1a2b3c4d5e6_consumption_idempotency.py downgrade().
+-- NOTE: Rollback drops the new tables/columns but does NOT erase idempotency history
+-- for completed operations that the application relies on for replay protection —
+-- consumption_operations rows persist until the table is dropped. If the goal is to
+-- preserve operation history while reverting schema, a more surgical downgrade is needed.
 BEGIN;
 
 -- 6. meals
@@ -34,13 +37,10 @@ DROP TABLE IF EXISTS beverage_measurements;
 DROP INDEX IF EXISTS ix_consumption_items_measurement;
 DROP INDEX IF EXISTS ix_consumption_items_meal_item;
 DROP INDEX IF EXISTS ix_consumption_items_user_op;
-DROP INDEX IF EXISTS uq_consumption_item_op_key;
 DROP TABLE IF EXISTS consumption_items;
 
 -- 1. consumption_operations
 DROP INDEX IF EXISTS ix_consumption_ops_user_created;
-DROP INDEX IF EXISTS uq_consumption_op_idempotency;
-DROP INDEX IF EXISTS uq_consumption_op_telegram;
 DROP TABLE IF EXISTS consumption_operations;
 
 COMMIT;

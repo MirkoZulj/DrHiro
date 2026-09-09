@@ -366,9 +366,13 @@ class TestLegacyNewWaterCoexistence:
 
     def test_ambiguous_intent_clarifies(self, db, user):
         """Ambiguous intent (no source identity, no reference, no intent=new)
-        → CLARIFY response, nothing written."""
+        → CLARIFY response, nothing written.
+
+        Uses source="api" (non-telegram) to test the ambiguous path: telegram
+        source without identity is now rejected fail-closed by B3."""
         r = log_manual_liquid(
             db=db, user_id=user.id, amount_ml=250, category="water",
+            source="api",
         )
         assert r["ok"] is False
         assert r.get("clarify") is True
@@ -388,8 +392,12 @@ class TestLegacyNewWaterCoexistence:
             "milk", grams=250, volume_ml=250, beverage_category="non_alcoholic",
             is_beverage=True, food=food_catalog["beer"], db=db,
         )
+        # Genuinely new drink with intent="new" and no source identity.
+        # Uses source="api" (non-telegram) so the ambiguous guard does not apply;
+        # telegram source without identity is rejected fail-closed by B3.
         r = log_manual_liquid(
             db=db, user_id=user.id, amount_ml=250, category="non_alcoholic",
+            source="api",
             intent="new", items=[milk_item],
         )
         assert r["ok"] is True

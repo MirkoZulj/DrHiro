@@ -424,7 +424,12 @@ class TestIdempotency:
         assert result1["data"]["meal_id"] == result2["data"]["meal_id"]
 
     def test_concurrent_submit_one_set(self, db, user, food_catalog):
-        """Two concurrent operations with the same Telegram key produce ONE meal."""
+        """Sequential dedup: same Telegram key returns the same operation.
+
+        With the atomic B5 path (INSERT ... ON CONFLICT DO NOTHING), the first
+        call creates the row (created=True) and the second call finds it
+        (created=False). Both return the same op.id.
+        """
         op1, created1 = get_or_create_operation(
             db, user.id, source="telegram",
             source_chat_id="chat1", source_message_id="msg1", source_bot_id="bot1",
