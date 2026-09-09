@@ -772,34 +772,26 @@ async def handle_mcp(request: Request):
                     except (TypeError, ValueError):
                         amount = None
                 if amount is not None and amount > 0:
+                    # Route through the configured API using the shared auth
+                    # context (TOKEN / API_BASE) — never mint a hard-coded user JWT.
+                    out = await call_api("POST", "/ingest/manual/water", {"amount_ml": amount})
                     try:
-                        import httpx as _hx
-                        # The water endpoint requires a Bearer JWT (not service token).
-                        # Mint a token for the user.
-                        import jwt as _pyjwt
-                        from datetime import datetime, timedelta, timezone as _tz
-                        _secret = os.environ.get("DRHIRO_JWT_SECRET", "")
-                        _uid = os.environ.get("DRHIRO_TELEGRAM_ID", "")
-                        _payload = {
-                            "sub": "0bfad360-9938-4216-8abd-b44d69e2003f", "type": "access",
-                            "exp": datetime.now(_tz.utc) + timedelta(hours=1)
-                        }
-                        _jwt = _pyjwt.encode(_payload, _secret, algorithm="HS256")
-                        _hdrs = {"Authorization": "Bearer " + _jwt}
-                        _api_url = "http://172.20.0.1:8010/api/v1"
-                        _resp = _hx.post(_api_url + "/ingest/manual/water",
-                                         json={"amount_ml": amount}, headers=_hdrs, timeout=15)
-                        ok = _resp.status_code in (200, 201)
-                    except Exception as e:
-                        ok = False
-                        print(f"[log_water] api error: {e}", flush=True)
-                    if ok:
+                        ok = (json.loads(out) or {}).get("ok")
+                    except Exception:
+                        ok = out.startswith("{") and "error" not in out
+                    if not ok:
+                        # Fail closed: surface the backend error, don't fabricate success.
+                        try:
+                            err = (json.loads(out) or {}).get("error")
+                        except Exception:
+                            err = None
+                        text = json.dumps({"ok": False, "error": err or "log_failed",
+                                           "message": "Could not log water right now. Please try again."})
+                        print(f"[log_water] api error: {err}", flush=True)
+                    else:
                         text = json.dumps({"ok": True,
                                            "message": f"Logged {int(amount)} ml of water."})
                         print(f"[log_water] logged {amount} ml", flush=True)
-                    else:
-                        text = json.dumps({"ok": False, "error": "log_failed",
-                                           "message": "Could not log water right now. Please try again."})
                 else:
                     text = json.dumps({"ok": False, "error": "need_amount",
                                        "message": "How much water? Tell me the amount in ml or glasses."})
@@ -886,31 +878,31 @@ async def handle_mcp(request: Request):
                     except (TypeError, ValueError):
                         amount = None
                 if amount is not None and amount > 0:
+                    # Route through the configured API using the shared auth
+                    # context (TOKEN / API_BASE) — never mint a hard-coded user JWT.
+                    # The /ingest/manual/water endpoint accepts a category field and
+                    # writes a Measurement row with the liquid category. This is the
+                    # SAME backend path the meal confirm uses for linked beverages,
+                    # so a manual log_liquid for a drink that was also in a meal
+                    # resolves to the same consumption item identity (no double count).
+                    out = await call_api("POST", "/ingest/manual/water",
+                                        {"amount_ml": amount, "category": category})
                     try:
-                        import httpx as _hx
-                        import jwt as _pyjwt
-                        from datetime import datetime, timedelta, timezone as _tz
-                        _secret = os.environ.get("DRHIRO_JWT_SECRET", "")
-                        _payload = {
-                            "sub": "0bfad360-9938-4216-8abd-b44d69e2003f", "type": "access",
-                            "exp": datetime.now(_tz.utc) + timedelta(hours=1)
-                        }
-                        _jwt = _pyjwt.encode(_payload, _secret, algorithm="HS256")
-                        _hdrs = {"Authorization": "Bearer " + _jwt}
-                        _api_url = "http://172.20.0.1:8010/api/v1"
-                        _resp = _hx.post(_api_url + "/ingest/manual/water",
-                                         json={"amount_ml": amount, "category": category}, headers=_hdrs, timeout=15)
-                        ok = _resp.status_code in (200, 201)
-                    except Exception as e:
-                        ok = False
-                        print(f"[log_liquid] api error: {e}", flush=True)
-                    if ok:
+                        ok = (json.loads(out) or {}).get("ok")
+                    except Exception:
+                        ok = out.startswith("{") and "error" not in out
+                    if not ok:
+                        try:
+                            err = (json.loads(out) or {}).get("error")
+                        except Exception:
+                            err = None
+                        text = json.dumps({"ok": False, "error": err or "log_failed",
+                                           "message": "Could not log that right now. Please try again."})
+                        print(f"[log_liquid] api error: {err}", flush=True)
+                    else:
                         text = json.dumps({"ok": True,
                                            "message": f"Logged {int(amount)} ml of {category}."})
                         print(f"[log_liquid] logged {amount} ml cat={category}", flush=True)
-                    else:
-                        text = json.dumps({"ok": False, "error": "log_failed",
-                                           "message": "Could not log that right now. Please try again."})
                 else:
                     text = json.dumps({"ok": False, "error": "need_amount",
                                        "message": "How much did you drink? Tell me the amount in ml or glasses."})
@@ -971,30 +963,26 @@ async def handle_mcp(request: Request):
                     text = json.dumps({"ok": False, "error": "need_title_and_kcal",
                                        "message": "I need the activity name and calories burned. e.g. 'Log 30 min gardening, 150 kcal'"})
                 else:
+                    body = {"title": title, "calories_burned": kcal}
+                    if desc: body["description"] = desc
+                    if date: body["activity_date"] = date
+                    out = await call_api("POST", "/activities", body)
                     try:
-                        body = {"title": title, "calories_burned": kcal}
-                        if desc: body["description"] = desc
-                        if date: body["activity_date"] = date
-                        import httpx as _hx
-                        import jwt as _pyjwt
-                        from datetime import datetime as _dt, timedelta as _td, timezone as _tzz
-                        _secret = os.environ.get('DRHIRO_JWT_SECRET', '')
-                        _payload = {'sub': '0bfad360-9938-4216-8abd-b44d69e2003f', 'type': 'access', 'exp': _dt.now(_tzz.utc) + _td(hours=1)}
-                        _jwt = _pyjwt.encode(_payload, _secret, algorithm='HS256')
-                        _api = "http://172.20.0.1:8010/api/v1"
-                        _resp = _hx.post(_api + "/activities", json=body,
-                                         headers={"Authorization": "Bearer " + _jwt}, timeout=15)
-                        ok = _resp.status_code in (200, 201)
-                    except Exception as e:
-                        ok = False
-                        print(f"[log_activity] api error: {e}", flush=True)
-                    if ok:
+                        ok = (json.loads(out) or {}).get("ok")
+                    except Exception:
+                        ok = out.startswith("{") and "error" not in out
+                    if not ok:
+                        try:
+                            err = (json.loads(out) or {}).get("error")
+                        except Exception:
+                            err = None
+                        text = json.dumps({"ok": False, "error": err or "log_failed",
+                                           "message": "Could not log the activity right now."})
+                        print(f"[log_activity] api error: {err}", flush=True)
+                    else:
                         text = json.dumps({"ok": True,
                                            "message": f"Logged {title}: {int(kcal)} kcal burned."})
                         print(f"[log_activity] logged {title} {kcal} kcal", flush=True)
-                    else:
-                        text = json.dumps({"ok": False, "error": "log_failed",
-                                           "message": "Could not log the activity right now."})
 
             elif tool_name == "learn_food":
                 args = _unwrap_schema_echo(args)
@@ -1228,80 +1216,67 @@ async def handle_mcp(request: Request):
                         pass
                 text = text_out
             elif tool_name == "list_activities":
+                _d = _as_text(args.get("date")) or ""
+                path = "/activities" + (f"?date={_d}" if _d else "")
+                out = await call_api("GET", path)
                 try:
-                    import httpx as _hx
-                    import jwt as _pyjwt
-                    from datetime import datetime, timedelta, timezone as _tz
-                    _secret = os.environ.get("DRHIRO_JWT_SECRET", "")
-                    _payload = {
-                        "sub": "0bfad360-9938-4216-8abd-b44d69e2003f", "type": "access",
-                        "exp": datetime.now(_tz.utc) + timedelta(hours=1)
-                    }
-                    _jwt = _pyjwt.encode(_payload, _secret, algorithm="HS256")
-                    _hdrs = {"Authorization": "Bearer " + _jwt}
-                    _api = "http://172.20.0.1:8010/api/v1"
-                    _d = _as_text(args.get("date")) or ""
-                    _url = _api + "/activities" + (f"?date={_d}" if _d else "")
-                    _resp = await _hx.AsyncClient(timeout=15).get(_url, headers=_hdrs)
-                    if _resp.status_code == 200:
-                        text = _resp.text
-                    else:
-                        text = json.dumps({"ok": False, "error": "list_failed", "message": f"Could not list activities (HTTP {_resp.status_code})."})
-                except Exception as e:
-                    print(f"[list_activities] error: {e}", flush=True)
+                    parsed = json.loads(out)
+                    ok = isinstance(parsed, (list, dict)) and "error" not in (parsed if isinstance(parsed, dict) else {})
+                except Exception:
+                    ok = False
+                if ok:
+                    text = out
+                else:
                     text = json.dumps({"ok": False, "error": "list_failed", "message": "Could not list activities right now."})
             elif tool_name == "update_activity":
                 _aid = _as_text(args.get("activity_id")) or _deep_str(args.get("activity_id"))
                 if not _aid:
                     text = json.dumps({"ok": False, "error": "missing_activity_id", "message": "Pass activity_id."})
                 else:
+                    _body = {}
+                    for _k in ("title", "description", "calories_burned", "activity_date"):
+                        _v = args.get(_k)
+                        if _v is None or (isinstance(_v, dict) and (not _v or set(_v.keys()) == {"__type"})):
+                            continue
+                        if isinstance(_v, dict):
+                            _v = _deep_str(_v) or _as_text(_v)
+                        if _k == "description" or (_v != ""):
+                            _body[_k] = _v
+                    out = await call_api("PATCH", f"/data-points/activity/{_aid}", _body)
                     try:
-                        import httpx as _hx
-                        import jwt as _pyjwt
-                        from datetime import datetime, timedelta, timezone as _tz
-                        _secret = os.environ.get("DRHIRO_JWT_SECRET", "")
-                        _payload = {"sub": "0bfad360-9938-4216-8abd-b44d69e2003f", "type": "access", "exp": datetime.now(_tz.utc) + timedelta(hours=1)}
-                        _jwt = _pyjwt.encode(_payload, _secret, algorithm="HS256")
-                        _hdrs = {"Authorization": "Bearer " + _jwt, "Content-Type": "application/json"}
-                        _api = "http://172.20.0.1:8010/api/v1"
-                        _body = {}
-                        for _k in ("title", "description", "calories_burned", "activity_date"):
-                            _v = args.get(_k)
-                            if _v is None or (isinstance(_v, dict) and (not _v or set(_v.keys()) == {"__type"})):
-                                continue
-                            if isinstance(_v, dict):
-                                _v = _deep_str(_v) or _as_text(_v)
-                            if _k == "description" or (_v != ""):
-                                _body[_k] = _v
-                        _resp = await _hx.AsyncClient(timeout=15).patch(_api + f"/data-points/activity/{_aid}", json=_body, headers=_hdrs)
-                        text = _resp.text if _resp.status_code in (200, 201) else json.dumps({"ok": False, "error": "update_failed", "message": f"Could not update activity (HTTP {_resp.status_code})."})
-                    except Exception as e:
-                        print(f"[update_activity] error: {e}", flush=True)
-                        text = json.dumps({"ok": False, "error": "update_failed", "message": "Could not update activity right now."})
+                        ok = (json.loads(out) or {}).get("ok")
+                    except Exception:
+                        ok = out.startswith("{") and "error" not in out
+                    if not ok:
+                        try:
+                            err = (json.loads(out) or {}).get("error")
+                        except Exception:
+                            err = None
+                        text = json.dumps({"ok": False, "error": err or "update_failed",
+                                           "message": "Could not update activity right now."})
+                        print(f"[update_activity] api error: {err}", flush=True)
+                    else:
+                        text = out
             elif tool_name == "list_data_points":
+                from datetime import datetime as _dtdt, timezone as _tz
+                _q = []
+                _mt = _as_text(args.get("metric_type")) or ""
+                if _mt:
+                    _q.append("metric_type=" + quote(_mt))
+                _d = _as_text(args.get("date")) or ""
+                if _d:
+                    _q.append("from=" + _dtdt.fromisoformat(_d).replace(tzinfo=_tz.utc).isoformat())
+                    _q.append("to=" + (_dtdt.fromisoformat(_d).replace(hour=23, minute=59, second=59)).replace(tzinfo=_tz.utc).isoformat())
+                path = "/data-points" + (("?" + "&".join(_q)) if _q else "")
+                out = await call_api("GET", path)
                 try:
-                    import httpx as _hx
-                    import jwt as _pyjwt
-                    from datetime import datetime, timedelta, timezone as _tz
-                    _secret = os.environ.get("DRHIRO_JWT_SECRET", "")
-                    _payload = {"sub": "0bfad360-9938-4216-8abd-b44d69e2003f", "type": "access", "exp": datetime.now(_tz.utc) + timedelta(hours=1)}
-                    _jwt = _pyjwt.encode(_payload, _secret, algorithm="HS256")
-                    _hdrs = {"Authorization": "Bearer " + _jwt}
-                    _api = "http://172.20.0.1:8010/api/v1"
-                    _q = []
-                    _mt = _as_text(args.get("metric_type")) or ""
-                    if _mt:
-                        _q.append("metric_type=" + quote(_mt))
-                    _d = _as_text(args.get("date")) or ""
-                    if _d:
-                        from datetime import datetime as _dtdt
-                        _q.append("from=" + _dtdt.fromisoformat(_d).replace(tzinfo=_tz.utc).isoformat())
-                        _q.append("to=" + (_dtdt.fromisoformat(_d).replace(hour=23, minute=59, second=59)).replace(tzinfo=_tz.utc).isoformat())
-                    _url = _api + "/data-points" + (("?" + "&".join(_q)) if _q else "")
-                    _resp = await _hx.AsyncClient(timeout=15).get(_url, headers=_hdrs)
-                    text = _resp.text if _resp.status_code == 200 else json.dumps({"ok": False, "error": "list_failed", "message": f"Could not list data points (HTTP {_resp.status_code})."})
-                except Exception as e:
-                    print(f"[list_data_points] error: {e}", flush=True)
+                    parsed = json.loads(out)
+                    ok = isinstance(parsed, (list, dict)) and "error" not in (parsed if isinstance(parsed, dict) else {})
+                except Exception:
+                    ok = False
+                if ok:
+                    text = out
+                else:
                     text = json.dumps({"ok": False, "error": "list_failed", "message": "Could not list data points right now."})
             elif tool_name == "update_data_point":
                 args = _unwrap_schema_echo(args)
@@ -1367,76 +1342,71 @@ async def handle_mcp(request: Request):
                 elif not _pid:
                     text = json.dumps({"ok": False, "error": "missing_id", "message": "Pass id, or item+grams for a meal weight edit."})
                 else:
+                    _body = {}
+                    _val = args.get("value")
+                    if isinstance(_val, dict) and not (set(_val.keys()) == {"__type"} or _val.get("__type") is not None and set(_val.keys()) == {"__type"}):
+                        _body["value"] = _val
+                    elif _val not in (None, {}, "", {"__type": None}):
+                        _body["value"] = {"value": _val}
+                    if args.get("unit") not in (None, "", {"__type": None}):
+                        _body["unit"] = _as_text(args.get("unit"))
+                    if args.get("measured_at"):
+                        _body["measured_at"] = _as_text(args.get("measured_at"))
+                    out = await call_api("PATCH", f"/data-points/{_pid}", _body)
                     try:
-                        import httpx as _hx
-                        import jwt as _pyjwt
-                        from datetime import datetime, timedelta, timezone as _tz
-                        _secret = os.environ.get("DRHIRO_JWT_SECRET", "")
-                        _payload = {"sub": "0bfad360-9938-4216-8abd-b44d69e2003f", "type": "access", "exp": datetime.now(_tz.utc) + timedelta(hours=1)}
-                        _jwt = _pyjwt.encode(_payload, _secret, algorithm="HS256")
-                        _hdrs = {"Authorization": "Bearer " + _jwt, "Content-Type": "application/json"}
-                        _api = "http://172.20.0.1:8010/api/v1"
-                        _body = {}
-                        _val = args.get("value")
-                        if isinstance(_val, dict) and not (set(_val.keys()) == {"__type"} or _val.get("__type") is not None and set(_val.keys()) == {"__type"}):
-                            _body["value"] = _val
-                        elif _val not in (None, {}, "", {"__type": None}):
-                            _body["value"] = {"value": _val}
-                        if args.get("unit") not in (None, "", {"__type": None}):
-                            _body["unit"] = _as_text(args.get("unit"))
-                        if args.get("measured_at"):
-                            _body["measured_at"] = _as_text(args.get("measured_at"))
-                        _resp = await _hx.AsyncClient(timeout=15).patch(_api + f"/data-points/{_pid}", json=_body, headers=_hdrs)
-                        text = _resp.text if _resp.status_code in (200, 201) else json.dumps({"ok": False, "error": "update_failed", "message": f"Could not update data point (HTTP {_resp.status_code})."})
-                    except Exception as e:
-                        print(f"[update_data_point] error: {e}", flush=True)
-                        text = json.dumps({"ok": False, "error": "update_failed", "message": "Could not update data point right now."})
+                        ok = (json.loads(out) or {}).get("ok")
+                    except Exception:
+                        ok = out.startswith("{") and "error" not in out
+                    if not ok:
+                        try:
+                            err = (json.loads(out) or {}).get("error")
+                        except Exception:
+                            err = None
+                        text = json.dumps({"ok": False, "error": err or "update_failed",
+                                           "message": "Could not update data point right now."})
+                        print(f"[update_data_point] api error: {err}", flush=True)
+                    else:
+                        text = out
             elif tool_name == "delete_data_point":
                 _pid = _as_text(args.get("id")) or _deep_str(args.get("id"))
                 if not _pid:
                     text = json.dumps({"ok": False, "error": "missing_id", "message": "Pass id."})
                 else:
+                    out = await call_api("DELETE", f"/data-points/{_pid}")
                     try:
-                        import httpx as _hx
-                        import jwt as _pyjwt
-                        from datetime import datetime, timedelta, timezone as _tz
-                        _secret = os.environ.get("DRHIRO_JWT_SECRET", "")
-                        _payload = {"sub": "0bfad360-9938-4216-8abd-b44d69e2003f", "type": "access", "exp": datetime.now(_tz.utc) + timedelta(hours=1)}
-                        _jwt = _pyjwt.encode(_payload, _secret, algorithm="HS256")
-                        _hdrs = {"Authorization": "Bearer " + _jwt}
-                        _api = "http://172.20.0.1:8010/api/v1"
-                        _resp = await _hx.AsyncClient(timeout=15).delete(_api + f"/data-points/{_pid}", headers=_hdrs)
-                        text = _resp.text if _resp.status_code in (200, 204) else json.dumps({"ok": False, "error": "delete_failed", "message": f"Could not delete data point (HTTP {_resp.status_code})."})
-                    except Exception as e:
-                        print(f"[delete_data_point] error: {e}", flush=True)
-                        text = json.dumps({"ok": False, "error": "delete_failed", "message": "Could not delete data point right now."})
+                        ok = (json.loads(out) or {}).get("ok")
+                    except Exception:
+                        ok = "error" not in out
+                    if not ok:
+                        try:
+                            err = (json.loads(out) or {}).get("error")
+                        except Exception:
+                            err = None
+                        text = json.dumps({"ok": False, "error": err or "delete_failed",
+                                           "message": "Could not delete data point right now."})
+                    else:
+                        text = out
             elif tool_name == "delete_activity":
                 aid = _as_text(args.get("activity_id")) or _deep_str(args.get("activity_id"))
                 if not aid:
                     text = json.dumps({"error": "missing_activity_id", "message": "Pass activity_id to delete."})
                 else:
+                    out = await call_api("DELETE", f"/activities/{aid}")
                     try:
-                        import httpx as _hx
-                        import jwt as _pyjwt
-                        from datetime import datetime, timedelta, timezone as _tz
-                        _secret = os.environ.get("DRHIRO_JWT_SECRET", "")
-                        _payload = {
-                            "sub": "0bfad360-9938-4216-8abd-b44d69e2003f", "type": "access",
-                            "exp": datetime.now(_tz.utc) + timedelta(hours=1)
-                        }
-                        _jwt = _pyjwt.encode(_payload, _secret, algorithm="HS256")
-                        _hdrs = {"Authorization": "Bearer " + _jwt}
-                        _api = "http://172.20.0.1:8010/api/v1"
-                        _resp = await _hx.AsyncClient(timeout=15).delete(_api + f"/activities/{aid}", headers=_hdrs)
-                        if _resp.status_code in (200, 204):
-                            text = json.dumps({"ok": True, "message": "Activity deleted."})
-                        elif _resp.status_code == 404:
+                        parsed = json.loads(out)
+                        ok = parsed.get("ok")
+                        if ok:
+                            text = out
+                        elif parsed.get("error") == "not_found":
                             text = json.dumps({"ok": False, "error": "not_found", "message": "Activity not found or already deleted."})
                         else:
-                            text = json.dumps({"ok": False, "error": "delete_failed", "message": f"Could not delete the activity (HTTP {_resp.status_code})."})
-                    except Exception as e:
-                        print(f"[delete_activity] error: {e}", flush=True)
-                        text = json.dumps({"ok": False, "error": "delete_failed", "message": "Could not delete the activity right now."})
+                            err = parsed.get("error")
+                            text = json.dumps({"ok": False, "error": err or "delete_failed",
+                                               "message": "Could not delete the activity right now."})
+                            print(f"[delete_activity] api error: {err}", flush=True)
+                    except Exception:
+                        text = json.dumps({"ok": False, "error": "delete_failed",
+                                           "message": "Could not delete the activity right now."})
             elif tool_name == "delete_meal":
                 frag = _as_text(args.get("fragment"))
                 match_all = bool(args.get("match_all"))

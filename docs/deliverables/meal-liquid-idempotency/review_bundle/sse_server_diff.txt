@@ -1,0 +1,82 @@
+diff --git a/packages/drhiro-mcp/src/drhiro_mcp/sse_server.py b/packages/drhiro-mcp/src/drhiro_mcp/sse_server.py
+index 9ab12b5..47bb8e4 100644
+--- a/packages/drhiro-mcp/src/drhiro_mcp/sse_server.py
++++ b/packages/drhiro-mcp/src/drhiro_mcp/sse_server.py
+@@ -1633,69 +1633,14 @@ async def handle_mcp(request: Request):
+                                 summary += f" Several options existed for: {', '.join(amb)}. Say which to change if a match is wrong."
+                             text = json.dumps({"ok": True, "summary": summary})
+                             print(f"[log_meal_intelligent] confirmed: {summary[:120]}", flush=True)
+-                            # --- liquid auto-detection: if the user's text contains
+-                            # drink keywords (coffee, tea, juice, milk, soda, etc.),
+-                            # also log the liquid volume so daily water/liquid totals
+-                            # stay accurate alongside the calorie count.
+-                            try:
+-                                import httpx as _hx
+-                                import jwt as _pyjwt
+-                                from datetime import datetime, timedelta, timezone as _tz
+-                                _secret = os.environ.get("DRHIRO_JWT_SECRET", "")
+-                                _payload = {
+-                                    "sub": "<REDACTED_USER_UUID>", "type": "access",
+-                                    "exp": datetime.now(_tz.utc) + timedelta(hours=1)
+-                                }
+-                                _jwt = _pyjwt.encode(_payload, _secret, algorithm="HS256")
+-                                _hdrs = {"Authorization": "Bearer " + _jwt}
+-                                _api_url = "http://<REDACTED_INTERNAL_IP>:8010/api/v1"
+-                                _drink_cats = [
+-                                    ("spirits", r"whiskey|whisky|viski|vodka|votka|rum|gin|brandy|rakija|konjak|tequila"),
+-                                    ("wine", r"wine|vino|rose|prosecco|champagne|\u0161ampanjac"),
+-                                    ("beer", r"beer|pivo|lager|ale|stout|heineken|ozujsko|karlova"),
+-                                    ("other_alcohol", r"cocktail|koktel|cider|liqueur|liker|aperol|martini|mojito"),
+-                                    ("non_alcoholic", r"coffee|kava|tea|\u010daj|juice|sok|soda|cola|coke|milk|energy|redbull|fanta|sprite|espresso|latte|cappuccino|mocha|americano"),
+-                                ]
+-                                _text_lower = text.lower()
+-                                _category = None
+-                                for _c, _pat in _drink_cats:
+-                                    if re.search(_pat, _text_lower, re.I):
+-                                        _category = _c
+-                                        break
+-                                if _category:
+-                                    # Extract amount: "250ml", "1 glass", "2 cups", "330 ml"
+-                                    _amount = None
+-                                    _m = re.search(r'(\d+(?:[.,]\d+)?)\s*(ml|milliliter|millilitre|liter|litre|l|cup|cups|glass|glasses|espresso|shot|shots)', _text_lower)
+-                                    if _m:
+-                                        _val = float(_m.group(1).replace(',', '.'))
+-                                        _unit = _m.group(2).lower()
+-                                        if _unit in ('l', 'liter', 'litre'):
+-                                            _amount = _val * 1000
+-                                        elif _unit in ('cup', 'cups'):
+-                                            _amount = _val * 250
+-                                        elif _unit in ('glass', 'glasses'):
+-                                            _amount = _val * 200
+-                                        elif _unit in ('espresso', 'shot', 'shots'):
+-                                            _amount = _val * 30  # ~30ml per espresso shot
+-                                        else:
+-                                            _amount = _val
+-                                    if _amount and _amount > 0:
+-                                        try:
+-                                            _resp = _hx.post(_api_url + "/ingest/manual/water",
+-                                                             json={"amount_ml": _amount, "category": _category},
+-                                                             headers=_hdrs, timeout=15)
+-                                            if _resp.status_code in (200, 201):
+-                                                print(f"[log_meal_intelligent] liquid auto-logged: {_amount:.0f}ml {_category}", flush=True)
+-                                                # Append liquid info to the summary so the bot mentions it
+-                                                _summary_obj = json.loads(text)
+-                                                _summary_obj["liquid_logged"] = f"{_amount:.0f}ml {_category}"
+-                                                text = json.dumps(_summary_obj)
+-                                            else:
+-                                                print(f"[log_meal_intelligent] liquid auto-log failed: {_resp.status_code}", flush=True)
+-                                        except Exception as _e:
+-                                            print(f"[log_meal_intelligent] liquid auto-log error: {_e}", flush=True)
+-                            except Exception as _e:
+-                                print(f"[log_meal_intelligent] liquid detection error: {_e}", flush=True)
++                            # LIQUID AUTO-LOG BLOCK REMOVED (MCP cutover):
++                            # The old side-effect that minted a hard-coded JWT for user
++                            # <REDACTED_USER_UUID> and POSTed to
++                            # /ingest/manual/water with a whole-message regex scan has been
++                            # removed. The new unified backend writer (consumption.py) is
++                            # now the SINGLE authoritative path for both meal items and
++                            # linked beverages. This prevents the two writers from both
++                            # recording the same drink.
+                     else:
+                         text = text_out
+                 except Exception as e:
