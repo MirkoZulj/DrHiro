@@ -82,7 +82,13 @@
 **Change**: Entry-point coverage matrix for every meal/liquid creation + mutation path.
 
 ### 6. `packages/drhiro-mcp/src/drhiro_mcp/sse_server.py`
-**Change**: **MCP CUTOVER** — removed the liquid auto-log side-effect block (lines 1636–1698).
+**Change**: Added `DRHIRO_LIQUID_WRITER` flag + re-introduced controllable liquid auto-log block.
+
+- `DRHIRO_LIQUID_WRITER=legacy` (default) — old MCP side effect ACTIVE (pre-cutover behavior)
+- `DRHIRO_LIQUID_WRITER=unified` — old MCP side effect SKIPPED; backend is authoritative (post-cutover)
+- Any other value → `ValueError` at module load (fail-closed)
+
+Helper functions: `get_liquid_writer_mode()`, `is_unified_writer()`.
 
 ### 11. `apps/api/src/drhiro_api/routers/meals.py` (B4 wiring)
 **Change**: Four previously-bypassing paths now route through shared domain:

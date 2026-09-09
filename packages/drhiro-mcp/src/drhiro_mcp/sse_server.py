@@ -20,6 +20,29 @@ TOKEN = os.environ.get("DRHIRO_MCP_TOKEN", "")
 SERVICE_TOKEN = os.environ.get("DRHIRO_SERVICE_TOKEN", "")
 TELEGRAM_ID = os.environ.get("DRHIRO_TELEGRAM_ID", "")
 REDIS_URL = os.environ.get("REDIS_URL", "")
+_LIQUID_WRITER_MODE = os.environ.get("DRHIRO_LIQUID_WRITER", "legacy")
+
+
+def get_liquid_writer_mode() -> str:
+    """Return the active liquid-writer mode.
+
+    Fail-closed: any value other than 'legacy' or 'unified' raises at call sites
+    that depend on it. Defaults to 'legacy' (old side effect active) so that a
+    missing env var does NOT silently enable the new writer.
+    """
+    mode = _LIQUID_WRITER_MODE.strip().lower()
+    if mode not in ("legacy", "unified"):
+        raise ValueError(
+            f"Invalid DRHIRO_LIQUID_WRITER={_LIQUID_WRITER_MODE!r}: "
+            f"must be 'legacy' or 'unified'"
+        )
+    return mode
+
+
+def is_unified_writer() -> bool:
+    """True only when DRHIRO_LIQUID_WRITER is explicitly set to 'unified'."""
+    return get_liquid_writer_mode() == "unified"
+
 
 def _headers(path=""):
     h = {"Content-Type": "application/json"}
@@ -1603,14 +1626,70 @@ async def handle_mcp(request: Request):
                                 summary += f" Several options existed for: {', '.join(amb)}. Say which to change if a match is wrong."
                             text = json.dumps({"ok": True, "summary": summary})
                             print(f"[log_meal_intelligent] confirmed: {summary[:120]}", flush=True)
-                            # LIQUID AUTO-LOG BLOCK REMOVED (MCP cutover):
-                            # The old side-effect that minted a hard-coded JWT for user
-                            # 0bfad360-9938-4216-8abd-b44d69e2003f and POSTed to
-                            # /ingest/manual/water with a whole-message regex scan has been
-                            # removed. The new unified backend writer (consumption.py) is
-                            # now the SINGLE authoritative path for both meal items and
-                            # linked beverages. This prevents the two writers from both
-                            # recording the same drink.
+                            # CONTROLLABLE LIQUID AUTO-LOG (gated by DRHIRO_LIQUID_WRITER):
+                            # • unified mode → SKIP: the unified backend writer
+                            #   (consumption.py) already handled beverages atomically
+                            #   as part of the meal confirm. Running the MCP side-effect
+                            #   would double-count the drink.
+                            # • legacy mode → RUN: preserve the old behavior where the
+                            #   MCP scans the user's text for a drink and logs volume.
+                            #   This is the pre-cutover state; the unified writer may
+                            #   also be writing (dual-write interval during cutover),
+                            #   so the runbook must ensure only one writer is active.
+                            # Fail-closed: any other flag value raises ValueError at
+                            # module load (see get_liquid_writer_mode).
+                            if not is_unified_writer():
+                                try:
+                                    _drink_cats = [
+                                        ("spirits", r"whiskey|whisky|viski|vodka|votka|rum|gin|brandy|rakija|šljivovica|sljivovica|konjak|cognac|tequila|loza|travarica"),
+                                        ("wine", r"wine|vino|rose|rosé|prosecco|šampanjac|sampanjac|champagne|crno|bijelo|bjelo"),
+                                        ("beer", r"beer|pivo|lager|ale|stout|heineken|ozujsko|karlovačko|karlovacko|točeno|toceno|radler"),
+                                        ("other_alcohol", r"cocktail|koktel|cider|jabolčnik|jabolcnik|liqueur|liker|aperol|martini|baileys|amaretto|mojito|negroni|spritz"),
+                                        ("non_alcoholic", r"coffee|kava|cappuccino|latte|tea|čaj|caj|ice\s*tea|juice|sok|soda|cola|coke|coca|fanta|sprite|smoothie|shake|milk|mlijeko|mliko|energy|redbull|monster|cedevita|limunada|nectar|espresso|americano|mocha"),
+                                    ]
+                                    _text_lower = text.lower()
+                                    _category = None
+                                    for _c, _pat in _drink_cats:
+                                        if re.search(_pat, _text_lower, re.I):
+                                            _category = _c
+                                            break
+                                    if _category:
+                                        _amount = None
+                                        _m = re.search(r'(\d+(?:[.,]\d+)?)\s*(ml|milliliter|millilitre|liter|litre|l|cup|cups|glass|glasses|espresso|shot|shots)', _text_lower)
+                                        if _m:
+                                            _val = float(_m.group(1).replace(',', '.'))
+                                            _unit = _m.group(2).lower()
+                                            if _unit in ('l', 'liter', 'litre'):
+                                                _amount = _val * 1000
+                                            elif _unit in ('cup', 'cups'):
+                                                _amount = _val * 250
+                                            elif _unit in ('glass', 'glasses'):
+                                                _amount = _val * 200
+                                            elif _unit in ('espresso', 'shot', 'shots'):
+                                                _amount = _val * 30
+                                            else:
+                                                _amount = _val
+                                        if _amount and _amount > 0:
+                                            _resp = await call_api("POST", "/ingest/manual/water",
+                                                                   {"amount_ml": _amount, "category": _category})
+                                            try:
+                                                _ok = (json.loads(_resp) or {}).get("ok")
+                                            except Exception:
+                                                _ok = False
+                                            if _ok:
+                                                print(f"[log_meal_intelligent] liquid auto-logged: {_amount:.0f}ml {_category}", flush=True)
+                                                try:
+                                                    _summary_obj = json.loads(text)
+                                                    _summary_obj["liquid_logged"] = f"{_amount:.0f}ml {_category}"
+                                                    text = json.dumps(_summary_obj)
+                                                except Exception:
+                                                    pass
+                                            else:
+                                                print(f"[log_meal_intelligent] liquid auto-log failed: {_resp[:120]}", flush=True)
+                                except Exception as _e:
+                                    print(f"[log_meal_intelligent] liquid detection error: {_e}", flush=True)
+                            else:
+                                print(f"[log_meal_intelligent] liquid auto-log SKIPPED (DRHIRO_LIQUID_WRITER=unified): backend is authoritative", flush=True)
                     else:
                         text = text_out
                 except Exception as e:

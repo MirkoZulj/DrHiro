@@ -231,6 +231,20 @@ Both B7 blocker conditions are now closed. Stage 3 = B4 + B7 complete.
 
 ---
 
+## Writer Coordination (B9 — Stage 4)
+
+**Scenario**: During cutover, could BOTH the old MCP liquid side effect AND the new unified backend writer record the same drink?
+
+**Answer**: No — controlled by `DRHIRO_LIQUID_WRITER`:
+
+- `legacy` (default): old MCP side effect ACTIVE, new backend may also write (P1 dual-write window — minimized to minutes).
+- `unified`: old MCP side effect SKIPPED — `if not is_unified_writer()` gate in `sse_server.py` runs the legacy block; in `unified` mode it is bypassed and a log line is emitted instead.
+- Any other value → `ValueError` at module load (fail-closed → container crash → no writes).
+
+The flag is read per-request, so the flip is atomic at container restart. There is no interval where neither writer records a drink (P1 has both; P2 has unified only).
+
+**Test coverage**: `tests/test_stage4_writer_flag.py` (5 tests) — proves mode control + fail-closed on invalid values.
+
 ## Calorie Double-Count Prevention
 
 **Scenario**: Could a beverage's calories be counted twice — once as a meal_item and once as a liquid measurement?
