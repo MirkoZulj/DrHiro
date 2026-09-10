@@ -717,3 +717,59 @@ Production container split · production rotation cutover · real OpenClaw spool
 into the real ingress · upgrade fail-safe · real OpenClaw compatibility with the
 boundary · user-facing surface for `unknown` resolution · R1 partial · R2 production
 rotation · R4 production-mirror value preservation · R6 cutover/rollback.
+
+---
+
+# REVISION 5 — review #7 blocker fixes (isolated branch, disposable stack)
+
+No production changes, push, deployment, credential rotation, gate activation, or
+volume deletion. Candidate `7e2cf69` and the frozen archive remain unchanged. **No new
+candidate archive is built at this checkpoint** (per instruction to submit focused
+fixes and evidence first). See `INCREMENTAL_REVIEW_R2.md` / `REVIEW7_BLOCKERS.md` for
+the full responses; this is the summary.
+
+## 5.1 The seven fixes
+
+1. **Unfinished receipts recovered from Postgres, not discarded.** `telegram_receipts`
+   stores `raw_text`; a redelivered non-completed receipt is re-driven from the stored
+   payload; `recover_receipts()` re-drives unfinished receipts at startup and
+   periodically with no Telegram redelivery. Test-only crash/fail hooks exercise
+   "crash after receipt commit" and "failure before consumption persistence".
+2. **Admin surface not model-reachable and authenticated.** Admin binds to
+   `127.0.0.1` (off the turn interface); every admin route (GET and POST) requires
+   the Bearer token. Measured: the model container cannot reach the ingress admin
+   surface.
+3. **Principal derived from credentials.** The audited actor is the fixed
+   `ADMIN_IDENTITY` bound to the token, never a caller-supplied string.
+   Administrator-only surface, documented.
+4. **Delivery completion fenced to the current attempt.** `reply_outbox.
+   current_attempt_id`; every send/resend mints a new id; completion applies only
+   while that id is current. Late result from an old attempt cannot overwrite.
+5. **HTTP errors classified conservatively.** `_api()` validates `ok` and raises on
+   `ok=false`. Only connection-refused/DNS and HTTP 429 are known-safe; every other
+   HTTP response (notably 5xx) and `ok=false` are ambiguous (`unknown`, never
+   auto-resent).
+6. **Migration adoption validator validates definitions.** CHECK compared semantically
+   (canonical expression, rejects `>= -100`); indexes matched on columns; server
+   defaults, PK and FK validated. Negative adoption tests (7) added; failing-before →
+   passing-after demonstrated.
+7. **Explicit out-of-proven-scope documentation.** Real polling-offset, sender
+   identity resolution, and edit/content-conflict handling are stated as NOT
+   implemented/proven. A verified bot identity authenticates the bot, not the sender.
+
+## 5.2 Packaging vs implementation
+
+The functional change set (ingress, stack_ctl, fake_telegram, probe, schema SQL,
+compose, schema_activities, test files) is separated from documentation/evidence in
+the git history and in `REVIEW7_BLOCKERS.md`, so packaging additions are not confused
+with new functional code.
+
+## 5.3 Test state (all EXECUTED, passing)
+
+- `tests/test_r4_activities_migration.py` (gated): **18 passed** (incl. 7 new
+  negative adoption tests).
+- `tests/test_t1_isolated_ingress_stack.py` (gated, disposable stack): full stack
+  suite passing, including new `TestReceiptRecovery` (2), `TestAdminSurface...` (2),
+  `TestHttpClassification` (2), `TestAttemptFencing` (2), and the updated resolution
+  and concurrent-writer tests.
+- Default + gated suites reported in the evidence run.
