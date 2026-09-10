@@ -397,17 +397,54 @@ A transactional outbox durably records intent alongside the consumption commit; 
 means **"turn handled"**, not "reply delivered".
 
 Documented semantics (superseding any stronger claim):
+
 - **Consumption effects:** exactly once (operation key + `FOR UPDATE` + completed
   replay). This is the guarantee we actually hold.
-- **Reply delivery:** at-least-once **attempt**, with **possible duplicate** after an
-  ambiguous send (Telegram accepted, worker crashed before recording it). A local
-  fence/completion marker does not remove the ambiguity.
-- **Unknown-delivery state:** `reply_state ∈ pending | sent | unknown | failed`, where
-  `sent` is recorded only after a response is durably saved; a send that cannot be
-  confirmed is recorded `unknown`, **not** retried automatically, and surfaced.
-- **Recovery policy:** `pending` (never attempted) → safe to send; `unknown` → never
-  auto-resent; requires an operator decision or a user-visible "already logged" path.
-- Explicitly **not** claimed: exactly-once replies. No claim rests on a stub.
+- **Reply delivery:** we claim exactly what is true — **durable reply intent**,
+  **retry of known-safe failures**, and **explicitly unresolved ambiguous sends**.
+  Successful delivery is NOT guaranteed. A send whose outcome is unknown is neither
+  assumed delivered nor blindly retried.
+
+State machine (persisted alongside the consumption commit, i.e. transactional intent):
+
+```
+reply_state:
+  pending   intent durably recorded, no send attempted   -> safe to send
+  sent      a response was received AND durably stored   -> terminal, do not resend
+  failed    a send failed with a KNOWN-SAFE failure       -> safe to retry
+            (connection refused, DNS failure, 429, 5xx before acceptance,
+             request never left the process)
+  unknown   a send was ATTEMPTED and its outcome was not recorded
+                                                          -> never auto-resent
+```
+
+- **Known-safe retry** applies only to `failed`. Retrying a request that provably
+  never reached Telegram cannot duplicate a reply.
+- **`unknown` is the honest state for an ambiguous send.** Exactly one window
+  produces it: the request was written to the socket (or handed to the transport),
+  and the worker died — or lost its lease — before the response was recorded and
+  committed. The worker cannot distinguish "Telegram never got it" from "Telegram
+  delivered it and I lost the confirmation". Recording `sent` would be a guess;
+  retrying would risk a duplicate; so the state is recorded as `unknown` and left
+  for resolution. **A crash mid-send therefore enters `unknown`, not `pending`**:
+  the intent row is written and the send attempt is marked as in-flight *before* the
+  network call, so recovery sees an in-flight attempt with no recorded outcome.
+  A crash *before* the send attempt leaves `pending` and is safely retryable —
+  that asymmetry is the whole point, and it is asserted by test.
+- **Resolution of `unknown`** — two supported paths, neither automatic:
+  1. **Operator resolution.** An operator inspects the operation, the reply body and
+     the transport evidence, then either marks it `sent` (accepted as delivered) or
+     `failed` (accepted as lost, enabling a manual resend). Recorded with actor,
+     timestamp and reason.
+  2. **Authenticated user resolution.** The user can query the operation and is told
+     plainly that a reply may not have arrived. An explicit user action ("resend")
+     is an authorised decision to send again and therefore an accepted duplicate
+     risk; it moves `unknown -> failed -> send`, never a silent auto-retry.
+  Until one of those happens the operation is surfaced as unresolved — never
+  silently retried, never silently assumed sent.
+- Explicitly **not** claimed: exactly-once replies, or guaranteed delivery. No claim
+  rests on a stub, and `sent` means "a response was durably stored", not "the user
+  saw it".
 
 ## R4. Migrations: validate existing state, don't skip it
 

@@ -11,6 +11,7 @@ read-only `\\d activities` on the real database (defaults, CHECK, composite inde
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
@@ -197,3 +198,99 @@ class TestDivergence:
         """))
         diff = sa_act.diff_activities(conn, schema=SCHEMA)
         assert any("description" in d and "nullable" in d for d in diff["fatal"])
+
+
+class TestCatalogRepresentation:
+    """The CHECK-detection guards must be version-independent and must not ignore
+    genuine CHECK constraints. Facts below are read from the live server, not
+    assumed: catalog representation of NOT NULL changed across major versions."""
+
+    def test_server_version_is_reported(self, conn):
+        # Evidence, not an assertion on a specific version: the point is that the
+        # representation is version-dependent, so the code must not rely on it.
+        assert re.match(r"^\d+\.", sa_act.server_version(conn))
+
+    def test_not_null_is_not_a_check_constraint(self, conn):
+        sa_act.create_activities(conn, schema=SCHEMA)
+
+        # NOT NULL is authoritative in pg_attribute.attnotnull...
+        nn = set(sa_act.not_null_columns(conn, SCHEMA))
+        assert {"id", "user_id", "activity_date", "title", "calories_burned"} <= nn
+        assert "description" not in nn, "description is nullable"
+
+        # ...and must NOT be reported as a CHECK constraint.
+        checks = sa_act._check_constraints(conn, SCHEMA)
+        assert checks, "the real CHECK must be found"
+        assert len(checks) == 1, f"expected exactly one check, got {checks}"
+        for name, ddl in checks:
+            assert ddl.startswith("CHECK"), ddl
+            assert "NOT NULL" not in ddl.upper(), ddl
+
+    def test_genuine_check_is_validated_not_ignored(self, conn):
+        """A real CHECK must be detected - the guards must not over-filter."""
+        sa_act.create_activities(conn, schema=SCHEMA)
+        assert sa_act.has_calories_check(conn, SCHEMA) is True
+
+        # Drop it: detection must flip to False and report it reconcilable.
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities "
+            "DROP CONSTRAINT activities_calories_burned_check"
+        ))
+        assert sa_act.has_calories_check(conn, SCHEMA) is False
+        assert any(
+            "CHECK" in d for d in sa_act.diff_activities(conn, schema=SCHEMA)["reconcilable"]
+        )
+
+        # Reconciling restores a working constraint (enforced, not NOT VALID).
+        actions = sa_act.reconcile_activities(conn, schema=SCHEMA)
+        assert any("CHECK" in a for a in actions), actions
+        assert sa_act.has_calories_check(conn, SCHEMA) is True
+        with pytest.raises(Exception):
+            conn.execute(text(
+                f"INSERT INTO {SCHEMA}.activities "
+                "(id, user_id, activity_date, title, calories_burned) VALUES "
+                "(gen_random_uuid(), gen_random_uuid(), current_date, 'x', -1)"
+            ))
+
+    def test_equivalent_differently_named_check_is_recognised(self, conn):
+        """An adopted table with an equivalent check must not be duplicated."""
+        _create_prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities "
+            "DROP CONSTRAINT activities_calories_burned_check"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ADD CONSTRAINT some_other_name "
+            "CHECK (calories_burned >= 0)"
+        ))
+        assert sa_act.has_calories_check(conn, SCHEMA) is True
+        assert not any(
+            "CHECK" in d for d in sa_act.diff_activities(conn, schema=SCHEMA)["reconcilable"]
+        )
+
+
+class TestDowngradeDestructiveness:
+    def test_owned_table_with_data_is_still_destructive_to_drop(self, conn):
+        """Ownership permits the drop; it does not make it safe. Documented and
+        asserted so the hazard cannot be mistaken for a lossless rollback."""
+        sa_act.create_activities(conn, schema=SCHEMA)
+        sa_act.set_owned(conn, schema=SCHEMA)
+        uid = conn.execute(text(f"""
+            INSERT INTO {SCHEMA}.users (id) VALUES (gen_random_uuid()) RETURNING id
+        """)).scalar()
+        conn.execute(text(f"""
+            INSERT INTO {SCHEMA}.activities
+                (id, user_id, activity_date, title, calories_burned)
+            VALUES (gen_random_uuid(), :uid, current_date, 'run', 100)
+        """), {"uid": uid})
+        assert _rowcount(conn) == 1
+
+        sa_act.assert_downgrade_allowed(conn, schema=SCHEMA)  # permitted...
+        sa_act.drop_activities(conn, schema=SCHEMA)           # ...but destructive
+        assert not sa_act.table_exists(conn, schema=SCHEMA)
+        # The row is gone with the table: no snapshot, no restore. Recorded
+        # explicitly in assert_downgrade_allowed's docstring.
+
+
+def _rowcount(conn):
+    return conn.execute(text(f"SELECT count(*) FROM {SCHEMA}.activities")).scalar()

@@ -151,8 +151,18 @@ def set_owned(conn: Connection, schema: str | None = None) -> None:
 def assert_downgrade_allowed(conn: Connection, schema: str | None = None) -> None:
     """Downgrade policy: only a self-created table may be dropped.
 
-    An adopted pre-existing table (production) has real data and an unknown
-    provenance; dropping it would destroy data the migration did not create.
+    Two distinct hazards, both documented rather than glossed:
+
+      1. ADOPTED TABLE (production). The migration did not create it, its data
+         predates the migration, and its provenance is unknown. Dropping it would
+         destroy data the migration never owned, so downgrade is UNSUPPORTED and
+         fails with this message; the operator reverses it deliberately.
+
+      2. SELF-CREATED TABLE THAT HAS SINCE ACQUIRED DATA. Ownership makes the drop
+         *permitted*, not *safe*: if rows were written after creation, the reverse
+         migration is DESTRUCTIVE and loses them. Nothing here snapshots the data.
+         Treat downgrade as a data-destroying operation for such a table and
+         back up first, or restore rather than downgrade.
     """
     if not is_owned(conn, schema=schema):
         raise RuntimeError(
@@ -208,11 +218,48 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
     return {"fatal": fatal, "reconcilable": reconcilable}
 
 
-def _check_constraints(conn: Connection, schema: str | None = None) -> list[tuple[str, str]]:
-    """(name, definition) for CHECK constraints on the table.
+def server_version(conn: Connection) -> str:
+    """`server_version` for evidence (catalog representation is version-dependent)."""
+    return str(conn.execute(text("SHOW server_version")).scalar())
 
-    Filtered to genuine checks: PostgreSQL >= 17 also records NOT NULL as a
-    `contype='c'` entry, so matching on the column name alone would false-positive.
+
+def not_null_columns(conn: Connection, schema: str | None = None) -> list[str]:
+    """NOT NULL columns, read from the authoritative place for this server.
+
+    NOT NULL is *not* a pg_constraint row on PostgreSQL before 18; it lives in
+    pg_attribute.attnotnull. PostgreSQL 18 adds not-null constraints to
+    pg_constraint with contype='n'. Reading pg_attribute is correct on every
+    version, so nothing here parses NOT NULL out of the constraint catalog.
+    """
+    rows = conn.execute(text("""
+        SELECT a.attname
+        FROM pg_attribute a
+        JOIN pg_class t ON t.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE t.relname = :t
+          AND a.attnotnull
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND (:s IS NULL OR n.nspname = :s)
+        ORDER BY a.attnum
+    """), {"t": TABLE, "s": schema}).fetchall()
+    return [r[0] for r in rows]
+
+
+def _check_constraints(conn: Connection, schema: str | None = None) -> list[tuple[str, str]]:
+    """(name, definition) for genuine CHECK constraints on the table.
+
+    Two independent guards, both version-independent:
+
+      * `contype = 'c'` is the CHECK type on every supported version;
+      * `pg_get_constraintdef(oid) LIKE 'CHECK%'` rejects any other constraint
+        kind that might share a contype value on some version.
+
+    Neither guard reads NOT NULL, which is recorded in pg_attribute.attnotnull
+    before PostgreSQL 18 and as contype='n' (not 'c') from 18 onward. Verified on
+    the disposable test server (PostgreSQL 16.14): `activities` reports exactly
+    three pg_constraint rows - 'c' (the CHECK), 'f' (the FK) and 'p' (the PK) -
+    with NOT NULL columns absent from pg_constraint entirely.
     """
     rows = conn.execute(text("""
         SELECT c.conname, pg_get_constraintdef(c.oid)
@@ -230,11 +277,14 @@ def _check_constraints(conn: Connection, schema: str | None = None) -> list[tupl
 def has_calories_check(conn: Connection, schema: str | None = None) -> bool:
     """True when an equivalent `calories_burned >= 0` check exists.
 
-    Matched by the production name OR by the expression, so a differently-named
-    equivalent constraint on an adopted table is not duplicated.
+    Matched by the production constraint name OR by an equivalent expression, so a
+    differently-named equivalent check on an adopted table is recognised (and not
+    duplicated), while a table with no check at all is correctly reported missing.
     """
     for name, ddl in _check_constraints(conn, schema):
-        if name == CHECK_NAME or ">=" in ddl:
+        if name == CHECK_NAME:
+            return True
+        if "calories_burned" in ddl and ">=" in ddl:
             return True
     return False
 
