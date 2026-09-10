@@ -24,6 +24,7 @@ from drhiro_api.models import Alert, Goal, Meal, Measurement, Reminder, Reminder
 from drhiro_api.routers.auth import mint_web_login_code
 from drhiro_api.routers.dashboard import _measurements_since
 from drhiro_api.security import audit, validate_service_token
+from drhiro_api.routers.telegram_ingress import require_model_writer_allowed
 from drhiro_rules.calculations import weight_trend
 from drhiro_schema.metrics import MetricType
 
@@ -152,7 +153,7 @@ class MealFromTextTool(BaseModel):
     meal_type: str | None = None
 
 
-@router.post("/create_meal_from_text", response_model=ToolResponse)
+@router.post("/create_meal_from_text", response_model=ToolResponse, dependencies=[Depends(require_model_writer_allowed)])
 def tool_meal_from_text(req: MealFromTextTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
     from drhiro_api.routers.meals import MealCreateRequest, MealItemIn, create_meal
     from drhiro_api.services.text_meal_parser import parse_meal_text
@@ -219,7 +220,7 @@ class UpdateMealItemTool(BaseModel):
     patch: MealItemPatchTool
 
 
-@router.post("/update_meal_item", response_model=ToolResponse)
+@router.post("/update_meal_item", response_model=ToolResponse, dependencies=[Depends(require_model_writer_allowed)])
 def tool_update_meal_item(req: UpdateMealItemTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
     from drhiro_api.routers.meals import MealItemPatch, patch_meal_item
     meal = db.query(Meal).filter(Meal.id == uuid.UUID(req.meal_id), Meal.user_id == user.id).first()
@@ -236,7 +237,7 @@ class ConfirmMealTool(BaseModel):
     meal_id: str
 
 
-@router.post("/confirm_meal", response_model=ToolResponse)
+@router.post("/confirm_meal", response_model=ToolResponse, dependencies=[Depends(require_model_writer_allowed)])
 def tool_confirm_meal(req: ConfirmMealTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
     from drhiro_api.routers.meals import confirm_meal
     meal = db.query(Meal).filter(Meal.id == uuid.UUID(req.meal_id), Meal.user_id == user.id).first()

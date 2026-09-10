@@ -72,6 +72,9 @@ def db(engine, tables):
         conn.execute(text("DELETE FROM foods"))
         conn.execute(text("DELETE FROM nutrients"))
         conn.execute(text("DELETE FROM data_sources"))
+        # Child rows referencing users must be cleared before users (FK order).
+        conn.execute(text("DELETE FROM external_identities"))
+        conn.execute(text("DELETE FROM device_connections"))
         conn.execute(text("DELETE FROM users"))
         conn.commit()
 

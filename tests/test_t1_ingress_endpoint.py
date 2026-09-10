@@ -257,15 +257,15 @@ class TestHappyPath:
 class TestWriterOwnership:
     def test_model_writer_is_closed_when_gate_active(self, client, seed, monkeypatch):
         """With the trusted path active and legacy writers closed, the model's
-        service identity cannot log a consumption."""
+        service identity cannot log a consumption through the /tools writer."""
         monkeypatch.setattr(
             router_mod, "get_settings",
             lambda: _Settings(enabled=True, legacy=False),
         )
         r = client.post(
-            "/api/v1/ingest/manual/water",
-            json={"amount_ml": 250},
-            headers={"x-service-token": _service_token()},
+            "/api/v1/tools/create_meal_from_text",
+            json={"text": "chicken 200g"},
+            headers={"x-service-token": _service_token(), "x-telegram-id": "555"},
         )
         assert r.status_code == 403
         assert "model_writer_disabled" in r.text
@@ -287,9 +287,9 @@ class TestWriterOwnership:
             lambda: _Settings(enabled=False, legacy=False),
         )
         r = client.post(
-            "/api/v1/ingest/manual/water",
-            json={"amount_ml": 250},
-            headers={"x-service-token": _service_token()},
+            "/api/v1/tools/create_meal_from_text",
+            json={"text": "chicken 200g"},
+            headers={"x-service-token": _service_token(), "x-telegram-id": "555"},
         )
         assert r.status_code == 503
         assert "legacy_writers_closed_without_trusted_path" in r.text

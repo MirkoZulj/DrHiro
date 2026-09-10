@@ -649,6 +649,70 @@ class TrustedIngressWorker:
         ).delete(synchronize_session=False)
         self.db.flush()
 
+    def recover_incomplete_operations(self, stale_minutes: int = 5) -> dict:
+        """Re-drive operations that crashed between receipt and completion.
+
+        A crash can leave an operation in 'pending' or 'processing' with no
+        Telegram redelivery (the offset may already have advanced, or the caller
+        is not Telegram). This scans the durable consumption_operations table —
+        NOT the poll offset — for in-flight operations and re-drives each
+        through the same trusted path, idempotently.
+
+        Only operations older than stale_minutes are considered, so a genuinely
+        concurrent worker does not double-drive an operation another worker is
+        actively processing. 'needs_clarification' is left for the user; only
+        'pending'/'processing' are recovered.
+        """
+        from datetime import timedelta
+
+        cutoff = _now() - timedelta(minutes=stale_minutes)
+        stale = (
+            self.db.query(ConsumptionOperation)
+            .filter(
+                ConsumptionOperation.status.in_(["pending", "processing"]),
+                ConsumptionOperation.updated_at < cutoff,
+            )
+            .order_by(ConsumptionOperation.updated_at.asc())
+            .limit(200)
+            .all()
+        )
+        recovered = {"replayed": 0, "completed": 0, "no_consumption": 0, "failed": 0, "ids": []}
+
+        for op in stale:
+            event = TrustedEvent(
+                kind="message",
+                bot_id=op.source_bot_id or "",
+                chat_id=op.source_chat_id or "",
+                message_id=op.source_message_id or "",
+                telegram_user_id="",
+                text=op.raw_text or "",
+                user_id=str(op.user_id),
+            )
+            # Fresh digest from the stored raw text.
+            digest = content_digest(event.text)
+            try:
+                outcome = self.handle(event)
+                status = outcome.get("status")
+            except (IngressConflict, IngressRejected) as exc:
+                recovered["failed"] += 1
+                recovered["ids"].append(str(op.id))
+                self.db.rollback()
+                self.db.query(ConsumptionOperation).filter(
+                    ConsumptionOperation.id == op.id
+                ).update({"status": "recovery_failed"}, synchronize_session=False)
+                self.db.commit()
+                continue
+
+            if status in ("completed", "revised"):
+                recovered["completed"] += 1
+            elif status == "replayed":
+                recovered["replayed"] += 1
+            else:
+                recovered["no_consumption"] += 1
+            recovered["ids"].append(str(op.id))
+
+        return recovered
+
     # -- confirmation callbacks ------------------------------------------- #
 
     def handle_callback(self, event: TrustedEvent) -> dict:

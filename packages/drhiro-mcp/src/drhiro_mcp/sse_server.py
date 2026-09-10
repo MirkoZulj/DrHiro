@@ -44,6 +44,44 @@ def is_unified_writer() -> bool:
     return get_liquid_writer_mode() == "unified"
 
 
+# --- T1 trusted-ingress writer gate ---------------------------------------
+# When DRHIRO_TRUSTED_INGRESS_WRITERS_DISABLED is truthy, the conversational
+# model's consumption-writing tools are disabled: the trusted worker owns
+# Telegram consumption. The model cannot independently log the same drink.
+# This is the DECISIVE gate for the model's tool surface; an API header gate
+# cannot distinguish a model-presented user JWT from a real user.
+_TRUSTED_INGRESS_WRITERS_DISABLED = (
+    os.environ.get("DRHIRO_TRUSTED_INGRESS_WRITERS_DISABLED", "false").lower() == "true"
+)
+
+# Consumption-writing tool names that the trusted worker must own exclusively.
+_CONSUMPTION_WRITER_TOOLS = {
+    "log_meal",
+    "log_meal_intelligent",
+    "confirm_intelligent_meal",
+    "log_water",
+    "log_liquid",
+    "log_recipe_meal",
+    "build_recipe",
+    "delete_meal",
+    "correct_meal_item",
+}
+
+
+def consumption_writers_disabled() -> bool:
+    return _TRUSTED_INGRESS_WRITERS_DISABLED
+
+
+def _writer_disabled_response(tool_name: str):
+    return {
+        "ok": False,
+        "error": (
+            f"model_writer_disabled: {tool_name} is owned by the trusted "
+            "Telegram ingress; the conversational model cannot log consumption."
+        ),
+    }
+
+
 def _headers(path=""):
     h = {"Content-Type": "application/json"}
     # Service token paths: MCP service endpoints that don't require user JWT
@@ -740,6 +778,12 @@ async def handle_mcp(request: Request):
         if not isinstance(args, dict):
             args = {}
         print(f"[tools/call] name={tool_name!r} args={json.dumps(args, default=str)[:300]}", flush=True)
+        # T1: the trusted worker owns consumption. Disable the model's
+        # consumption-writing tools when active.
+        if consumption_writers_disabled() and tool_name in _CONSUMPTION_WRITER_TOOLS:
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": req_id, "result": _writer_disabled_response(tool_name)}
+            )
         try:
             if tool_name == "get_steps":
                 text = await call_api("GET", "/dashboard/today")

@@ -607,6 +607,86 @@ class TestRestartAndRedisLoss:
 
 
 # ---------------------------------------------------------------------------
+# 6b. Recovery of unfinished operations after a crash (no Telegram redelivery)
+# ---------------------------------------------------------------------------
+
+class TestCrashRecovery:
+    def test_crash_between_receipt_and_completion_is_recovered(
+        self, SessionLocal, db, user, catalog
+    ):
+        """A crash leaves status='processing'; recovery re-drives it WITHOUT a
+        new Telegram update (offset already advanced)."""
+        # 1. Simulate a crash: create the operation + durable receipt, then
+        #    stop before interpretation (the worker that received it dies).
+        text = "I had 300g steak"
+        worker = ingress.TrustedIngressWorker(db, proposer_for(MEAL_PROPOSALS))
+        op, created = ingress.get_or_create_operation(
+            db, str(user.id), source="telegram",
+            source_chat_id=CHAT_ID, source_message_id="80", source_bot_id=BOT_ID,
+            raw_text=text, payload_hash=ingress.content_digest(text),
+        )
+        op.status = "processing"
+        db.commit()
+        op_id = str(op.id)
+
+        assert db.query(Meal).count() == 0, "crash before any write"
+        # The offset has advanced — no Telegram redelivery will ever come.
+
+        # 2. A brand-new worker session (post-restart) recovers it from
+        #    PostgreSQL, not from the network.
+        fresh = SessionLocal()
+        try:
+            restarted = ingress.TrustedIngressWorker(fresh, proposer_for(MEAL_PROPOSALS))
+            report = restarted.recover_incomplete_operations(stale_minutes=0)
+        finally:
+            fresh.close()
+
+        assert report["completed"] == 1, report
+        assert report["ids"] == [op_id]
+
+        db.expire_all()
+        meal = db.query(Meal).first()
+        assert meal is not None
+        assert meal.totals_json["kcal"] == pytest.approx(813.0, rel=1e-6)
+        # Still exactly ONE meal and ONE operation.
+        assert db.query(Meal).count() == 1
+        assert db.query(ConsumptionOperation).count() == 1
+
+    def test_recovery_does_not_touch_completed_or_clarification(
+        self, SessionLocal, db, user, catalog
+    ):
+        text = "I had 300g steak"
+        worker = ingress.TrustedIngressWorker(db, proposer_for(MEAL_PROPOSALS))
+        update = raw_message(text, "81")
+
+        # A completed operation is left alone.
+        done = worker.handle(accept(signed_payload(update)))
+        assert done["status"] == "completed"
+
+        # A needs_clarification operation is left for the user.
+        op2, _ = ingress.get_or_create_operation(
+            db, str(user.id), source="telegram",
+            source_chat_id=CHAT_ID, source_message_id="82", source_bot_id=BOT_ID,
+            raw_text="ambiguous", payload_hash=ingress.content_digest("ambiguous"),
+        )
+        op2.status = "needs_clarification"
+        db.commit()
+
+        fresh = SessionLocal()
+        try:
+            restarted = ingress.TrustedIngressWorker(fresh, proposer_for(MEAL_PROPOSALS))
+            report = restarted.recover_incomplete_operations(stale_minutes=0)
+        finally:
+            fresh.close()
+
+        # Neither was re-driven (completed is final; clarification waits on user).
+        assert report["completed"] == 0
+        assert report["replayed"] == 0
+        assert db.query(Meal).count() == 1
+        assert db.query(ConsumptionOperation).count() == 2
+
+
+# ---------------------------------------------------------------------------
 # 7. Trust boundary
 # ---------------------------------------------------------------------------
 
@@ -685,3 +765,61 @@ class TestTrustBoundary:
         assert out["status"] == "needs_clarification"
         assert db.query(Meal).count() == 0
         assert len(out["rejected"]) == 5
+
+    def test_unsupported_input_clarifies_not_guesses(self, db, user, catalog):
+        """Empty/garbled text with no items -> explicit clarification, nothing
+        silently logged (UNKNOWN is not assumed zero or skipped)."""
+        for idx, (text, proposals) in enumerate([
+            ("", {"items": []}),                       # blank message
+            ("hjhkasdf", {"items": []}),               # unparseable
+            ("???", None),                             # proposer yields nothing
+        ]):
+            worker = ingress.TrustedIngressWorker(db, proposer_for({text: proposals}))
+            out = worker.handle(accept(signed_payload(raw_message(text, f"76{idx}"))))
+            # needs_clarification or no_consumption — NEVER a silent consumption.
+            assert out["status"] in ("needs_clarification", "no_consumption"), out
+        assert db.query(Meal).count() == 0
+
+    def test_clarification_outcome_does_not_write(self, db, user, catalog):
+        """The needs_clarification branch must leave no meal, no measurement,
+        no item — and must not be recorded as completed."""
+        text = "I had 100g unobtainium"  # unknown food is still a valid item,
+        # but a FULLY rejected proposal set must not write.
+        bad = {"items": [{"name": "", "grams": 100}]}  # empty name -> rejected
+        worker = ingress.TrustedIngressWorker(db, proposer_for({text: bad}))
+        out = worker.handle(accept(signed_payload(raw_message(text, "77"))))
+        assert out["status"] == "needs_clarification"
+        op = db.query(ConsumptionOperation).filter(
+            ConsumptionOperation.id == out["operation_id"]
+        ).first()
+        assert op.status == "needs_clarification"
+        assert op.result_json["ok"] is False
+        assert db.query(Meal).count() == 0
+        assert db.query(Measurement).count() == 0
+        assert db.query(ConsumptionItem).count() == 0
+
+    def test_non_consumption_message_falls_through(self, db, user, catalog):
+        """A conversational turn that is NOT consumption-shaped returns
+        no_consumption so the conversational path can handle it."""
+        text = "what is my step count for today?"
+        worker = ingress.TrustedIngressWorker(db, proposer_for({text: {"items": []}}))
+        out = worker.handle(accept(signed_payload(raw_message(text, "78"))))
+        assert out["status"] == "no_consumption"
+        assert db.query(Meal).count() == 0
+
+    def test_proposals_with_identity_or_nutrition_are_ignored(
+        self, db, user, catalog
+    ):
+        """Model output carrying identity/nutrition must not influence the write."""
+        text = "I had 200g steak"
+        hostile = {
+            "items": [{
+                "name": "Steak", "grams": 200,
+                "user_id": "victim", "bot_id": "hax", "chat_id": "0",
+                "kcal": 50000,
+            }]
+        }
+        worker = ingress.TrustedIngressWorker(db, proposer_for({text: hostile}))
+        out = worker.handle(accept(signed_payload(raw_message(text, "79"))))
+        assert out["status"] == "completed"
+        assert out["result"]["data"]["totals"]["kcal"] == pytest.approx(271.0 * 2, rel=1e-6)
