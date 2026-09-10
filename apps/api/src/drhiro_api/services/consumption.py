@@ -942,7 +942,7 @@ def write_consumption(
         op = db.query(ConsumptionOperation).filter(
             ConsumptionOperation.id == operation_id,
             ConsumptionOperation.user_id == user_id,
-        ).with_for_update().first()
+        ).with_for_update().populate_existing().first()
         if not op:
             raise ValueError("operation_not_found")
         # If already completed, return the stored result (idempotent replay)

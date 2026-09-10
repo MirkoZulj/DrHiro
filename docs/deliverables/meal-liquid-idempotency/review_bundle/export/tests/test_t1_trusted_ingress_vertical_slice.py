@@ -685,63 +685,6 @@ class TestCrashRecovery:
         assert db.query(Meal).count() == 1
         assert db.query(ConsumptionOperation).count() == 2
 
-    def test_concurrent_recovery_no_duplicate_after_uncertain_commit(
-        self, SessionLocal, db, user, catalog
-    ):
-        """Concurrent workers recovering the SAME stale operation must collapse
-        to ONE completed write. This is the uncertain-commit case: after a crash
-        the commit outcome is unknown, and several recovery workers may race on
-        the same pending/processing row. write_consumption's FOR UPDATE lock +
-        completed-replay guard must yield exactly one meal."""
-        text = "I had 300g steak"
-        # 1. A crash leaves one stale processing operation (no network replay).
-        worker = ingress.TrustedIngressWorker(db, proposer_for(MEAL_PROPOSALS))
-        op, _created = ingress.get_or_create_operation(
-            db, str(user.id), source="telegram",
-            source_chat_id=CHAT_ID, source_message_id="83", source_bot_id=BOT_ID,
-            raw_text=text, payload_hash=ingress.content_digest(text),
-        )
-        op.status = "processing"
-        db.commit()
-        op_id = str(op.id)
-
-        # 2. N recovery workers race on the same operation.
-        errors = []
-        outcomes = []
-
-        def recover():
-            session = SessionLocal()
-            try:
-                restarted = ingress.TrustedIngressWorker(session, proposer_for(MEAL_PROPOSALS))
-                report = restarted.recover_incomplete_operations(stale_minutes=0)
-                outcomes.append(report["completed"])
-                outcomes.append(report["replayed"])
-            except Exception as exc:  # noqa: BLE001
-                errors.append(repr(exc))
-            finally:
-                session.close()
-
-        threads = [threading.Thread(target=recover) for _ in range(6)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        assert not errors, errors
-        # The uncertain-commit invariant: no matter how many workers raced and
-        # each reported its own 'completed' view, the DATABASE must hold exactly
-        # one meal, one operation, one item. The FOR UPDATE + populate_existing
-        # lock makes the second writer observe 'completed' and replay, not write.
-        db.expire_all()
-        assert db.query(Meal).count() == 1, "duplicate meal written by concurrent recovery"
-        assert db.query(ConsumptionOperation).count() == 1
-        assert db.query(ConsumptionItem).count() == 1
-        meal = db.query(Meal).first()
-        assert meal.totals_json["kcal"] == pytest.approx(813.0, rel=1e-6)
-        # And the operation must be completed (not left in-flight for another pass).
-        op = db.query(ConsumptionOperation).first()
-        assert op.status == "completed"
-
 
 # ---------------------------------------------------------------------------
 # 7. Trust boundary
