@@ -80,7 +80,12 @@ services:
       # Resolution auth. Present ONLY in the trusted ingress; never mounted into a
       # model-accessible container. Throwaway value: this stack is disposable.
       INGRESS_ADMIN_TOKEN: "disposable-admin-token"
+      # The authenticated administrator identity (review #3): the audit actor is
+      # ALWAYS this, never a caller-supplied string.
+      INGRESS_ADMIN_IDENTITY: "admin"
       REPLY_OWNER_ID: "555000111"
+      # Short lease so receipt-recovery tests (crash after commit) re-drive promptly.
+      RECEIPT_LEASE_S: "6"
     volumes:
       - trusted-spool:/var/spool/telegram
     networks: [trusted, turn]

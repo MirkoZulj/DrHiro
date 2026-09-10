@@ -71,11 +71,15 @@ def main() -> int:
         # The durable receipt the consumer writes before claiming. reply_outbox has a
         # foreign key to it, so the probe must reproduce that row: this is the
         # persistence layer racing, with the receipt stage assumed already done.
+        # Seeded 'completed' (not 'processing') so the LIVE ingress's periodic
+        # recover_receipts() does not treat it as unfinished and re-drive it
+        # concurrently with this probe's own writers - the probe must own this
+        # identity exclusively to test the persistence-layer race.
         cur.execute(
             """
             INSERT INTO telegram_receipts (event_key, bot_id, chat_id, message_id,
                                            update_id, content_digest, status)
-            VALUES (%s, %s, %s, %s, 1, %s, 'processing')
+            VALUES (%s, %s, %s, %s, 1, %s, 'completed')
             ON CONFLICT (event_key) DO NOTHING
             """,
             (f"{IDENTITY['bot_id']}:{IDENTITY['chat_id']}:{IDENTITY['message_id']}",

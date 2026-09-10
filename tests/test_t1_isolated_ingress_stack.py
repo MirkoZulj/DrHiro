@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -101,6 +102,31 @@ def ctl_api(*args: str) -> dict:
 def real_output() -> dict:
     """Read what the REAL consumption service produced (meals, items, measurements)."""
     return ctl("real-output")
+
+
+def touch_marker(name: str):
+    """Create a test-only hook marker in the trusted spool (B1). Only the trusted
+    ingress mounts that volume, so this is not reachable from the model side."""
+    r = compose("exec", "-T", "ingress", "sh", "-c",
+                f"touch /var/spool/telegram/{name}")
+    assert r.returncode == 0, r.stderr
+
+
+def postgres_q(sql: str) -> str:
+    r = compose("exec", "-T", "postgres", "psql", "-U", "drhiro", "-d", "drhiro_t1",
+                "-tAc", sql)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def wait_ingress_exited(timeout: float = 60) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = compose("ps", "-a", "--format", "{{.Service}} {{.State}}")
+        if "ingress exited" in r.stdout:
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def concurrent_probe(n: int = 4) -> dict:
@@ -322,6 +348,17 @@ class TestOpenClawCannotReachTrustedState:
     def test_cannot_reach_trusted_services(self, probe):
         reachable = [host for host, ok in probe["reachable"].items() if ok]
         assert reachable == [], f"model-accessible container reached {reachable}"
+
+    def test_cannot_reach_the_ingress_admin_surface(self, probe):
+        """The trusted ingress ADMIN surface must not be model-reachable.
+
+        The admin HTTP server binds to the ingress loopback (not 0.0.0.0), so it is
+        off the turn-facing interface entirely - reachability, not just a password,
+        denies the model network access (review #2).
+        """
+        assert probe["ingress_admin_reachable"] is False, (
+            "model-accessible container reached the ingress admin surface"
+        )
 
     def test_cannot_alter_trusted_state_even_if_it_tries(self):
         """Attempt a real write to the trusted database: it must fail."""
@@ -585,7 +622,9 @@ class TestUnknownResolution:
         before_out = real_output()
         before_sent = ctl_api("sent")["delivered"]
 
-        result = resolve(op, "operator-1", "acknowledge", CHAT_ID)
+        # Pass a SPOOFED actor string (review #3). The audit must record the
+        # AUTHENTICATED principal (the admin bound to the token), NOT this string.
+        result = resolve(op, "spoofed-actor", "acknowledge", CHAT_ID)
         assert result["ok"] is True
         assert result["to_state"] == "resolved_acknowledged"
 
@@ -596,9 +635,14 @@ class TestUnknownResolution:
         assert real_output()["meals"] == before_out["meals"]
 
         audit = ctl("audit")["audit"]
-        assert any(a["action"] == "acknowledge" and a["actor"] == "operator-1"
-                   and a["from_state"] == "unknown"
-                   and a["to_state"] == "resolved_acknowledged" for a in audit), audit
+        acted = [a for a in audit if a["action"] == "acknowledge"
+                 and a["operation_id"] == op]
+        assert acted, audit
+        assert all(a["actor"] == "admin" for a in acted), (
+            f"actor must be the authenticated admin, not the supplied string: {audit}"
+        )
+        assert any(a["from_state"] == "unknown" and a["to_state"] == "resolved_acknowledged"
+                   for a in acted), audit
 
     def test_resend_requires_explicit_duplicate_risk_acknowledgement(self, clean_state):
         op = force_unknown()
@@ -630,7 +674,7 @@ class TestUnknownResolution:
         audit = [a for a in ctl("audit")["audit"] if a["action"] == "resend"]
         assert len(audit) >= 2, audit
         assert any("may already have occurred" in (a["detail"] or "") for a in audit), audit
-        assert audit[-1]["actor"] == "operator-1"
+        assert audit[-1]["actor"] == "admin", "resend actor must be the authenticated admin"
 
     def test_concurrent_resolution_requests_do_not_both_act(self, clean_state):
         """Two simultaneous resolutions: exactly one may act."""
@@ -673,3 +717,174 @@ class TestUnknownResolution:
         assert result["http_status"] == 409
         assert result["error"] == "state_changed"
         assert result["current_state"] == "sent"
+
+
+
+# --------------------------------------------------------------------------- #
+# Review #1: unfinished receipts must be recovered from Postgres, not discarded
+# --------------------------------------------------------------------------- #
+
+class TestReceiptRecovery:
+    """A receipt left unfinished by a crash (after commit) or a failure (before
+    consumption persistence) must be re-driven from the STORED payload, without
+    requiring Telegram to redeliver (review #1)."""
+
+    def test_crash_after_receipt_commit_is_recovered_without_redelivery(self, clean_state):
+        # Deterministic crash hook: after the receipt is durably committed (status
+        # 'processing') and claimed, the process dies before any consumption work.
+        touch_marker("crash_after_receipt.marker")
+        ctl_api("enqueue", CHAT_ID, "200g chicken", "780001")
+
+        assert wait_ingress_exited(), "ingress must crash after the receipt commit"
+        # The receipt exists, in 'processing', carrying the trusted payload.
+        assert postgres_q(
+            "SELECT status FROM telegram_receipts WHERE message_id='780001'"
+        ) == "processing"
+        assert postgres_q(
+            "SELECT raw_text FROM telegram_receipts WHERE message_id='780001'"
+        ) == "200g chicken"
+
+        # Wipe the fake Telegram queue so it CANNOT redeliver the update: recovery
+        # must come purely from the stored payload in Postgres.
+        ctl_api("reset")
+        ensure_ingress_running()
+
+        # Recovery re-drives it: exactly one meal, correct totals, receipt completed.
+        wait_for(lambda: (o := try_ctl("real-output")) and o["meals"] and
+                 postgres_q("SELECT status FROM telegram_receipts WHERE message_id='780001'")
+                 == "completed", what="receipt recovered", timeout=90)
+        out = ctl("real-output")
+        assert len(out["meals"]) == 1, "recovery must not double the consumption"
+        # chicken 200 g -> 330 kcal / 62 p / 0 c / 7.2 f / 0 fib / 148 na
+        assert out["meals"][0]["totals_json"]["kcal"] == 330.0
+        c = ctl("counts")
+        assert c["telegram_consumptions"] == 1
+        assert c["receipt_status"] == {"completed": 1}
+
+    def test_failure_before_consumption_is_recovered(self, clean_state):
+        # Deterministic failure hook: persist raises before writing the consumption;
+        # fail_receipt resets the receipt to 'received' for recovery.
+        touch_marker("fail_before_consume.marker")
+        ctl_api("enqueue", CHAT_ID, "200g chicken", "780002")
+
+        # The failure releases the claim and records the attempt. (We do NOT assert
+        # meals==0 here: periodic receipt recovery races this assertion. The
+        # deterministic guarantees are that a failure is RECORDED, that recovery
+        # re-drives it, and that exactly ONE consumption results - never two.)
+        state = wait_for(
+            lambda: postgres_q(
+                "SELECT status FROM telegram_receipts WHERE message_id='780002'"
+            ) == "received", what="receipt released after failure", timeout=60,
+        )
+        attempts = int(postgres_q(
+            "SELECT attempts FROM telegram_receipts WHERE message_id='780002'"))
+        assert attempts >= 1, "a failed attempt must be recorded"
+
+        # Marker was consumed; periodic recovery re-drives from the stored payload.
+        wait_for(lambda: postgres_q(
+            "SELECT status FROM telegram_receipts WHERE message_id='780002'") == "completed",
+            what="receipt recovered after failure", timeout=60)
+        out = ctl("real-output")
+        assert len(out["meals"]) == 1
+        assert out["meals"][0]["totals_json"]["kcal"] == 330.0
+        c = ctl("counts")
+        assert c["telegram_consumptions"] == 1, "recovery must not duplicate"
+
+
+# --------------------------------------------------------------------------- #
+# Review #2: admin surface is authenticated AND not model-reachable
+# --------------------------------------------------------------------------- #
+
+class TestAdminSurfaceIsNotModelReachable:
+    def test_get_status_requires_auth(self, clean_state):
+        assert ctl("noauth_get", "/admin/status")["http_status"] == 401
+        assert ctl("noauth_get", "/admin/real-output")["http_status"] == 401
+        assert ctl("noauth_get", "/admin/audit")["http_status"] == 401
+        # with the token (stack_ctl attaches it) it is served
+        assert ctl("status")["http_status"] == 200
+
+    def test_recover_get_requires_auth_and_does_not_leak(self, clean_state):
+        """GET /admin/recover both changes state AND may send replies; it must be as
+        protected as the POST surface (review #2)."""
+        r = ctl("noauth_get", "/admin/recover")
+        assert r["http_status"] == 401
+        assert "counts" not in r, "unauthenticated recover must not return state"
+
+
+# --------------------------------------------------------------------------- #
+# Review #4: delivery completion is fenced to the current attempt
+# --------------------------------------------------------------------------- #
+
+class TestAttemptFencing:
+    def test_late_result_from_old_attempt_does_not_overwrite_newer_resolution(self, clean_state):
+        op = force_unknown()                       # 'unknown', current_attempt cleared
+        before_out = real_output()
+        before_sent = ctl_api("sent")["delivered"]
+
+        # Resolve to a terminal state.
+        r = resolve(op, "admin", "acknowledge", CHAT_ID)
+        assert r["to_state"] == "resolved_acknowledged"
+
+        # A DELAYED completion callback from an OLD attempt arrives late (review #4).
+        stale_attempt = str(uuid.uuid4())
+        late = ctl("late-result", op, stale_attempt, "sent")
+        assert late["applied"] is False, "a stale attempt must not complete anything"
+
+        after = ctl("counts")
+        assert after["reply_state"] == {"resolved_acknowledged": 1}, (
+            "late old result must not overwrite the newer resolution"
+        )
+        assert ctl_api("sent")["delivered"] == before_sent, "late result must not send"
+        assert real_output()["total_operations"] == before_out["total_operations"]
+
+    def test_late_result_from_old_attempt_does_not_overwrite_unknown(self, clean_state):
+        op = force_unknown()   # state 'unknown' with current_attempt cleared
+        before = ctl("counts")
+        stale_attempt = str(uuid.uuid4())
+        late = ctl("late-result", op, stale_attempt, "sent")
+        assert late["applied"] is False
+        assert ctl("counts")["reply_state"] == {"unknown": 1}
+
+
+# --------------------------------------------------------------------------- #
+# Review #5: HTTP errors are classified conservatively; responses validated
+# --------------------------------------------------------------------------- #
+
+class TestHttpClassification:
+    def test_5xx_after_acceptance_is_ambiguous_not_retried(self, clean_state):
+        """A message that IS delivered but whose response is a 5xx is AMBIGUOUS. A 5xx
+        alone does not prove nothing was delivered, so it must become 'unknown' and
+        must NOT be auto-retried (review #5)."""
+        ctl_api("mode", "accept_then_error")
+        ctl_api("enqueue", CHAT_ID, "5xx after send", "770001")
+        state = wait_for(
+            lambda: (c := try_ctl("counts")) and c["reply_state"].get("unknown") and c,
+            what="ambiguous 5xx -> unknown", timeout=60,
+        )
+        assert state["reply_state"] == {"unknown": 1}
+        delivered = ctl_api("sent")["delivered"]
+        assert delivered == 1, "the message WAS delivered before the 5xx"
+
+        ctl_api("mode", "normal")
+        time.sleep(6)  # give a wrong implementation time to auto-retry
+        final = ctl("counts")
+        assert final["reply_state"] == {"unknown": 1}, (
+            "an ambiguous 5xx must never be auto-retried"
+        )
+        assert ctl_api("sent")["delivered"] == delivered, (
+            "no extra delivery after an ambiguous 5xx"
+        )
+
+    def test_ok_false_is_not_marked_sent(self, clean_state):
+        """Telegram returning HTTP 200 with `ok=false` is an application-level error:
+        _api() must surface it (TelegramAPIError) rather than let the caller mark
+        success. The outcome is ambiguous, not 'sent' (review #5)."""
+        ctl_api("mode", "ok_false")
+        ctl_api("enqueue", CHAT_ID, "ok false", "770002")
+        state = wait_for(
+            lambda: (c := try_ctl("counts")) and c["reply_state"].get("unknown") and c,
+            what="ok=false -> unknown", timeout=60,
+        )
+        assert state["reply_state"] == {"unknown": 1}
+        assert "sent" not in state["reply_state"], "ok=false must not be recorded sent"
+        assert state["telegram_consumptions"] == 1

@@ -196,6 +196,26 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(30)
                 return
 
+            if mode == "accept_then_error":
+                # DELIVERED, then an error response (HTTP 5xx). The ingress must NOT
+                # treat a 5xx as 'nothing was delivered': a 5xx alone does not prove
+                # no delivery occurred, so this must be 'unknown', not retried.
+                return self._send_json(
+                    {"ok": False, "error_code": 500,
+                     "description": "internal error after acceptance"},
+                    code=500,
+                )
+
+            if mode == "ok_false":
+                # DELIVERED, then HTTP 200 with Telegram's application-level
+                # `ok=false`. _api() must surface this (TelegramAPIError) rather than
+                # letting the caller mark success; the outcome is ambiguous.
+                return self._send_json(
+                    {"ok": False, "error_code": 400,
+                     "description": "application-level error after acceptance"},
+                    code=200,
+                )
+
             with _lock:
                 mid = _sent[-1]["message_id"]
             return self._send_json({"ok": True, "result": {"message_id": mid,

@@ -51,9 +51,15 @@ def _call(url: str, payload: dict | None = None, token: str | None = None):
         return {**body, "http_status": exc.code}
 
 
-def _get(url: str):
+def _get(url: str, token: str | None = None):
+    """GET. Admin routes require the Bearer token (review #2); the fake-API control
+    routes do not. Non-2xx responses are returned as data so tests can assert on the
+    error code instead of crashing."""
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return {**json.loads(resp.read()), "http_status": resp.status}
     except urllib.error.HTTPError as exc:
         try:
@@ -61,6 +67,9 @@ def _get(url: str):
         except Exception:
             body = {}
         return {**body, "http_status": exc.code}
+
+
+_ADMIN_TOKEN = os.environ.get("INGRESS_ADMIN_TOKEN", "")
 
 
 def counts() -> dict:
@@ -123,11 +132,11 @@ def main() -> int:
     elif cmd == "reset":
         print(json.dumps(_call(f"{TELEGRAM_API}/_control/reset", {})))
     elif cmd == "status":
-        print(json.dumps(_get(f"{ADMIN}/admin/status")))
+        print(json.dumps(_get(f"{ADMIN}/admin/status", token=_ADMIN_TOKEN)))
     elif cmd == "recover":
-        print(json.dumps(_get(f"{ADMIN}/admin/recover")))
+        print(json.dumps(_get(f"{ADMIN}/admin/recover", token=_ADMIN_TOKEN)))
     elif cmd == "real-output":
-        print(json.dumps(_get(f"{INGRESS_ADMIN}/admin/real-output")))
+        print(json.dumps(_get(f"{INGRESS_ADMIN}/admin/real-output", token=_ADMIN_TOKEN)))
     elif cmd == "resolve":
         # resolve <operation_id> <actor> <action> <claim_chat_id> [ack]
         payload = {
@@ -147,7 +156,23 @@ def main() -> int:
         print(json.dumps(_call(f"{INGRESS_ADMIN}/admin/reply/resolve", payload,
                                token=None)))
     elif cmd == "audit":
-        print(json.dumps(_get(f"{INGRESS_ADMIN}/admin/audit")))
+        print(json.dumps(_get(f"{INGRESS_ADMIN}/admin/audit", token=_ADMIN_TOKEN)))
+    elif cmd == "noauth_get":
+        # noauth_get <path>  - GET an admin route with NO Authorization header, to
+        # prove the GET surface is also authenticated (review #2).
+        print(json.dumps(_get(f"{ADMIN}{sys.argv[2]}", token=None)))
+    elif cmd == "late-result":
+        # late-result <operation_id> <attempt_id> <state>
+        # Simulate a DELAYED completion callback from an OLD delivery attempt, to
+        # prove it cannot overwrite a newer resolution (review #4).
+        import ingress as _I
+        conn = _I._conn()
+        try:
+            with conn, conn.cursor() as cur:
+                applied = _I._finish(cur, sys.argv[2], sys.argv[3], sys.argv[4])
+        finally:
+            conn.close()
+        print(json.dumps({"applied": applied}))
     elif cmd == "counts":
         print(json.dumps(counts()))
     else:

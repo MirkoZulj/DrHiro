@@ -28,6 +28,11 @@ TRUSTED_HOSTS = [
     ("fake-telegram", 8081),
 ]
 
+# The trusted ingress's ADMIN surface. Bound to the ingress's loopback (not 0.0.0.0),
+# so it must be unreachable from the model-accessible network even though `ingress`
+# is on the same network (review #2). Reachability is access.
+INGRESS_ADMIN_HOST = ("ingress", 8082)
+
 SPOOL_PATHS = ["/var/spool/telegram", "/home/node/.openclaw", "/var/run/docker.sock"]
 
 
@@ -62,6 +67,7 @@ def main() -> int:
         "secret_env": secret_env(),
         "paths": [path_report(p) for p in SPOOL_PATHS],
         "reachable": {f"{h}:{p}": reachable(h, p) for h, p in TRUSTED_HOSTS},
+        "ingress_admin_reachable": reachable(*INGRESS_ADMIN_HOST),
     }
     print(json.dumps(result, indent=2))
     return 0
