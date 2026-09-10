@@ -294,3 +294,109 @@ class TestDowngradeDestructiveness:
 
 def _rowcount(conn):
     return conn.execute(text(f"SELECT count(*) FROM {SCHEMA}.activities")).scalar()
+
+
+class TestAdoptionRejectsInvalidSchemas:
+    """The adoption validator must reject invalid production-shaped tables with a
+    precise diagnostic - it must NOT accept a CHECK by loose substring, or accept a
+    table whose indexes/PK/FK/defaults are wrong.
+
+    These are the negative cases the reviewer required (wrong CHECK bound, missing/
+    wrong FK, missing/wrong PK, wrong defaults, wrong index columns).
+    """
+
+    def test_check_with_wrong_lower_bound_is_fatal(self, conn):
+        # Same shape, but CHECK allows calories_burned >= -100: that is NOT the
+        # promised >= 0 invariant.
+        conn.execute(text(f"""
+            CREATE TABLE {SCHEMA}.activities (
+                id uuid NOT NULL DEFAULT gen_random_uuid(),
+                user_id uuid NOT NULL,
+                activity_date date NOT NULL,
+                title character varying(255) NOT NULL,
+                description text,
+                calories_burned double precision NOT NULL,
+                created_at timestamp with time zone NOT NULL DEFAULT now(),
+                updated_at timestamp with time zone NOT NULL DEFAULT now(),
+                CONSTRAINT activities_pkey PRIMARY KEY (id),
+                CONSTRAINT activities_calories_burned_check
+                    CHECK (calories_burned >= -100::double precision),
+                CONSTRAINT activities_user_id_fkey FOREIGN KEY (user_id)
+                    REFERENCES users(id) ON DELETE CASCADE
+            );
+        """))
+        assert sa_act.has_calories_check(conn, SCHEMA) is False, \
+            "a >= -100 check must NOT satisfy the >= 0 invariant"
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("CHECK" in d for d in diff["fatal"]), diff["fatal"]
+        with pytest.raises(RuntimeError):
+            sa_act.reconcile_activities(conn, schema=SCHEMA)
+
+    def test_wrong_index_columns_are_fatal_not_reconciled(self, conn):
+        _create_prod_shape(conn)
+        # Index exists with the right NAME but the WRONG columns. This is the exact
+        # case the old code missed (it validated names only).
+        conn.execute(text(
+            f"ALTER INDEX {SCHEMA}.idx_activities_user_date "
+            "RENAME TO idx_activities_user_date_wrong"
+        ))
+        conn.execute(text(
+            f"CREATE INDEX idx_activities_user_date ON {SCHEMA}.activities (title)"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("idx_activities_user_date" in d and "columns" in d
+                   for d in diff["fatal"]), diff["fatal"]
+
+    def test_missing_pk_is_fatal(self, conn):
+        _create_prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities DROP CONSTRAINT activities_pkey"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("primary key" in d or "PK" in d.upper() for d in diff["fatal"]), diff["fatal"]
+
+    def test_wrong_pk_columns_are_fatal(self, conn):
+        _create_prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities DROP CONSTRAINT activities_pkey"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ADD PRIMARY KEY (title)"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("primary key" in d for d in diff["fatal"]), diff["fatal"]
+
+    def test_missing_fk_is_fatal(self, conn):
+        _create_prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities DROP CONSTRAINT activities_user_id_fkey"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("foreign key" in d.lower() for d in diff["fatal"]), diff["fatal"]
+
+    def test_wrong_fk_target_is_fatal(self, conn):
+        # An FK from user_id to a WRONG table, or with the wrong ON DELETE action,
+        # must not be accepted as equivalent to users(id) ON DELETE CASCADE.
+        _create_prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities DROP CONSTRAINT activities_user_id_fkey"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ADD CONSTRAINT activities_user_id_fkey "
+            f"FOREIGN KEY (user_id) REFERENCES {SCHEMA}.users(id) ON DELETE SET NULL"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("foreign key" in d.lower() for d in diff["fatal"]), diff["fatal"]
+
+    def test_missing_server_defaults_are_fatal(self, conn):
+        # Production has gen_random_uuid()/now() server defaults; an adopted table
+        # without them is not equivalent (app-side only is not the same).
+        _create_prod_shape(conn)
+        conn.execute(text(f"ALTER TABLE {SCHEMA}.activities ALTER COLUMN id DROP DEFAULT"))
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ALTER COLUMN created_at DROP DEFAULT"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("default" in d for d in diff["fatal"]), diff["fatal"]
+        with pytest.raises(RuntimeError):
+            sa_act.reconcile_activities(conn, schema=SCHEMA)

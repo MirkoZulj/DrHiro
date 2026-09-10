@@ -59,6 +59,15 @@ COLUMNS: dict[str, tuple[str, bool]] = {
     "updated_at": ("TIMESTAMP", False),
 }
 
+# Server defaults the adopted table must carry (substring match against the
+# canonicalised default). Measured from production: id defaults to gen_random_uuid(),
+# created_at/updated_at to now().
+EXPECTED_DEFAULTS: dict[str, str] = {
+    "id": "gen_random_uuid",
+    "created_at": "now",
+    "updated_at": "now",
+}
+
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -181,8 +190,13 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
 
     Returns {"fatal": [...], "reconcilable": [...]}.
 
-      fatal         column missing / type or nullability mismatch - needs a human
-      reconcilable  missing index or CHECK - safe to add without touching rows
+      fatal         a mismatch that must not be auto-fixed: missing/wrong column,
+                    wrong type or nullability, wrong/missing server default, wrong/
+                    missing PRIMARY KEY, wrong/missing FOREIGN KEY, an index that
+                    exists with the WRONG columns, or a CHECK that exists but is not
+                    the required `calories_burned >= 0`.
+      reconcilable  a missing index or missing CHECK - safe to add without touching
+                    rows.
     """
     fatal: list[str] = []
     reconcilable: list[str] = []
@@ -206,14 +220,78 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
                 f"column {TABLE}.{name} is {got_n}, expected {want_n}"
             )
 
-    index_names = {i["name"] for i in insp.get_indexes(TABLE, schema=schema)}
-    if ORM_INDEX not in index_names:
-        reconcilable.append(f"missing index {ORM_INDEX} (user_id)")
-    if PROD_INDEX not in index_names:
-        reconcilable.append(f"missing index {PROD_INDEX} (user_id, activity_date)")
+    # Server defaults (the promised gen_random_uuid() / now()).
+    for name, want in EXPECTED_DEFAULTS.items():
+        got = (cols.get(name) or {}).get("default") or ""
+        got_norm = re.sub(r"[^a-z0-9]", "", str(got).lower())
+        want_norm = re.sub(r"[^a-z0-9]", "", want.lower())
+        if want_norm not in got_norm:
+            fatal.append(
+                f"column {TABLE}.{name} default is {got!r}, expected containing {want}()"
+            )
 
-    if not has_calories_check(conn, schema):
-        reconcilable.append(f"missing CHECK {CHECK_NAME}")
+    # Indexes: match on DEFINITION (columns), not just name. A name with the wrong
+    # columns is fatal - it cannot be fixed by adding a differently-shaped index.
+    index_defs = {
+        i["name"]: list(i.get("column_names") or i.get("columns") or [])
+        for i in insp.get_indexes(TABLE, schema=schema)
+    }
+    for index_name, want_cols in (
+        (ORM_INDEX, ["user_id"]),
+        (PROD_INDEX, ["user_id", "activity_date"]),
+    ):
+        if index_name not in index_defs:
+            reconcilable.append(
+                f"missing index {index_name} ({', '.join(want_cols)})"
+            )
+        elif index_defs[index_name] != want_cols:
+            fatal.append(
+                f"index {index_name} columns {index_defs[index_name]} do not match "
+                f"expected {want_cols}"
+            )
+
+    # PRIMARY KEY must be activities_pkey on (id).
+    pk = insp.get_pk_constraint(TABLE, schema=schema)
+    pk_name = pk.get("name")
+    pk_cols = list(pk.get("constrained_columns") or [])
+    if pk_name != PK_NAME or pk_cols != ["id"]:
+        fatal.append(
+            f"primary key {pk_name or '<none>'}({pk_cols}) does not match "
+            f"expected {PK_NAME}(id)"
+        )
+
+    # FOREIGN KEY must be user_id -> users(id) ON DELETE CASCADE.
+    def _fk_equivalent() -> bool:
+        for fk in insp.get_foreign_keys(TABLE, schema=schema):
+            opts = fk.get("options") or {}
+            if (
+                fk.get("name") == FK_NAME
+                and list(fk.get("constrained_columns")) == ["user_id"]
+                and fk.get("referred_table") == "users"
+                and list(fk.get("referred_columns")) == ["id"]
+                and opts.get("ondelete", "NO ACTION") == "CASCADE"
+            ):
+                return True
+        return False
+
+    if not _fk_equivalent():
+        fatal.append(
+            f"foreign key {FK_NAME} (user_id -> users(id) ON DELETE CASCADE) not "
+            "found or not equivalent"
+        )
+
+    # CHECK: missing -> reconcilable; present-but-wrong -> fatal.
+    checks = _check_constraints(conn, schema)
+    if has_calories_check(conn, schema):
+        pass
+    else:
+        wrong = [f"{n} ({ddl})" for n, ddl in checks if "calories_burned" in ddl]
+        if wrong:
+            fatal.append(
+                f"CHECK(s) {', '.join(wrong)} is not the required {CHECK_EXPR}"
+            )
+        else:
+            reconcilable.append(f"missing CHECK {CHECK_NAME}")
 
     return {"fatal": fatal, "reconcilable": reconcilable}
 
@@ -274,17 +352,69 @@ def _check_constraints(conn: Connection, schema: str | None = None) -> list[tupl
     return [(r[0], r[1]) for r in rows]
 
 
+def _canon_check_expr(ddl: str) -> str:
+    """Extract and canonicalise the boolean expression of a CHECK constraint DDL.
+
+    PostgreSQL re-renders the stored expression, so `pg_get_constraintdef` returns
+    forms like:
+
+        CHECK ((calories_burned >= (0)::double precision))
+        CHECK ((calories_burned >= (- (100)::double precision)))
+
+    (casts, redundant parens, and unary minus re-rendered as `(- (N))`). This
+    normalises those to a comparable canonical form such as ``calories_burned >= 0``
+    or ``calories_burned >= -100``, so a different lower bound is correctly treated
+    as NOT equivalent to the required `>= 0`.
+    """
+    m = re.match(r"CHECK\s*\((.*)\)\s*$", ddl, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    expr = m.group(1)
+    # Remove type casts (::double precision etc.).
+    expr = re.sub(r"::\s*[a-z_][a-z_ ]*", "", expr)
+    expr = re.sub(r"\s+", " ", expr).strip()
+    # Collapse single-value parens and unary-minus re-renderings, repeatedly.
+    for _ in range(10):
+        prev = expr
+        expr = re.sub(
+            r"\(\s*(-)?\s*\(\s*(-)?\s*(\d+(?:\.\d+)?)\s*\)\s*\)", r"\1\2\3", expr
+        )
+        expr = re.sub(r"\(\s*(-)?\s*(\d+(?:\.\d+)?)\s*\)", r"\1\2", expr)
+        if expr == prev:
+            break
+    # Strip balanced outer parentheses that wrap the whole expression.
+    while expr.startswith("(") and expr.endswith(")"):
+        depth = 0
+        wraps = True
+        for i, ch in enumerate(expr):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(expr) - 1:
+                    wraps = False
+                    break
+        if wraps:
+            expr = expr[1:-1].strip()
+        else:
+            break
+    return expr.lower()
+
+
+REQUIRED_CHECK_CANON = "calories_burned >= 0"
+
+
 def has_calories_check(conn: Connection, schema: str | None = None) -> bool:
     """True when an equivalent `calories_burned >= 0` check exists.
 
-    Matched by the production constraint name OR by an equivalent expression, so a
-    differently-named equivalent check on an adopted table is recognised (and not
-    duplicated), while a table with no check at all is correctly reported missing.
+    The test is SEMANTIC (canonical expression equals `calories_burned >= 0`), not
+    nominal. A constraint that merely shares the production NAME but encodes a
+    different bound (e.g. `calories_burned >= -100`) is NOT accepted - the name alone
+    does not make it the required invariant. A differently-named equivalent check is
+    accepted (and not duplicated).
     """
-    for name, ddl in _check_constraints(conn, schema):
-        if name == CHECK_NAME:
-            return True
-        if "calories_burned" in ddl and ">=" in ddl:
+    for _name, ddl in _check_constraints(conn, schema):
+        if _canon_check_expr(ddl) == REQUIRED_CHECK_CANON:
             return True
     return False
 
