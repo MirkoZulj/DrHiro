@@ -322,3 +322,156 @@ approval. Tests are stated per step above so that "EXECUTED" never stands in for
 
 Candidate `7e2cf69` remains frozen. No production change, push, deployment, gate
 activation, or historical cleanup.
+
+---
+
+# REVISION 2 — approved corrections (supersedes conflicting text above)
+
+Development approved: isolated branch + disposable stack only. The five corrections
+below amend §1–§4. Where this revision conflicts with earlier text, **this revision
+wins**.
+
+## R1. Trusted ingress must be separated from model-accessible execution
+
+**The boundary does not exist today — measured, not assumed.** The spool lives inside
+the model-accessible container:
+
+```
+drhiro-openclaw-gateway-1 mounts:
+  /var/lib/docker/volumes/drhiro_openclaw_state/_data -> /home/node/.openclaw  (rw)
+```
+
+The same container holds `TELEGRAM_BOT_TOKEN`, `DRHIRO_TELEGRAM_BOT_TOKEN` and
+`DRHIRO_JWT_SECRET`. Therefore the earlier §1.2 proposal — *mint inside the spool
+module* — is **withdrawn**: HMAC signed by a key the untrusted runtime can read
+establishes nothing, and a spool record written by model-accessible code is not a
+trusted record.
+
+**Revised design (isolation, not cryptography):**
+
+1. A **trusted ingress container** (`drhiro-ingress`) is the **only** component with
+   the bot token and the **only** holder of the spool volume; it performs `getUpdates`
+   (single consumer), `getMe` (verified bot id), spool write, claim, resolve, persist,
+   reply.
+2. The **OpenClaw gateway keeps neither** the bot token nor the spool mount nor any
+   Telegram credential. It becomes a pure conversational engine that receives an
+   authenticated turn over an internal channel and returns text. Model-accessible
+   code therefore has nothing to read and no trusted record to modify.
+3. **Key material placement:** with HMAC, the ingress signing/verifying secret is
+   present only in `drhiro-ingress` and `drhiro-api` — never in the gateway or MCP.
+   With asymmetric signing, the **private key exists only in `drhiro-ingress`** and
+   verifiers hold the **public key only** (verifiers must never hold signing
+   capability). The plan adopts **Ed25519 asymmetric** as the target so that the API
+   verifies without holding a signing-capable secret.
+4. **Enforcement is a deployment assertion, not a convention:** a test that inspects
+   the running containers' environments/mounts and fails if the bot token, spool
+   mount, or private signing key appears in a model-accessible container.
+
+If the isolation cannot be built, the honest fallback is stated plainly: the trusted
+path cannot be claimed, and consumption writes stay closed.
+
+## R2. Credential removal is a rotation cutover, not an env-var deletion
+
+Deleting `DRHIRO_JWT_SECRET` invalidates nothing. The separately-approved cutover must
+cover: (a) generate a new signing key; (b) **reject** anything signed with the retired
+key (key-id / `kid` in the header, old kid denylisted — no dual-accept window);
+(c) reissue credentials for legitimate callers (web, Android bridge, manual tooling);
+(d) remove the old key from model-accessible env, **mounts, config files, and
+tooling**; (e) verify by inventory that it is gone.
+Tests: token signed with retired key → rejected; wrong scope/audience → rejected; a
+valid-key token's *minting origin* is **not** claimed to be distinguishable — the API
+cannot tell who minted a token under its current trusted key, and the plan says so
+explicitly.
+Secret handling: no secret values in logs, tests, or review artifacts. R2 is
+remediation of an **exposure**; presence is not evidence of abuse.
+
+## R3. Reply delivery — corrected guarantee (no exactly-once reply claim)
+
+A transactional outbox durably records intent alongside the consumption commit; it
+**cannot** guarantee exactly one Telegram reply. Verified spool semantics:
+`completeTelegramSpooledUpdateWithRetry` requires `claim.claimToken` (else
+`TelegramSpooledUpdateCompletionOwnershipError`), lease
+`TELEGRAM_SPOOLED_UPDATE_CLAIM_LEASE_MS = 1800s`, stale recovery default `staleMs =
+6h`, `TELEGRAM_SPOOLED_UPDATE_PROCESS_ID = <pid>:<uuid>`, reply fence lane =
+`accountId\0sequentialKey`, completed/failed TTL 720h (max 1000 entries). Completion
+means **"turn handled"**, not "reply delivered".
+
+Documented semantics (superseding any stronger claim):
+- **Consumption effects:** exactly once (operation key + `FOR UPDATE` + completed
+  replay). This is the guarantee we actually hold.
+- **Reply delivery:** at-least-once **attempt**, with **possible duplicate** after an
+  ambiguous send (Telegram accepted, worker crashed before recording it). A local
+  fence/completion marker does not remove the ambiguity.
+- **Unknown-delivery state:** `reply_state ∈ pending | sent | unknown | failed`, where
+  `sent` is recorded only after a response is durably saved; a send that cannot be
+  confirmed is recorded `unknown`, **not** retried automatically, and surfaced.
+- **Recovery policy:** `pending` (never attempted) → safe to send; `unknown` → never
+  auto-resent; requires an operator decision or a user-visible "already logged" path.
+- Explicitly **not** claimed: exactly-once replies. No claim rests on a stub.
+
+## R4. Migrations: validate existing state, don't skip it
+
+Measured production `activities` (read-only `\d activities`):
+
+```
+id uuid NOT NULL DEFAULT gen_random_uuid()
+user_id uuid NOT NULL            (idx_activities_user_date btree(user_id, activity_date))
+activity_date date NOT NULL
+title varchar(255) NOT NULL
+description text NULL
+calories_burned double precision NOT NULL   CHECK (calories_burned >= 0)
+created_at timestamptz NOT NULL DEFAULT now()
+updated_at timestamptz NOT NULL DEFAULT now()
+PK activities_pkey(id) · FK activities_user_id_fkey -> users(id) ON DELETE CASCADE
+```
+
+This differs from the ORM declaration (which has no CHECK, no server defaults, and an
+`index=True` on `user_id` that would name the index `ix_activities_user_id`). Adoption
+therefore must **compare** columns, types, nullability, defaults, constraints and
+indexes, then either **reconcile supported differences** or **fail with a precise
+diagnostic** — never silently skip.
+- **Ownership-aware reversal:** the migration must **not** auto-drop a pre-existing
+  table. It records whether *it* created the table (e.g. an `alembic` marker/comment
+  on the table). Downgrade drops only self-created tables; an adopted production
+  table makes **downgrade unsupported** and it fails with that message.
+- Tests: **fresh creation** (all columns/types/constraints/indexes as declared, incl.
+  the CHECK and a deterministic index name) **and adoption** of the production-shaped
+  table (validation passes; downgrade refuses).
+
+## R5. Spool handoff contract (explicit)
+
+- **Exclusive claim ownership:** one record has one claim token; completion requires
+  it (`TelegramSpooledUpdateCompletionOwnershipError` otherwise). `ownerId =
+  <pid>:<uuid>` identifies the claiming process.
+- **Lease renewal:** 1800s lease; long turns must call `refreshTelegramSpooledUpdateClaim`
+  or the claim expires mid-turn.
+- **Stale-worker fencing:** `recoverStaleTelegramSpooledUpdateClaims(staleMs=6h)`
+  reclaims abandoned claims; `isTelegramSpooledUpdateClaimOwnedByOtherLiveProcess`
+  fences a zombie worker; a reclaimed record is re-processed and must converge via
+  the consumption idempotency (not by re-writing).
+- **When completion occurs:** after the turn's effects (consumption commit + reply
+  attempt recorded) — completion is what stops re-delivery; crashing before it means
+  the record is reclaimed after the lease and re-driven.
+- **How ordinary OpenClaw processing is prevented from consuming the same record:**
+  by R1 — OpenClaw has **no spool mount and no bot token**, so it cannot poll, claim,
+  or complete. This is the structural answer; the claim protocol is defence in depth
+  among the trusted ingress's own workers.
+- **Operation binding is never model-controlled:** the write path is bound server-side
+  to the authenticated ingress credential. Forwarding `operation_id` to the model is
+  **non-authoritative**: it is an opaque reference; any model-supplied value is
+  accepted only as a lookup that must **match** the server-bound operation, and a
+  mismatch is rejected. This resolves the earlier "no identity in the turn" wording:
+  no *authoritative* identity travels to the model; a non-authoritative correlation
+  handle may.
+
+## Revised sequencing
+
+1. **R1 container split + key placement** (with the deployment assertion test).
+2. **R2 rotation cutover** (separately approved).
+3. **R4 `activities` migration** (fresh + adoption; independent, small).
+4. **R3 delivery state** (`pending|sent|unknown|failed`) + migration.
+5. **R5 trusted claim worker** against the isolated spool.
+6. Gap tests in §4.1.
+
+Tests are labelled EXECUTED or PENDING throughout; R1–R5 remain PROPOSALS until
+implemented and tested on the disposable stack.
