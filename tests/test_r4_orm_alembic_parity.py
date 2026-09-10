@@ -57,7 +57,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Pre-existing ORM tables not created by the Alembic chain (documented gap).
-NOT_IN_CHAIN = {"activities"}
+NOT_IN_CHAIN = set()  # `activities` is now created/adopted by b7c8d9e0f1a2
 
 
 def _canon_dbtype(t: str) -> str:
