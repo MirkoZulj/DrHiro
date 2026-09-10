@@ -43,7 +43,7 @@ class TestR4MigrationChain:
         """Exactly one head: the chain must be linear (no forks)."""
         heads = _script().get_heads()
         assert len(heads) == 1, f"expected single head, got {heads}"
-        assert heads[0] == "c9d0e1f2a3b4"
+        assert heads[0] == "9a1b2c3d4e5f"
 
     def test_food_baseline_is_chain_root(self):
         """The food-domain baseline (b2f3c4d5e6f7) is the new base (down_revision None)."""
