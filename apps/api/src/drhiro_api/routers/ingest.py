@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from drhiro_api.config import get_settings
 from drhiro_api.db import get_db
+from drhiro_api.routers.telegram_ingress import require_model_writer_allowed
 from drhiro_api.deps import get_current_user
 from drhiro_api.models import DeviceConnection, IngestBatch, Measurement, User
 from drhiro_api.security import audit
@@ -255,7 +256,7 @@ def manual_bp(req: ManualBloodPressureRequest, user: User = Depends(get_current_
     return ManualResult(id=str(m.id), metric_type=MetricType.BLOOD_PRESSURE, recorded_at=m.start_at)
 
 
-@router.post("/manual/water", response_model=ManualResult)
+@router.post("/manual/water", response_model=ManualResult, dependencies=[Depends(require_model_writer_allowed)])
 def manual_water(req: ManualWaterRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     cat = req.category if req.category in LIQUID_CATEGORIES else "water"
     m = _manual_measurement(db, user, MetricType.WATER, {"amount_ml": req.amount_ml, "category": cat}, req.measured_at)
@@ -304,7 +305,7 @@ class ManualLiquidResult(BaseModel):
     error: str | None = None
 
 
-@router.post("/manual/liquid", response_model=ManualLiquidResult)
+@router.post("/manual/liquid", response_model=ManualLiquidResult, dependencies=[Depends(require_model_writer_allowed)])
 def manual_liquid(req: ManualLiquidRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Reconciliation-aware manual liquid logging.
 
@@ -508,7 +509,7 @@ def _parse_text_measurements(text: str) -> tuple[list[tuple[str, dict]], str]:
     return parsed, rest.strip()
 
 
-@router.post("/manual/text", response_model=ManualTextResult)
+@router.post("/manual/text", response_model=ManualTextResult, dependencies=[Depends(require_model_writer_allowed)])
 def manual_text(req: ManualTextRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Natural-language measurement logging via deterministic parsing.
 

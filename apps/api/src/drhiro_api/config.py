@@ -34,6 +34,20 @@ class Settings(BaseSettings):
     # OpenClaw service identity (signed tool calls)
     openclaw_service_token: str = ""
 
+    # --- T1 trusted Telegram ingress ---------------------------------------
+    # Shared secret the telegram-bridge uses to sign trusted events. Absent =>
+    # the ingress endpoint fails closed.
+    telegram_ingress_secret: str = ""
+    # The VERIFIED bot identity (Telegram getMe.id), established by provisioning.
+    # Absent/ambiguous => the ingress endpoint fails closed.
+    telegram_bot_id: str = ""
+    # When true, the trusted worker owns Telegram consumption writes.
+    telegram_ingress_enabled: bool = False
+    # When false, the legacy model-driven consumption writers are closed so the
+    # conversational model cannot log a consumption by itself. Manual and
+    # other authenticated callers keep their explicit idempotency contract.
+    legacy_consumption_writers_enabled: bool = True
+
     # LLM for food-rule extraction (OpenAI-compatible endpoint)
     llm_api_url: str = "https://openrouter.ai/api/v1"
     llm_api_key: str = ""

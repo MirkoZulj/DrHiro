@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload
 
 from drhiro_api.db import get_db
+from drhiro_api.routers.telegram_ingress import require_model_writer_allowed
 from drhiro_api.deps import get_current_user
 from drhiro_api.food_search import nutrient_map, resolve_food
 from drhiro_api.models import Food, FoodCatalogItem, FoodNutrient, Meal, MealItem, Nutrient, User
@@ -368,7 +369,7 @@ def _owned_meal(db: Session, meal_id: str, user: User) -> Meal:
     return meal
 
 
-@router.post("", response_model=MealOut)
+@router.post("", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     meal = Meal(
         user_id=user.id,
@@ -414,7 +415,7 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
     return _meal_to_out(meal)
 
 
-@router.post("/from-text", response_model=MealOut)
+@router.post("/from-text", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def create_meal_from_text(req: MealCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Natural-language meal logging.
 
@@ -432,7 +433,7 @@ class PhotoDraftOut(BaseModel):
     message: str = "Draft created. Confirm before this meal becomes official."
 
 
-@router.post("/from-photo", response_model=PhotoDraftOut)
+@router.post("/from-photo", response_model=PhotoDraftOut, dependencies=[Depends(require_model_writer_allowed)])
 async def create_meal_from_photo(
     file: UploadFile = File(...),
     caption: str | None = None,
@@ -474,7 +475,7 @@ class BarcodeRequest(BaseModel):
     quantity: float = Field(default=1.0, ge=0.1, le=100)
 
 
-@router.post("/from-barcode", response_model=MealOut)
+@router.post("/from-barcode", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def create_meal_from_barcode(req: BarcodeRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     cat = _catalog()
     try:
@@ -566,7 +567,7 @@ class MealPatchRequest(BaseModel):
     eaten_at: datetime | None = None
 
 
-@router.patch("/{meal_id}", response_model=MealOut)
+@router.patch("/{meal_id}", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def patch_meal(meal_id: str, req: MealPatchRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     meal = (
         db.query(Meal)
@@ -599,7 +600,7 @@ class MealItemPatch(BaseModel):
     external_id: str | None = None
 
 
-@router.patch("/{meal_id}/items/{item_id}", response_model=MealOut)
+@router.patch("/{meal_id}/items/{item_id}", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Correct one item of a meal AND re-resolve its nutrition.
 
@@ -667,7 +668,7 @@ def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User =
     return _meal_to_out(meal)
 
 
-@router.post("/{meal_id}/items", response_model=MealOut)
+@router.post("/{meal_id}/items", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Add one item to an existing meal, resolving nutrition like create does.
 
@@ -749,7 +750,7 @@ def remove_meal_item(meal_id: str, item_id: str, user: User = Depends(get_curren
     return _meal_to_out(meal)
 
 
-@router.post("/{meal_id}/confirm", response_model=MealOut)
+@router.post("/{meal_id}/confirm", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def confirm_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     meal = (
         db.query(Meal)

@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from drhiro_api.config import get_settings
 from drhiro_api.routers import auth, auth_web, dashboard, datapoints, import_csv, ingest, meals, openclaw_tools, privacy, reminders
 from drhiro_api.routers import settings as settings_router
+from drhiro_api.routers import telegram_ingress as telegram_ingress_router
 from drhiro_api.routers.xiaomi_csv import router as xiaomi_csv_router
 
 settings = get_settings()
@@ -52,3 +53,4 @@ app.include_router(privacy.router, prefix="/api/v1")
 app.include_router(datapoints.router, prefix="/api/v1")
 app.include_router(openclaw_tools.router, prefix="/api/v1")
 app.include_router(settings_router.router, prefix="/api/v1")
+app.include_router(telegram_ingress_router.router, prefix="/api/v1")
