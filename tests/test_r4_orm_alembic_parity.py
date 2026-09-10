@@ -48,6 +48,14 @@ TEST_DB_URL = os.environ.get(
     "postgresql+psycopg2://drhiro:drhiro@localhost:5435/drhiro_r4test_alembic",
 )
 
+# Requirement: an ALEMBIC-BUILT database (no create_all). Skipped unless opted
+# in, so the default (create_all-based) suite is unaffected:
+#   DRHIRO_R4_ALEMBIC_DB=1 DRHIRO_TEST_DB_URL=<alembic-db>
+pytestmark = pytest.mark.skipif(
+    os.environ.get("DRHIRO_R4_ALEMBIC_DB") != "1",
+    reason="requires an Alembic-built DB; set DRHIRO_R4_ALEMBIC_DB=1",
+)
+
 # Pre-existing ORM tables not created by the Alembic chain (documented gap).
 NOT_IN_CHAIN = {"activities"}
 
