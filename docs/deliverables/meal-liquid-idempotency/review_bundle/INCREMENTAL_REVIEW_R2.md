@@ -252,7 +252,44 @@ queue.
 
 ---
 
-## 6. Open items (unchanged)
+## 6. Executed vs pending
+
+**EXECUTED and passing (all on the disposable stack or disposable databases):**
+
+| Suite | Result | Gate |
+|---|---|---|
+| `tests/test_t1_isolated_ingress_stack.py` | **28 passed** | `DRHIRO_ISOLATED_STACK=1` |
+| `tests/test_r1_stack_isolation.py` | **14 passed** | in the default suite |
+| `tests/test_r2_trusted_key_set.py` | **17 passed** | default |
+| `tests/test_r4_activities_migration.py` | **11 passed** | `DRHIRO_ACTIVITIES_MIGRATION_DB=1` |
+| default suite | **363 passed / 85 skipped / 0 errors** | — |
+
+The stack suite includes the real-output tests, duplicate-delivery and concurrent-writer
+assertions, and the seven resolution tests (authentication, ownership, acknowledge,
+resend refusal without acknowledgement, traceable resend that never recreates the
+consumption, concurrent resolution, and refusal on a non-resolvable state).
+
+Recorded environment: PostgreSQL **16.15** (Alpine, disposable) — the local test
+databases are 16.14; both are 16.x, consistent with the catalog finding in §3 of the
+prior revision. Alembic revision at head in the stack: **`b7c8d9e0f1a2`**, produced by
+the real chain. Image tags and immutable digests are captured in
+`evidence/incremental_evidence.txt`.
+
+**PENDING (not implemented — do not read as accepted):**
+
+- Production container split; `drhiro-ingress` is a role in a disposable stack.
+- Production rotation cutover for **every** credential in §3, including
+  `DRHIRO_JWT_SECRET`.
+- Porting receipt/claim logic into the real ingress; wiring its real spool; upgrade
+  fail-safe.
+- Real OpenClaw compatibility with the boundary (application, not topology).
+- User-facing surface for `unknown` resolution (the stack exposes the trusted admin
+  endpoint only).
+- Production-mirror value preservation (still open).
+- R6 cutover / rollback plan (still open).
+- R1 partial · R2 production rotation open · R4 production-mirror preservation open.
+
+## 7. Open items (unchanged)
 
 - **Production-mirror value preservation** — still open; not run.
 - **R6 cutover / rollback plan** — still open.
