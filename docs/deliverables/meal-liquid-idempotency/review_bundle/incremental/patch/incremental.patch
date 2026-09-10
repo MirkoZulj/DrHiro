@@ -2750,10 +2750,10 @@ index 0000000..2571985
 +    sys.exit(main())
 diff --git a/deploy/disposable/build_incremental_archive.py b/deploy/disposable/build_incremental_archive.py
 new file mode 100644
-index 0000000..85c6264
+index 0000000..b826660
 --- /dev/null
 +++ b/deploy/disposable/build_incremental_archive.py
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,269 @@
 +#!/usr/bin/env python3
 +"""Build the incremental review archive for the R2 checkpoint.
 +
@@ -2775,6 +2775,7 @@ index 0000000..85c6264
 +import os
 +import shutil
 +import subprocess
++import tempfile
 +import sys
 +from pathlib import Path
 +
@@ -2839,6 +2840,11 @@ index 0000000..85c6264
 +                          check=True).stdout.strip()
 +
 +
++def run_in(cwd: Path, *cmd: str) -> str:
++    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
++                          check=True).stdout.strip()
++
++
 +def sha256_file(path: Path) -> str:
 +    h = hashlib.sha256()
 +    with path.open("rb") as fh:
@@ -2863,15 +2869,65 @@ index 0000000..85c6264
 +    BUILD.mkdir(parents=True)
 +
 +    # 1. Incremental patch: frozen candidate -> head, excluding the stale binary.
++    # Excluded from the textual patch: binaries git cannot represent as a patch, and
++    # generated artifacts. The frozen release archive is deliberately excluded - it is
++    # delivered separately and must stay byte-identical.
++    EXCLUDE = [
++        ":(exclude)drhiro_meal_liquid_review_bundle_FINAL.tar.gz",
++        ":(exclude)docs/deliverables/meal-liquid-idempotency/review_bundle/rebuilt.tar.gz",
++        ":(exclude)docs/deliverables/meal-liquid-idempotency/review_bundle/incremental/*",
++        ":(exclude)docs/deliverables/meal-liquid-idempotency/review_bundle"
++        "/incremental_review_bundle_R2.tar.gz",
++    ]
 +    patch = subprocess.run(
-+        ["git", "diff", FROZEN, head, "--", ".",
-+         ":(exclude)drhiro_meal_liquid_review_bundle_FINAL.tar.gz"],
++        ["git", "diff", FROZEN, head, "--", ".", *EXCLUDE],
 +        cwd=REPO, capture_output=True, text=True, check=True).stdout
 +    patch_dir = BUILD / "patch"
 +    patch_dir.mkdir()
 +    (patch_dir / "incremental.patch").write_text(patch)
-+    # Applied from the repository root, so a reviewer can reproduce the delta:
-+    run("git", "apply", "--check", str(patch_dir / "incremental.patch"))
++
++    # Verify the patch applies to a CLEAN CHECKOUT OF THE BASE, not to the current
++    # tree (which already contains the changes, so --check would fail by definition).
++    verify_dir = Path(tempfile.mkdtemp(prefix="incr-verify-"))
++    try:
++        subprocess.run(["git", "worktree", "add", "--detach", str(verify_dir), FROZEN],
++                       cwd=REPO, capture_output=True, text=True, check=True)
++        subprocess.run(["git", "apply", "--check",
++                        str(patch_dir / "incremental.patch")],
++                       cwd=verify_dir, capture_output=True, text=True, check=True)
++        # Apply for real, and confirm the resulting tree equals HEAD for the payload.
++        subprocess.run(["git", "apply", str(patch_dir / "incremental.patch")],
++                       cwd=verify_dir, capture_output=True, text=True, check=True)
++        # Stage so newly-added files appear in the diff (git apply without --index
++        # leaves them untracked, which would under-report the patch).
++        run_in(verify_dir, "git", "add", "-A")
++        applied = run_in(verify_dir, "git", "diff", "--cached", "--stat")
++        summary = applied.splitlines()[-1] if applied.splitlines() else "no diff"
++        print(f"patch verified against clean base {FROZEN[:12]}: applies cleanly")
++        print(f"  reconstructed delta: {summary}")
++
++        # Every payload file must be byte-identical after reconstruction. This is the
++        # real check: the patch, not just the listing, must reproduce the artifacts.
++        mismatches = []
++        for rel in PAYLOAD:
++            head_file = REPO / rel
++            if not head_file.exists():
++                continue
++            recon = verify_dir / rel
++            if not recon.exists() or sha256_file(recon) != sha256_file(head_file):
++                mismatches.append(rel)
++        # review answers + manifest are generated/derived, not part of the patch.
++        generated = {"REVIEW_ANSWERS.md", "BASE_AND_HEAD.md", "MANIFEST.sha256"}
++        mismatches = [m for m in mismatches if Path(m).name not in generated]
++        if mismatches:
++            print(f"  WARNING: {len(mismatches)} payload files not reproduced by the "
++                  f"patch: {mismatches[:5]}")
++        else:
++            print(f"  all {len(PAYLOAD)} payload files reproduced byte-identically")
++    finally:
++        subprocess.run(["git", "worktree", "remove", "--force", str(verify_dir)],
++                       cwd=REPO, capture_output=True, text=True)
++        shutil.rmtree(verify_dir, ignore_errors=True)
 +
 +    # 2. Payload files, preserving their repository-relative paths.
 +    copied = []

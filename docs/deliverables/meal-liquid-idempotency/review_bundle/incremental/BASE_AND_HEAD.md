@@ -2,7 +2,7 @@
 
 - **Base (frozen candidate):** `7e2cf6915dbd7478e8a558817d4d51aa63879e60`
 - **Packaging commit of the frozen archive:** `8870a4e`
-- **Head of this incremental artifact:** `8167af385163aff882ba63b3200359335803b5c8`
+- **Head of this incremental artifact:** `ee3f24b54f80723dbbe913d3c77b42cd0e571e8c`
 
 Base/head as *decided* by the reviewer: the base is the frozen candidate
 `7e2cf69`, the version pinned for review. `8870a4e` is the (later)
