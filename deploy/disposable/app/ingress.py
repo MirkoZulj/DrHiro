@@ -30,6 +30,7 @@ import json
 import os
 import socket
 import sys
+import hmac
 import threading
 import time
 import urllib.error
@@ -41,11 +42,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import psycopg2
 import psycopg2.extras
 from sqlalchemy import create_engine, select
+from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 sys.path.insert(0, "/app/drhiro_src")
 from drhiro_api.models import ConsumptionOperation, User  # noqa: E402
+
+# The REAL T1 services. The slice must exercise the actual single write path, not
+# fabricate a completed operation row: parse -> resolve nutrition -> write, which is
+# what produces meal items, liquid measurements and the 6-nutrient totals.
+from drhiro_api.services.consumption import (  # noqa: E402
+    _compute_payload_hash,
+    get_or_create_operation,
+    parse_consumption_text,
+    resolve_item_nutrition,
+    write_consumption,
+)
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_API = os.environ["TELEGRAM_API_URL"]
@@ -156,6 +169,30 @@ def claim_receipt(cur, event_key: str) -> dict | None:
     }
 
 
+def fail_receipt(cur, event_key: str, claim_token: str, error: str) -> bool:
+    """Release a claim after a processing error so the update is retried promptly.
+
+    Waiting for the lease to expire also works, but it wastes the whole lease (60s by
+    default) on a transient error. This records the error and the attempt count, and
+    clears the claim so the next poll retries. Safe because `write_consumption` is
+    transactional: a failure leaves no partial consumption behind.
+    """
+    cur.execute(
+        """
+        UPDATE telegram_receipts
+           SET status = 'received',
+               claim_token = NULL,
+               claimed_by = NULL,
+               lease_expires_at = NULL,
+               attempts = attempts + 1,
+               last_error = %s
+         WHERE event_key = %s AND claim_token = %s
+        """,
+        (error[:500], event_key, claim_token),
+    )
+    return cur.rowcount == 1
+
+
 def complete_receipt(cur, event_key: str, claim_token: str, operation_id: uuid.UUID) -> bool:
     """Completion requires the claim token - the ownership check."""
     cur.execute(
@@ -175,66 +212,89 @@ def complete_receipt(cur, event_key: str, claim_token: str, operation_id: uuid.U
 
 def persist_consumption(*, event_key, bot_id, chat_id, message_id, text,
                         digest) -> tuple[uuid.UUID, bool]:
-    """Persist into the REAL T1 tables and record reply intent in the SAME commit.
+    """Persist through the REAL T1 consumption service.
 
-    Returns (operation_id, created). `created=False` means the natural Telegram key
-    already existed: a replay, which must not produce a second consumption.
+    Exercises the genuine path end to end:
+
+        parse_consumption_text      -> real parser (quantities, units, beverages)
+        get_or_create_operation     -> trusted Telegram identity, fail-closed,
+                                       atomic ON CONFLICT on the natural key
+        resolve_item_nutrition      -> real DB-first resolution (no network: the
+                                       disposable stack seeds a food catalog)
+        write_consumption           -> THE single write path: meal row, meal_items,
+                                       Measurement + BeverageMeasurement for liquids,
+                                       6-nutrient totals, durable operation result
+
+    Reply intent is inserted with the SAME session, so `write_consumption`'s commit
+    commits it atomically with the consumption. Returns (operation_id, created);
+    created=False is a replay against the natural Telegram key and must never write a
+    second consumption or a second meal.
     """
     with Session(_engine) as session:
         user_id = ensure_user(session)
-        op = session.execute(
-            select(ConsumptionOperation).where(
-                ConsumptionOperation.user_id == user_id,
-                ConsumptionOperation.source_bot_id == bot_id,
-                ConsumptionOperation.source_chat_id == chat_id,
-                ConsumptionOperation.source_message_id == message_id,
-            )
-        ).scalar_one_or_none()
 
-        if op is not None:
-            return op.id, False
+        # Real parser. Non-consumption chatter parses to zero items; that is not an
+        # error and must not create a consumption.
+        items = parse_consumption_text(text or "")
+        payload_hash = _compute_payload_hash(items) if items else digest
 
-        op = ConsumptionOperation(
-            user_id=user_id,
+        op, created = get_or_create_operation(
+            session,
+            str(user_id),
             source="telegram",
-            source_bot_id=bot_id,
-            source_chat_id=chat_id,
-            source_message_id=message_id,
+            source_chat_id=str(chat_id),
+            source_message_id=str(message_id),
+            source_bot_id=str(bot_id),
             raw_text=text,
-            payload_hash=digest,
-            status="completed",
-            result_json={"items": 1, "via": "trusted-ingress"},
+            payload_hash=payload_hash,
         )
-        session.add(op)
-        try:
-            session.flush()
-        except IntegrityError:
-            session.rollback()
-            existing = session.execute(
-                select(ConsumptionOperation).where(
-                    ConsumptionOperation.user_id == user_id,
-                    ConsumptionOperation.source_bot_id == bot_id,
-                    ConsumptionOperation.source_chat_id == chat_id,
-                    ConsumptionOperation.source_message_id == message_id,
-                )
-            ).scalar_one()
-            log("consumption_conflict_replayed", event_key=event_key)
-            return existing.id, False
 
-        # Transactional intent: same transaction as the consumption commit.
+        if not created and op.status == "completed" and op.result_json:
+            # Replay: the consumption already happened. No second meal, no second
+            # outbox row, no second delivery.
+            op_id = op.id
+            session.rollback()          # nothing to write; keep the read side clean
+            log("consumption_replayed", event_key=event_key, operation_id=str(op_id))
+            return op_id, False
+
+        if not items:
+            # Nothing to log: complete the operation with an explicit empty result so
+            # a redelivery is equally inert.
+            op.status = "completed"
+            op.result_json = {"ok": True, "data": {"items": [], "totals": None},
+                              "message": "No consumable items recognised."}
+            session.commit()
+            return op.id, created
+
+        resolved = [resolve_item_nutrition(session, it) for it in items]
+
+        # Transactional reply intent. Inserted BEFORE write_consumption so that the
+        # single commit inside it covers both the consumption and this row.
+        # NOTE: sql_text, not text - `text` is the message parameter in this scope.
         session.execute(
-            __import__("sqlalchemy").text(
+            sql_text(
                 """
                 INSERT INTO reply_outbox (operation_id, event_key, chat_id, body)
                 VALUES (:op, :ek, :chat, :body)
                 ON CONFLICT (operation_id) DO NOTHING
                 """
             ),
-            {"op": str(op.id), "ek": event_key, "chat": chat_id,
-             "body": f"Logged: {text}"},
+            {"op": str(op.id), "ek": event_key, "chat": str(chat_id),
+             "body": text or ""},
         )
-        session.commit()
-        log("t1_persisted_with_reply_intent", event_key=event_key, operation_id=str(op.id))
+        session.flush()
+
+        # THE real write path. Commits the consumption, the meal items, the liquid
+        # measurements and the reply intent together.
+        result = write_consumption(
+            session, str(user_id), resolved, operation_id=op.id,
+        )
+
+        totals = (result.get("data") or {}).get("totals")
+        log("t1_persisted_with_reply_intent", event_key=event_key,
+            operation_id=str(op.id), items=len(resolved),
+            meal_id=(result.get("data") or {}).get("meal_id"),
+            kcal=(totals or {}).get("kcal"))
         return op.id, True
 
 
@@ -280,7 +340,8 @@ def deliver_reply(operation_id, chat_id: str, body: str) -> str:
                 return "skipped"
 
         try:
-            _api("sendMessage", {"chat_id": chat_id, "text": body})
+            _api("sendMessage", {"chat_id": chat_id,
+                                 "text": body or "Logged."})
         except urllib.error.HTTPError as exc:
             # A RESPONSE came back and the send was refused (429/5xx before
             # acceptance). Nothing was delivered, so a retry is known-safe.
@@ -415,10 +476,19 @@ def consume_once(bot_id: str) -> int:
                 log("receipt_claimed", event_key=event_key, claim_token=claim["claim_token"])
 
             # --- outside the transaction: T1 persistence + reply intent ---
-            op_id, created_op = persist_consumption(
-                event_key=event_key, bot_id=bot_id, chat_id=chat_id,
-                message_id=message_id, text=text, digest=digest,
-            )
+            try:
+                op_id, created_op = persist_consumption(
+                    event_key=event_key, bot_id=bot_id, chat_id=chat_id,
+                    message_id=message_id, text=text, digest=digest,
+                )
+            except Exception as exc:
+                # Release the claim so the update retries instead of being stranded
+                # in 'processing' until the lease expires.
+                with conn, conn.cursor() as cur:
+                    released = fail_receipt(cur, event_key, claim["claim_token"], repr(exc))
+                log("consume_failed_claim_released", event_key=event_key,
+                    released=released, error=repr(exc))
+                continue
 
             with conn, conn.cursor() as cur:
                 if not complete_receipt(cur, event_key, claim["claim_token"], op_id):
@@ -446,6 +516,193 @@ def _safe_ack(update_ids: list[int]):
         _api("ack", {"update_ids": update_ids})
     except Exception:
         pass
+
+
+
+# --------------------------------------------------------------------------- #
+# reply resolution (the `unknown` state)
+# --------------------------------------------------------------------------- #
+
+ADMIN_TOKEN = os.environ.get("INGRESS_ADMIN_TOKEN", "")
+
+RESOLVABLE_STATES = ("unknown", "failed")
+
+
+class ResolutionError(Exception):
+    def __init__(self, code: str, http_status: int = 400, **extra):
+        super().__init__(code)
+        self.code, self.http_status, self.extra = code, http_status, extra
+
+
+def _authorised(header: str | None) -> bool:
+    """Bearer-token auth for the resolution action.
+
+    The token is delivered to the trusted ingress only; it is never mounted into a
+    model-accessible container. An unset token means resolution is DISABLED (fail
+    closed) rather than open.
+    """
+    if not ADMIN_TOKEN:
+        return False
+    if not header or not header.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(header[len("Bearer "):].strip(), ADMIN_TOKEN)
+
+
+def resolve_reply(*, operation_id: str, actor: str, action: str,
+                  claim_chat_id: str, note: str | None = None,
+                  duplicate_risk_ack: bool = False) -> dict:
+    """Resolve an `unknown`/`failed` reply intent. Ownership-checked and audited.
+
+    action="acknowledge": record that the ambiguity is accepted and no resend will
+        be attempted. Terminal; the consumption is untouched.
+    action="resend":      perform an explicit new delivery attempt. Requires
+        duplicate_risk_ack=True, because delivery may ALREADY have happened. The
+        attempt is recorded, and the consumption is NEVER recreated or re-run.
+
+    Concurrency: the outbox row is locked FOR UPDATE and its state re-checked, so two
+    simultaneous resolutions cannot both act. The loser gets state_changed.
+    """
+    if action not in ("acknowledge", "resend"):
+        raise ResolutionError("unknown_action")
+
+    if action == "resend" and not duplicate_risk_ack:
+        raise ResolutionError("duplicate_risk_not_acknowledged")
+
+    conn = _conn()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT o.operation_id, o.chat_id, o.body, o.reply_state, o.attempts,
+                           (SELECT count(*) FROM reply_audit a
+                             WHERE a.operation_id = o.operation_id
+                               AND a.action = 'resend') AS resends
+                      FROM reply_outbox o
+                     WHERE o.operation_id = %s
+                     FOR UPDATE
+                    """,
+                    (str(operation_id),),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise ResolutionError("not_found", http_status=404)
+
+                # Ownership: the caller must be bound to the chat that owns the reply.
+                cur.execute(
+                    "SELECT owner_id FROM reply_owners WHERE chat_id = %s",
+                    (row["chat_id"],),
+                )
+                owner = cur.fetchone()
+                if owner is None or owner["owner_id"] != claim_chat_id:
+                    raise ResolutionError("not_owner", http_status=403)
+
+                if row["reply_state"] not in RESOLVABLE_STATES:
+                    raise ResolutionError(
+                        "state_changed", http_status=409,
+                        current_state=row["reply_state"],
+                    )
+
+                from_state = row["reply_state"]
+                attempt_no = int(row["attempts"]) + int(row["resends"])
+
+                if action == "acknowledge":
+                    to_state = "resolved_acknowledged"
+                    cur.execute(
+                        """
+                        UPDATE reply_outbox
+                           SET reply_state = %s, resolved_by = %s, resolved_at = now(),
+                               updated_at = now()
+                         WHERE operation_id = %s
+                        """,
+                        (to_state, actor, str(operation_id)),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO reply_audit (operation_id, actor, action, from_state,
+                                                 to_state, delivery_attempt, detail)
+                        VALUES (%s, %s, 'acknowledge', %s, %s, %s, %s)
+                        """,
+                        (str(operation_id), actor, from_state, to_state, attempt_no,
+                         note or "ambiguity accepted; no resend attempted"),
+                    )
+                    return {"ok": True, "action": action, "to_state": to_state,
+                            "delivery_attempt": attempt_no, "consumption_untouched": True}
+
+                # --- explicit resend -------------------------------------------------
+                # A new, separately counted delivery attempt. Nothing about the
+                # consumption is touched: we do not re-run the write path.
+                #
+                # CRITICAL ORDERING: transition the row OUT of the resolvable set
+                # inside this locked transaction, BEFORE releasing the lock. The send
+                # happens after the lock is dropped (a slow network call must not
+                # block other work), so without this claim the state would still read
+                # 'unknown' while the resend is in flight and a second resolver would
+                # pass its own state check - both would act. Marking 'in_flight' (not
+                # resolvable) makes the loser observe a state it cannot resolve.
+                cur.execute(
+                    """
+                    UPDATE reply_outbox
+                       SET reply_state = 'in_flight', resolved_by = %s,
+                           in_flight_at = now(), updated_at = now()
+                     WHERE operation_id = %s
+                    """,
+                    (actor, str(operation_id)),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO reply_audit (operation_id, actor, action, from_state,
+                                             to_state, delivery_attempt, detail)
+                    VALUES (%s, %s, 'resend', %s, 'in_flight', %s, %s)
+                    """,
+                    (str(operation_id), actor, from_state, attempt_no + 1,
+                     note or "explicit resend after ambiguous delivery; "
+                             "delivery may already have occurred"),
+                )
+
+        # Send OUTSIDE the transaction that holds the lock, so a slow network call
+        # does not block other work. The audit row above is already durable.
+        try:
+            _api("sendMessage", {"chat_id": row["chat_id"],
+                                 "text": row["body"] or "Logged."})
+            outcome, to_state, error = "delivered", "resolved_resent", None
+        except urllib.error.HTTPError as exc:
+            outcome, to_state, error = "refused", "failed", f"HTTP {exc.code}"
+        except Exception as exc:
+            # Ambiguous again: the resend itself may have been delivered.
+            outcome, to_state, error = "ambiguous", "unknown", repr(exc)
+
+        conn2 = _conn()
+        try:
+            with conn2:
+                with conn2.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE reply_outbox
+                           SET reply_state = %s, last_error = %s, resolved_by = %s,
+                               resolved_at = now(), updated_at = now()
+                         WHERE operation_id = %s
+                        """,
+                        (to_state, error, actor, str(operation_id)),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO reply_audit (operation_id, actor, action, from_state,
+                                                 to_state, delivery_attempt, detail)
+                        VALUES (%s, %s, 'resend', 'in_flight', %s, %s, %s)
+                        """,
+                        (str(operation_id), actor, to_state, attempt_no + 1,
+                         f"resend outcome={outcome} error={error}"),
+                    )
+        finally:
+            conn2.close()
+
+        log("reply_resolved", operation_id=str(operation_id), actor=actor,
+            action=action, outcome=outcome, delivery_attempt=attempt_no + 1)
+        return {"ok": True, "action": action, "outcome": outcome, "to_state": to_state,
+                "delivery_attempt": attempt_no + 1, "consumption_untouched": True}
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -484,7 +741,123 @@ class AdminHandler(BaseHTTPRequestHandler):
                                    "owner": _process_owner})
             finally:
                 conn.close()
+        if self.path == "/admin/audit":
+            conn = _conn()
+            try:
+                with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        SELECT id, operation_id, actor, action, from_state, to_state,
+                               delivery_attempt, detail, created_at
+                          FROM reply_audit ORDER BY id
+                        """
+                    )
+                    rows = [dict(r) for r in cur.fetchall()]
+                return self._json({"ok": True, "audit": rows})
+            finally:
+                conn.close()
+        if self.path == "/admin/real-output":
+            # What the REAL consumption service actually produced. Used by the tests
+            # to assert on meal items, nutrition, liquid measurements and projections
+            # rather than merely on a completed operation row.
+            conn = _conn()
+            try:
+                with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        SELECT m.id AS meal_id, m.meal_type, m.totals_json
+                          FROM meals m ORDER BY m.created_at
+                        """
+                    )
+                    meals = [dict(r) for r in cur.fetchall()]
+                    cur.execute(
+                        """
+                        SELECT mi.id, mi.display_name, mi.grams, mi.volume_ml,
+                               mi.beverage_category, mi.meal_id
+                          FROM meal_items mi ORDER BY mi.display_name
+                        """
+                    )
+                    items = [dict(r) for r in cur.fetchall()]
+                    cur.execute(
+                        """
+                        SELECT id, metric_type, unit, value_json, source_operation_id,
+                               source_item_id, meal_item_id
+                          FROM measurements WHERE source_provider = 'consumption'
+                         ORDER BY created_at
+                        """
+                    )
+                    measurements = [dict(r) for r in cur.fetchall()]
+                    cur.execute("SELECT count(*) AS n FROM beverage_measurements")
+                    bev_links = cur.fetchone()["n"]
+                    cur.execute(
+                        "SELECT count(*) AS n FROM consumption_operations WHERE status = 'completed'"
+                    )
+                    completed_ops = cur.fetchone()["n"]
+                    cur.execute("SELECT count(*) AS n FROM consumption_operations")
+                    all_ops = cur.fetchone()["n"]
+                return self._json({
+                    "ok": True, "meals": meals, "meal_items": items,
+                    "measurements": measurements, "beverage_measurements": bev_links,
+                    "completed_operations": completed_ops,
+                    "total_operations": all_ops,
+                })
+            finally:
+                conn.close()
         return self._json({"ok": False}, 404)
+
+    def do_POST(self):
+        if self.path != "/admin/reply/resolve":
+            return self._json({"ok": False}, 404)
+
+        if not _authorised(self.headers.get("Authorization")):
+            return self._json({"ok": False, "error": "unauthorised"}, 401)
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            return self._json({"ok": False, "error": "bad_json"}, 400)
+
+        try:
+            result = resolve_reply(
+                operation_id=payload["operation_id"],
+                actor=payload.get("actor") or "unknown",
+                action=payload.get("action", ""),
+                claim_chat_id=str(payload.get("claim_chat_id", "")),
+                note=payload.get("note"),
+                duplicate_risk_ack=bool(payload.get("duplicate_risk_ack", False)),
+            )
+        except ResolutionError as exc:
+            body = {"ok": False, "error": exc.code, **exc.extra}
+            return self._json(body, exc.http_status)
+        except KeyError as exc:
+            return self._json({"ok": False, "error": f"missing_field:{exc}"}, 400)
+        return self._json(result)
+
+
+def _register_owner_bindings():
+    """Bind the Telegram user to their chat, for ownership-checked resolution.
+
+    Owned by the TRUSTED side: the binding is established from configuration the
+    model-accessible containers never see, and resolution is refused unless the
+    caller's claim matches it.
+    """
+    owner = os.environ.get("REPLY_OWNER_ID")
+    if not owner:
+        return
+    conn = _conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO reply_owners (chat_id, owner_id)
+                    VALUES (%s, %s) ON CONFLICT (chat_id) DO NOTHING
+                    """,
+                    (owner, owner),
+                )
+    finally:
+        conn.close()
 
 
 def _serve_admin():
@@ -504,6 +877,7 @@ def main():
         raise SystemExit("database unreachable")
 
     bot_id = verified_bot_id()
+    _register_owner_bindings()
     threading.Thread(target=_serve_admin, daemon=True).start()
 
     # Recovery first (pending is safe; abandonment becomes unknown).

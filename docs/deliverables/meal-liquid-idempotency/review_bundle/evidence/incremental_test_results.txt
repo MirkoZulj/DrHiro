@@ -1,0 +1,91 @@
+=== disposable stack suite (DRHIRO_ISOLATED_STACK=1) ===
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /home/mirko/work/DrHiro/.venv/bin/python
+rootdir: /home/mirko/work/DrHiro
+plugins: asyncio-1.4.0, anyio-4.15.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 28 items
+
+tests/test_t1_isolated_ingress_stack.py::TestSingleConsumer::test_exactly_one_service_holds_the_bot_token PASSED [  3%]
+tests/test_t1_isolated_ingress_stack.py::TestSingleConsumer::test_exactly_one_service_mounts_the_trusted_spool PASSED [  7%]
+tests/test_t1_isolated_ingress_stack.py::TestSingleConsumer::test_one_update_produces_exactly_one_consumption PASSED [ 10%]
+tests/test_t1_isolated_ingress_stack.py::TestTrustedIngressToT1::test_durable_receipt_then_t1_persistence PASSED [ 14%]
+tests/test_t1_isolated_ingress_stack.py::TestTrustedIngressToT1::test_redelivery_of_the_same_message_does_not_double_count PASSED [ 17%]
+tests/test_t1_isolated_ingress_stack.py::TestTrustedIngressToT1::test_reply_intent_is_recorded_in_the_same_commit PASSED [ 21%]
+tests/test_t1_isolated_ingress_stack.py::TestOpenClawCannotReachTrustedState::test_noise_allowlist_cannot_mask_a_real_credential PASSED [ 25%]
+tests/test_t1_isolated_ingress_stack.py::TestOpenClawCannotReachTrustedState::test_holds_no_secret_environment PASSED [ 28%]
+tests/test_t1_isolated_ingress_stack.py::TestOpenClawCannotReachTrustedState::test_cannot_read_the_trusted_spool PASSED [ 32%]
+tests/test_t1_isolated_ingress_stack.py::TestOpenClawCannotReachTrustedState::test_cannot_reach_trusted_services PASSED [ 35%]
+tests/test_t1_isolated_ingress_stack.py::TestOpenClawCannotReachTrustedState::test_cannot_alter_trusted_state_even_if_it_tries PASSED [ 39%]
+tests/test_t1_isolated_ingress_stack.py::TestOpenClawCannotReachTrustedState::test_mcp_has_consumption_writers_disabled PASSED [ 42%]
+tests/test_t1_isolated_ingress_stack.py::TestAmbiguousSendRecovery::test_known_safe_failure_is_retryable_without_duplication PASSED [ 46%]
+tests/test_t1_isolated_ingress_stack.py::TestAmbiguousSendRecovery::test_crash_mid_send_becomes_unknown_and_is_never_resent PASSED [ 50%]
+tests/test_t1_isolated_ingress_stack.py::TestAmbiguousSendRecovery::test_unknown_survives_further_recovery_passes PASSED [ 53%]
+tests/test_t1_isolated_ingress_stack.py::TestInStackRotation::test_rotation_and_retired_key_rejection_in_the_stack PASSED [ 57%]
+tests/test_t1_isolated_ingress_stack.py::TestRealConsumptionServiceOutputs::test_mixed_meal_and_drink_produces_real_items_and_nutrition PASSED [ 60%]
+tests/test_t1_isolated_ingress_stack.py::TestRealConsumptionServiceOutputs::test_unknown_food_is_not_recorded_as_known_zero PASSED [ 64%]
+tests/test_t1_isolated_ingress_stack.py::TestRealConsumptionServiceOutputs::test_beverage_only_message_still_projects_liquid PASSED [ 67%]
+tests/test_t1_isolated_ingress_stack.py::TestDuplicateAndConcurrentDelivery::test_duplicate_delivery_does_not_duplicate_real_outputs PASSED [ 71%]
+tests/test_t1_isolated_ingress_stack.py::TestDuplicateAndConcurrentDelivery::test_concurrent_writers_create_exactly_one_meal PASSED [ 75%]
+tests/test_t1_isolated_ingress_stack.py::TestUnknownResolution::test_requires_authentication PASSED [ 78%]
+tests/test_t1_isolated_ingress_stack.py::TestUnknownResolution::test_ownership_is_enforced PASSED [ 82%]
+tests/test_t1_isolated_ingress_stack.py::TestUnknownResolution::test_acknowledge_resolves_without_resending_or_recreating PASSED [ 85%]
+tests/test_t1_isolated_ingress_stack.py::TestUnknownResolution::test_resend_requires_explicit_duplicate_risk_acknowledgement PASSED [ 89%]
+tests/test_t1_isolated_ingress_stack.py::TestUnknownResolution::test_resend_is_traceable_and_never_recreates_the_consumption PASSED [ 92%]
+tests/test_t1_isolated_ingress_stack.py::TestUnknownResolution::test_concurrent_resolution_requests_do_not_both_act PASSED [ 96%]
+tests/test_t1_isolated_ingress_stack.py::TestUnknownResolution::test_resolution_of_a_non_unknown_state_is_refused PASSED [100%]
+
+======================== 28 passed in 295.75s (0:04:55) ========================
+
+=== default suite (no production inspection; gated tests skipped) ===
+........................................................................ [ 16%]
+..................................................sss................... [ 32%]
+...............................................sssssssssss.......sssssss [ 48%]
+s....................................................................... [ 64%]
+.....................................sssssssssssssssssssssssssssssssssss [ 80%]
+sss..........sssssssssssssssssssssssss.................................. [ 96%]
+................                                                         [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /home/mirko/work/DrHiro/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+.venv/lib/python3.12/site-packages/starlette/testclient.py:53
+  /home/mirko/work/DrHiro/.venv/lib/python3.12/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+tests/test_b7_closing_regression.py::TestBeverageToSolidRename::test_beverage_to_solid_rename_by_name_only
+tests/test_stage3_wired_paths.py::TestWiredBeveragePatch::test_patch_beverage_name_propagates_to_measurement
+  /home/mirko/work/DrHiro/.venv/lib/python3.12/site-packages/rq/utils.py:128: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    return datetime.datetime.utcnow()
+
+tests/test_r4_migration_chain.py::TestR4MigrationChain::test_single_head
+tests/test_r4_migration_chain.py::TestR4MigrationChain::test_activities_migration_is_at_head_after_orm_column_gaps
+tests/test_r4_migration_chain.py::TestR4MigrationChain::test_food_baseline_is_chain_root
+tests/test_r4_migration_chain.py::TestR4MigrationChain::test_canonical_schema_rebased_after_food_baseline
+tests/test_r4_migration_chain.py::TestR4MigrationChain::test_production_revision_is_in_chain_before_feature
+  /home/mirko/work/DrHiro/.venv/lib/python3.12/site-packages/alembic/config.py:604: DeprecationWarning: No path_separator found in configuration; falling back to legacy splitting on spaces, commas, and colons for prepend_sys_path.  Consider adding path_separator=os to Alembic config.
+    util.warn_deprecated(
+
+tests/test_t1_writer_gate_routes.py: 25 warnings
+  /home/mirko/work/DrHiro/.venv/lib/python3.12/site-packages/jwt/api_jwt.py:147: InsecureKeyLengthWarning: The HMAC key is 23 bytes long, which is below the minimum recommended length of 32 bytes for SHA256. See RFC 7518 Section 3.2.
+    return self._jws.encode(
+
+tests/test_t1_writer_gate_routes.py: 21 warnings
+  /home/mirko/work/DrHiro/.venv/lib/python3.12/site-packages/jwt/api_jwt.py:368: InsecureKeyLengthWarning: The HMAC key is 23 bytes long, which is below the minimum recommended length of 32 bytes for SHA256. See RFC 7518 Section 3.2.
+    decoded = self.decode_complete(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+363 passed, 85 skipped, 55 warnings in 42.68s
+
+=== R1 isolation enforcement (mandatory, in default suite) ===
+..............                                                           [100%]
+14 passed in 0.28s
+
+=== R2 trusted-key set ===
+.................                                                        [100%]
+17 passed in 0.07s
+
+=== R4 activities migration (gated) ===
+...........                                                              [100%]
+11 passed in 2.44s

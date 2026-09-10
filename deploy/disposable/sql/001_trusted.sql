@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS telegram_receipts (
     lease_expires_at  timestamptz,
     status            text NOT NULL DEFAULT 'received',
     operation_id      uuid,
+    attempts          integer NOT NULL DEFAULT 0,
+    last_error        text,
     CONSTRAINT ck_receipts_status
         CHECK (status IN ('received', 'processing', 'completed'))
 );
@@ -56,7 +58,45 @@ CREATE TABLE IF NOT EXISTS reply_outbox (
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT ck_outbox_state
-        CHECK (reply_state IN ('pending', 'in_flight', 'sent', 'failed', 'unknown'))
+        CHECK (reply_state IN ('pending', 'in_flight', 'sent', 'failed', 'unknown',
+                               'resolved_acknowledged', 'resolved_resent'))
 );
 
 CREATE INDEX IF NOT EXISTS ix_outbox_state ON reply_outbox (reply_state);
+
+
+-- ---------------------------------------------------------------------------
+-- Reply resolution: audit trail for the `unknown` state.
+--
+-- `unknown` means a send was attempted and we cannot know whether it arrived. An
+-- operator or the owning user may resolve it, but resolution is RECORDED, never
+-- silent, and a resend is explicitly acknowledged as possibly duplicating.
+--
+-- Every row is an immutable fact: who did what, to which reply, and the outcome.
+-- `delivery_attempt` counts real network sends of this reply, including resends
+-- after an ambiguous result, so duplicates are traceable rather than mysterious.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS reply_audit (
+    id                 bigserial PRIMARY KEY,
+    operation_id       uuid NOT NULL REFERENCES reply_outbox (operation_id),
+    actor              text NOT NULL,          -- authenticated principal
+    action             text NOT NULL,          -- acknowledge | resend | auto_recover
+    from_state         text NOT NULL,
+    to_state           text NOT NULL,
+    delivery_attempt   integer NOT NULL DEFAULT 0,
+    detail             text,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_reply_audit_action
+        CHECK (action IN ('acknowledge', 'resend', 'auto_recover'))
+);
+
+CREATE INDEX IF NOT EXISTS ix_reply_audit_operation
+    ON reply_audit (operation_id, created_at);
+
+-- Resolution is ownership-checked: the resolving principal must be bound to the
+-- chat that owns the reply. Kept as a table so the binding is data, not code.
+CREATE TABLE IF NOT EXISTS reply_owners (
+    chat_id      text PRIMARY KEY,
+    owner_id     text NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);

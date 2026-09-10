@@ -27,20 +27,40 @@ import psycopg2
 import psycopg2.extras
 
 TELEGRAM_API = os.environ.get("TELEGRAM_API_URL", "http://fake-telegram:8081")
-ADMIN = f"http://localhost:{os.environ.get('INGRESS_ADMIN_PORT', '8082')}"
+INGRESS_ADMIN = f"http://localhost:{os.environ.get('INGRESS_ADMIN_PORT', '8082')}"
+ADMIN = INGRESS_ADMIN
 
 
-def _call(url: str, payload: dict | None = None):
+def _call(url: str, payload: dict | None = None, token: str | None = None):
+    """POST JSON. Non-2xx responses are returned as data so tests can assert on the
+    error code (401 unauthorised, 403 not_owner, 409 state_changed) instead of
+    crashing."""
     data = json.dumps(payload or {}).encode()
-    req = urllib.request.Request(url, data=data,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return {**json.loads(resp.read()), "http_status": resp.status}
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read())
+        except Exception:
+            body = {}
+        return {**body, "http_status": exc.code}
 
 
 def _get(url: str):
-    with urllib.request.urlopen(url, timeout=30) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return {**json.loads(resp.read()), "http_status": resp.status}
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read())
+        except Exception:
+            body = {}
+        return {**body, "http_status": exc.code}
 
 
 def counts() -> dict:
@@ -70,6 +90,16 @@ def counts() -> dict:
                 "WHERE source_bot_id IS NOT NULL AND source_message_id IS NOT NULL"
             )
             out["telegram_consumptions"] = cur.fetchone()["n"]
+            # Operation ids per state, so a test can act on a specific reply.
+            for label, state in (("unknown", "unknown"), ("sent", "sent"),
+                                 ("failed", "failed")):
+                cur.execute(
+                    "SELECT operation_id FROM reply_outbox WHERE reply_state = %s "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (state,),
+                )
+                row = cur.fetchone()
+                out[f"{label}_operation_id"] = str(row["operation_id"]) if row else None
             return out
     finally:
         conn.close()
@@ -96,6 +126,28 @@ def main() -> int:
         print(json.dumps(_get(f"{ADMIN}/admin/status")))
     elif cmd == "recover":
         print(json.dumps(_get(f"{ADMIN}/admin/recover")))
+    elif cmd == "real-output":
+        print(json.dumps(_get(f"{INGRESS_ADMIN}/admin/real-output")))
+    elif cmd == "resolve":
+        # resolve <operation_id> <actor> <action> <claim_chat_id> [ack]
+        payload = {
+            "operation_id": sys.argv[2], "actor": sys.argv[3],
+            "action": sys.argv[4], "claim_chat_id": sys.argv[5],
+        }
+        if len(sys.argv) > 6:
+            payload["duplicate_risk_ack"] = sys.argv[6] == "ack"
+        print(json.dumps(_call(f"{INGRESS_ADMIN}/admin/reply/resolve", payload,
+                               token=os.environ.get("INGRESS_ADMIN_TOKEN"))))
+    elif cmd == "resolve_noauth":
+        # Same request with NO Authorization header, to prove auth is enforced.
+        payload = {
+            "operation_id": sys.argv[2], "actor": "anonymous",
+            "action": sys.argv[3], "claim_chat_id": sys.argv[4],
+        }
+        print(json.dumps(_call(f"{INGRESS_ADMIN}/admin/reply/resolve", payload,
+                               token=None)))
+    elif cmd == "audit":
+        print(json.dumps(_get(f"{INGRESS_ADMIN}/admin/audit")))
     elif cmd == "counts":
         print(json.dumps(counts()))
     else:

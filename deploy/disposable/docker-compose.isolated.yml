@@ -53,9 +53,12 @@ services:
   # tables rather than a lookalike schema.
   migrate:
     <<: *app
-    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    command: ["sh", "-c",
+              "alembic -c /app/alembic.ini upgrade head && python /app/seed_catalog.py"]
     environment:
       DRHIRO_DATABASE_URL: "postgresql+psycopg2://drhiro:disposable-only@postgres:5432/drhiro_t1"
+      DATABASE_URL: "postgresql://drhiro:disposable-only@postgres:5432/drhiro_t1"
+      PYTHONPATH: "/app/drhiro_src"
     networks: [trusted]
     depends_on:
       postgres: {condition: service_healthy}
@@ -74,6 +77,10 @@ services:
       TELEGRAM_API_URL: "http://fake-telegram:8081"
       OPENCLAW_URL: "http://openclaw:8090"
       INGRESS_ADMIN_PORT: "8082"
+      # Resolution auth. Present ONLY in the trusted ingress; never mounted into a
+      # model-accessible container. Throwaway value: this stack is disposable.
+      INGRESS_ADMIN_TOKEN: "disposable-admin-token"
+      REPLY_OWNER_ID: "555000111"
     volumes:
       - trusted-spool:/var/spool/telegram
     networks: [trusted, turn]

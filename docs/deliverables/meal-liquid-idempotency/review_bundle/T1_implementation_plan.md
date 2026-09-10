@@ -629,3 +629,91 @@ recovery converts abandoned `in_flight` to `unknown`.
 
 No claim in this revision rests on the production path: everything marked EXECUTED
 was run against the disposable stack or the disposable databases.
+
+---
+
+# REVISION 4 — checkpoint 2: real service path + reply resolution (IMPLEMENTED + TESTED)
+
+Scope unchanged: isolated branch + DISPOSABLE stack only. Candidate `7e2cf69` still
+frozen; the frozen archive is unchanged. No production split, rotation, cutover, push,
+deployment, gate activation or cleanup.
+
+## 4.1 Correction applied: the slice was proving too little
+
+Review question 2 identified a real defect in my own evidence: the slice called the
+`ConsumptionOperation` model directly and fabricated
+`result_json = {"items": 1, "via": "trusted-ingress"}`. It never invoked the
+consumption service. A completed operation row proved nothing about meal items,
+nutrition, liquid measurement or projections.
+
+The slice now calls the genuine path:
+
+```
+parse_consumption_text   -> real parser
+get_or_create_operation  -> real trusted-identity entry point (fail-closed, ON CONFLICT)
+resolve_item_nutrition   -> real DB-first resolution over a seeded catalog
+write_consumption        -> THE single write path
+```
+
+A seeded food catalog (`app/seed_catalog.py`) makes resolution deterministic and
+**offline**, so the real resolution path runs over a real SQL query rather than a
+stubbed nutrient source.
+
+Observed for `200 g steak and 0.5 l beer`: totals
+`{kcal 757.0, protein 54.5, carbs 18.0, fat 36.0, fiber 0.0, sodium 130.0}`; meal items
+`steak (200 g)` and `beer (500 ml, category beer)`; one `Measurement`
+(`water`, `ml`, `amount_ml 500.0`, linked to the beer meal item) and one
+`BeverageMeasurement`. Terminology note: "projection" here means that linked liquid
+projection; there is no `daily_aggregates` writer in the logging path and none is
+claimed.
+
+**Duplicate and concurrency assertions over those outputs:** redelivery of the same
+`message_id` leaves 1 meal / 2 items / 1 measurement with identical totals; 4
+concurrent writers racing one identity produce `creations: 1`,
+`duplicates_reported: 3`, `errors: []` and exactly one meal/measurement. The
+concurrency probe deliberately does **not** start a second Telegram poller — the
+architecture keeps exactly one consumer — so it tests the persistence-layer race
+(stolen claim, restarted worker), not two pollers.
+
+Related hardening found while wiring this: a processing error previously stranded an
+update in `processing` until its lease expired. `fail_receipt()` now releases the claim
+immediately and records `attempts` / `last_error`, so a transient failure retries
+promptly without weakening the claim ownership check.
+
+## 4.2 Implemented: resolution of the `unknown` state
+
+`POST /admin/reply/resolve`, with `acknowledge` and `resend`.
+
+- **Authenticated** — `Bearer $INGRESS_ADMIN_TOKEN`, `hmac.compare_digest`, held only
+  by the trusted ingress; an unset token **disables** resolution (fail closed).
+- **Ownership-checked** — must match the `reply_owners` binding, else `403`.
+- **Audited** — `reply_audit` records actor, action, from/to state, delivery attempt,
+  detail. A resend writes two rows (attempt made, then outcome), so an interrupted
+  resend is traceable.
+- **Resend warns** — requires `duplicate_risk_ack`; without it `400`. The audit detail
+  states delivery may already have occurred.
+- **Never recreates the consumption** — resolution touches only `reply_outbox` and
+  `reply_audit`; asserted after both actions.
+- **Concurrency** — `FOR UPDATE` + state re-check. A racing acknowledge/resend pair
+  yields exactly one success and one `409 state_changed`; a losing resend sends
+  nothing. Resolving a `sent` reply is refused with `409`.
+
+## 4.3 Review answers recorded in the artifact
+
+`INCREMENTAL_REVIEW_R2.md` carries the five answers, including two concessions:
+
+- **Component classification:** OpenClaw, MCP and Telegram in this stack are **test
+  substitutes**. Isolation evidence from inside a placeholder proves the *topology*
+  denies access; it does **not** prove the real OpenClaw application works without the
+  bot token and spool mount. That compatibility check is PENDING.
+- **Credential scope:** the Ed25519 envelope keys are **not** production credentials.
+  Their rotation demonstrates a mechanism only. `DRHIRO_JWT_SECRET` is **not rotated
+  and not tested**; with a symmetric key the API cannot distinguish who minted a valid
+  token, and deleting an environment variable invalidates nothing.
+
+## 4.4 PENDING (unchanged, plus new)
+
+Production container split · production rotation cutover · real OpenClaw spool wiring
+into the real ingress · upgrade fail-safe · real OpenClaw compatibility with the
+boundary · user-facing surface for `unknown` resolution · R1 partial · R2 production
+rotation · R4 production-mirror value preservation · R6 cutover/rollback.
