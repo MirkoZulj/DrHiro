@@ -46,6 +46,7 @@ from sqlalchemy.orm import sessionmaker, Session
 # --- unified consumption domain (single write path) ---
 from drhiro_api.services.consumption import (
     parse_consumption_text,
+    resolve_item_nutrition,
     confirm_consumption,
     find_completed_result_by_identity,
     ParsedItem,
@@ -178,8 +179,16 @@ async def create_meal_from_text_intelligent(
     text = req.text
     parsed_items = parse_consumption_text(text)
 
+    # R1: resolve nutrition for each parsed item through the real resolution
+    # path (DB catalog -> external fallback) BEFORE the draft is built, so the
+    # draft carries the resolved candidate + nutrient basis + provenance and
+    # confirmation/retries use the SAME nutrition (never the parser's empty
+    # dict, never a silent 0-kcal meal). Providers are hit only at their
+    # boundary inside resolve_item_nutrition.
+    resolved_items = [resolve_item_nutrition(db, pi) for pi in parsed_items]
+
     draft_items = []
-    for pi in parsed_items:
+    for pi in resolved_items:
         draft_items.append({
             "display_name": pi.display_name,
             "grams": pi.grams,
@@ -188,10 +197,15 @@ async def create_meal_from_text_intelligent(
             "is_beverage": pi.is_beverage,
             "quantity": pi.quantity,
             "unit": pi.unit,
+            # Resolved nutrition + provenance (R1)
             "nutrients_per_100": pi.nutrients_per_100,
             "nutrients_scaled": pi.nutrients_scaled,
             "source": pi.source,
             "confidence": pi.confidence,
+            "nutrient_basis": pi.nutrient_basis,
+            "resolution_source": pi.resolution_source,
+            "food_catalog_item_id": pi.food_catalog_item_id,
+            "nutrition_complete": pi.nutrition_complete,
         })
 
     draft_id = uuid.uuid4().hex
