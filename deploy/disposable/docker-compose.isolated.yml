@@ -1,26 +1,23 @@
 # Disposable isolated stack for the trusted-ingress vertical slice (R1).
 #
-# Purpose: the TARGET stack shape the mandatory isolation test asserts. Never used
-# for production; brought up only on a workstation/disposable host.
+# Disposable only; never used for production. Brought up on a workstation/disposable
+# host to exercise the trusted path with real containers and a real database.
 #
-# Isolation contract (enforced by tests/test_r1_stack_isolation.py):
-#   * `openclaw` and `mcp` are MODEL-ACCESSIBLE. They hold no bot token, no JWT
-#     signing secret, no ingress signing key, no private key; they mount neither the
-#     trusted spool nor any trusted config; they are unprivileged, have no
-#     administrative interface, and are attached ONLY to the `turn` network.
-#   * `ingress` is TRUSTED. It is the ONLY service holding the bot token and the
-#     ingress signing key, and the ONLY one mounting the trusted spool. It is the
-#     single Telegram consumer.
-#   * `postgres`/`redis` are on the `trusted` network only, so no model-accessible
-#     service can reach trusted state directly.
-#
-# Networks are a deliberate part of the boundary: reachability is access.
+# Isolation contract (enforced by tests/test_r1_stack_isolation.py over EFFECTIVE
+# access - secrets, mounts, privileges, admin interfaces and network reach):
+#   * `openclaw` and `mcp` are MODEL-ACCESSIBLE. No bot token, no JWT signing secret,
+#     no ingress signing key, no private key; no trusted spool/config mount; no
+#     administrative interface; attached ONLY to the `turn` network.
+#   * `ingress` is TRUSTED: the only holder of the bot token and signing key, the only
+#     mounter of the trusted spool, and the single Telegram consumer.
+#   * `postgres`/`redis`/`fake-telegram` sit on the `trusted` network only, so no
+#     model-accessible service can reach trusted state directly.
 name: drhiro-isolated
 
-x-app-image: &app-image
+x-app: &app
   build:
-    context: .
-    dockerfile: Dockerfile
+    context: ../..
+    dockerfile: deploy/disposable/Dockerfile
 
 services:
   postgres:
@@ -29,59 +26,73 @@ services:
       POSTGRES_USER: drhiro
       POSTGRES_PASSWORD: disposable-only
       POSTGRES_DB: drhiro_t1
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d:ro
     networks: [trusted]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U drhiro -d drhiro_t1"]
       interval: 2s
       timeout: 2s
-      retries: 30
+      retries: 40
 
   redis:
     image: redis:7-alpine
     networks: [trusted]
 
   fake-telegram:
-    <<: *app-image
+    <<: *app
     command: ["python", "-u", "/app/fake_telegram.py"]
     networks: [trusted]
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8081/health')\""]
       interval: 2s
       timeout: 2s
-      retries: 30
+      retries: 40
 
-  # TRUSTED: sole Telegram consumer, sole holder of the bot token + signing key,
-  # sole owner of the trusted spool mount.
+  # Runs the REAL Alembic chain, so the trusted ingress persists into genuine T1
+  # tables rather than a lookalike schema.
+  migrate:
+    <<: *app
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    environment:
+      DRHIRO_DATABASE_URL: "postgresql+psycopg2://drhiro:disposable-only@postgres:5432/drhiro_t1"
+    networks: [trusted]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  # TRUSTED: sole Telegram consumer; sole holder of the bot token and signing key;
+  # sole owner of the trusted spool.
   ingress:
-    <<: *app-image
+    <<: *app
     command: ["python", "-u", "/app/ingress.py"]
     environment:
       TELEGRAM_BOT_TOKEN: "111111:disposable-bot-token"
       DRHIRO_INGRESS_SIGNING_KEY: "disposable-ingress-signing-key"
       DRHIRO_TELEGRAM_ID: "8677922871"
       DATABASE_URL: "postgresql://drhiro:disposable-only@postgres:5432/drhiro_t1"
+      DRHIRO_DATABASE_URL: "postgresql+psycopg2://drhiro:disposable-only@postgres:5432/drhiro_t1"
       TELEGRAM_API_URL: "http://fake-telegram:8081"
       OPENCLAW_URL: "http://openclaw:8090"
-      SPOOL_DIR: "/var/spool/telegram"
+      INGRESS_ADMIN_PORT: "8082"
     volumes:
       - trusted-spool:/var/spool/telegram
     networks: [trusted, turn]
     depends_on:
       postgres: {condition: service_healthy}
       fake-telegram: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
 
-  # MODEL-ACCESSIBLE: conversational engine. No secrets, no trusted mounts, no
-  # administrative interface, `turn` network only.
+  # MODEL-ACCESSIBLE: conversational engine only.
   openclaw:
-    <<: *app-image
+    <<: *app
     command: ["python", "-u", "/app/openclaw_stub.py"]
     environment:
       TURN_ONLY: "1"
     networks: [turn]
 
-  # MODEL-ACCESSIBLE: the MCP the model calls. Same restrictions as openclaw.
+  # MODEL-ACCESSIBLE: the MCP the model calls.
   mcp:
-    <<: *app-image
+    <<: *app
     command: ["python", "-u", "/app/mcp_stub.py"]
     environment:
       TURN_ONLY: "1"

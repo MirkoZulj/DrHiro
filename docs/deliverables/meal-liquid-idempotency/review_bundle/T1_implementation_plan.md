@@ -512,3 +512,120 @@ diagnostic** — never silently skip.
 
 Tests are labelled EXECUTED or PENDING throughout; R1–R5 remain PROPOSALS until
 implemented and tested on the disposable stack.
+
+---
+
+# REVISION 3 — checkpoint: isolated ingress vertical slice (IMPLEMENTED + TESTED)
+
+Scope: isolated branch + DISPOSABLE stack only. No production split, rotation,
+consumer cutover, push, deployment, gate activation or cleanup. Candidate
+`7e2cf69` still frozen and NOT repackaged.
+
+## 3.1 Corrections applied at this checkpoint
+
+**(1) Diagnostics separated from acceptance tests.** The `xfail(strict=False)` test
+is deleted: it permitted XFAIL and XPASS without failing, so it recorded an exposure
+rather than enforcing anything.
+
+| artifact | role | in default suite? |
+|---|---|---|
+| `tests/test_r1_stack_isolation.py` | **ENFORCEMENT** — mandatory passing test over the target stack's effective access; never xfails | yes (passes) |
+| `TestCheckerIsNotVacuous` (same file) | 8 injected violations prove the checker *catches* leaks/mounts/socket/privileged/caps/reach | yes (passes) |
+| `scripts/diagnose_deployment_isolation.py` | **DIAGNOSTIC** — current-deployment inspection, explicit read-only invocation | **no** |
+
+Effective access is tested as secrets + mounts + privileges + administrative
+interfaces (docker socket, host network/pid/ipc, dangerous capabilities) + network
+reach — not env-var names. The mandatory test cannot be vacuous: the checker is
+itself tested against injected violations.
+
+**(2) The catalog claim was wrong and is corrected.** The earlier statement that
+"PostgreSQL 17+ records NOT NULL as `contype='c'`" is false and is withdrawn.
+
+```
+server  : PostgreSQL 16.14 (Debian 16.14-1.pgdg13+1), localhost:5435
+query   : select conname, contype, pg_get_constraintdef(oid) from pg_constraint
+          where conrelid='activities'::regclass order by contype, conname
+result  : 3 rows — 'c' CHECK (calories_burned >= 0::double precision), 'f' FK,
+          'p' PK.  NOT NULL columns are absent from pg_constraint; they are in
+          pg_attribute.attnotnull (7 rows). No contype='n' on this version.
+```
+
+NOT NULL lives in `pg_attribute.attnotnull` before PostgreSQL 18 and as
+`contype='n'` from 18 — never `'c'`. The real reason the earlier test failed was a
+case-sensitive assertion in my own test (`"CHECK" in "added
+activities_calories_burned_check"`), not the catalog. The detector is now explicitly
+version-independent (`contype='c'` **and** `constraintdef LIKE 'CHECK%'`), with
+`server_version()` and `not_null_columns()` added so the claim is checkable, plus
+tests that a genuine CHECK is **validated and enforced** rather than ignored.
+Ownership-aware adoption is preserved, and the downgrade documentation now states
+plainly that dropping a **migration-created** table remains **destructive** once it
+has acquired data — ownership permits the drop, it does not make it safe.
+
+**(3) Delivery semantics clarified.** Durable reply intent, retry of **known-safe**
+failures only, and explicitly unresolved ambiguous sends — no exactly-once-reply and
+no guaranteed-delivery claim. The state machine is specified in §R3 above, including
+how a crash mid-send enters `unknown` (in-flight recorded before the network call)
+versus `pending` (crash before the attempt, safely retryable), and the operator and
+authenticated-user resolution paths.
+
+## 3.2 Implemented at this checkpoint
+
+**Trusted ingress (`drhiro-ingress` role, `deploy/disposable/app/ingress.py`).**
+Single Telegram consumer, verified bot identity via `getMe`, durable receipt unique
+per `(bot_id, chat_id, message_id)`, exclusive claim with lease, then T1 persistence
+into the **real** `consumption_operations` table (real ORM model + the real Alembic
+chain, run by a `migrate` service) whose natural Telegram unique constraint enforces
+exactly-once. Reply intent is inserted **in the same transaction** as the
+consumption commit.
+
+**Isolation (`deploy/disposable/docker-compose.isolated.yml`).** `openclaw` and `mcp`
+are model-accessible with no bot token, no signing key, no trusted mount, no
+privilege, no administrative interface, and are attached only to the `turn` network;
+`postgres`/`redis`/`fake-telegram` are on `trusted` only. Measured from inside the
+untrusted container: no forbidden credentials, trusted paths absent, and
+`postgres:5432`, `redis:6379`, `fake-telegram:8081` all **unreachable**.
+
+**Asymmetric trusted keys (`services/ingress_keys.py`).** Ed25519 with the private
+key only in the trusted ingress; verifiers hold public keys. Explicit
+operator-provisioned key set; retired kids rejected even with a valid signature;
+`jwk`/`jku`/`x5u`/`x5c` refused; `alg=none` and HMAC confusion refused; `kid` never
+interpreted as a path or URL.
+
+**Ambiguous-send handling.** `in_flight` is committed *before* the network call;
+429/5xx and connection-refused are known-safe (`failed`, retryable); a delivered-
+but-unconfirmed send becomes `unknown` and is **never** auto-resent; periodic
+recovery converts abandoned `in_flight` to `unknown`.
+
+## 3.3 Test results at this checkpoint
+
+**EXECUTED (all passing):**
+
+- isolated stack, 16 tests — single consumer; durable receipt → T1 persistence;
+  redelivery does not double-count; reply intent in the same commit; OpenClaw cannot
+  read or alter trusted state (4 checks); known-safe failure retried without
+  duplication; crash mid-send → `unknown`, **not resent**; extra recovery passes do
+  not resolve `unknown`; in-stack rotation and retired-key rejection.
+- `tests/test_r2_trusted_key_set.py` — 17 tests (rotation, retirement, kid abuse,
+  alg confusion, claims).
+- `tests/test_r1_stack_isolation.py` — 14 tests (enforcement + non-vacuity).
+- `tests/test_r4_activities_migration.py` — 11 tests.
+
+**PENDING (still not implemented):**
+
+- **R2 rotation cutover on the real deployment** — removal from env/mounts/config/
+  tooling, `kid` denylist in the API, credential reissue. The stack demonstrates the
+  mechanism; the production cutover is separately approved and NOT done.
+- **The production container split** — `drhiro-ingress` is a role in the disposable
+  stack, not a deployed service. `drhiro-openclaw-gateway-1` still holds
+  `DRHIRO_JWT_SECRET`, both bot tokens, `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD`,
+  `NOUS_API_KEY`, `DRHIRO_LLM_API_KEY`, `OPENCLAW_GATEWAY_TOKEN`, and the rw spool
+  mount (see the diagnostic evidence).
+- **Wiring the trusted worker to the real OpenClaw spool** and the upgrade/version
+  fail-safe wrapper.
+- **Ordinary non-Telegram consumption paths through the same trusted worker.**
+- **Reply resolution UI/endpoint** for operators and users (`unknown` is surfaced in
+  state, not yet resolvable through an API).
+- R1 partial · R2 open · R4 production-mirror value preservation · R6 cutover.
+
+No claim in this revision rests on the production path: everything marked EXECUTED
+was run against the disposable stack or the disposable databases.
