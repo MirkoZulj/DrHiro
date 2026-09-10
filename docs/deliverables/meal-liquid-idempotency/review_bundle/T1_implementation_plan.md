@@ -753,9 +753,14 @@ the full responses; this is the summary.
    (canonical expression, rejects `>= -100`); indexes matched on columns; server
    defaults, PK and FK validated. Negative adoption tests (7) added; failing-before →
    passing-after demonstrated.
-7. **Explicit out-of-proven-scope documentation.** Real polling-offset, sender
-   identity resolution, and edit/content-conflict handling are stated as NOT
-   implemented/proven. A verified bot identity authenticates the bot, not the sender.
+7. **B7 — NOT CLOSED. Wording corrected; behaviour still unimplemented.** The earlier
+   "real OpenClaw spool wiring pending" phrasing wrongly implied the behaviour existed
+   and merely awaited wiring. Real polling-offset (`last_update_id`), sender-identity
+   resolution, and edit/content-conflict handling are **unimplemented**: the slice uses
+   the fake `/ack`, maps every message to one fixed user without checking the sender,
+   and treats an edited `message_id` as a duplicate receipt rather than a revision. A
+   legitimate bot identity authenticates the bot, not the sender. No code path
+   implements any of the three; they remain open findings.
 
 ## 5.2 Packaging vs implementation
 

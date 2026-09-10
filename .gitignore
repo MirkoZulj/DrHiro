@@ -47,3 +47,7 @@ apk-build/
 .idea/
 .vscode/
 *.swp
+
+# --- Generated review bundles (build outputs, not source) ---
+docs/deliverables/meal-liquid-idempotency/review_bundle/review7/
+docs/deliverables/meal-liquid-idempotency/review_bundle/review7_focused_bundle.tar.gz
