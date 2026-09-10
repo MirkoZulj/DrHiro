@@ -219,14 +219,20 @@ def verify_envelope(
     secret: bytes,
     service: str,
     bot_id: str,
-    chat_id: str,
-    message_id: str,
-    input_digest: str,
     now: Optional[int] = None,
     max_age_s: int = 300,
 ) -> BoundEvent:
     """Verify authenticity, integrity, and request binding of one envelope.
 
+    The shim does NOT independently know chat/message id (those arrive only
+    inside the signed envelope from the trusted minting adapter). Binding is
+    therefore established by:
+      - HMAC over service + account(bot) + event + input-digest: proves the
+        envelope was minted by the trusted adapter for THIS event+input;
+      - service and account(bot) compared against TRUSTED config;
+      - event_id recomputed canonically from the envelope's own identity fields
+        (self-consistency) -- the envelope's chat/message are authentic because
+        the HMAC covers them.
     Raises EnvelopeError subclasses; never silently falls back.
     """
     import time as _t
@@ -250,17 +256,18 @@ def verify_envelope(
     if not hmac.compare_digest(sig, expected):
         raise BadSignatureEnvelopeError("envelope signature invalid")
 
-    # Request binding: service + account(bot) + event + input digest.
+    # Request binding: service + authenticated account(bot) + event + input.
     if envelope.get("service") != service:
         raise BindingMismatchEnvelopeError("envelope service mismatch")
     if str(envelope.get("bot_id")) != str(bot_id):
         raise BindingMismatchEnvelopeError("envelope account(bot) mismatch")
-    if str(envelope.get("chat_id")) != str(chat_id):
-        raise BindingMismatchEnvelopeError("envelope chat mismatch")
-    if str(envelope.get("message_id")) != str(message_id):
-        raise BindingMismatchEnvelopeError("envelope message mismatch")
-    if envelope.get("input_digest") != input_digest:
-        raise BindingMismatchEnvelopeError("envelope input-digest mismatch")
+    # event_id must be canonically consistent with the signed identity fields.
+    expected_id = derive_event_id(
+        service=envelope["service"], bot_id=str(envelope["bot_id"]),
+        chat_id=str(envelope["chat_id"]), message_id=str(envelope["message_id"]),
+    )
+    if envelope.get("event_id") != expected_id:
+        raise BindingMismatchEnvelopeError("envelope event_id not canonically consistent")
 
     # Freshness governs acceptance of a NEW write (not durable replay retention).
     if abs(now - int(envelope["issued_at"])) > max_age_s:
@@ -321,8 +328,6 @@ def extract_and_remove_envelope(
     secret: bytes,
     service: str,
     bot_id: str,
-    chat_id: str,
-    message_id: str,
     now: Optional[int] = None,
     max_age_s: int = 300,
 ) -> tuple[BoundEvent, dict]:
@@ -332,8 +337,7 @@ def extract_and_remove_envelope(
     Rules:
       - The envelope is accepted ONLY inside an OpenClaw runtime-context block.
       - At most one valid envelope may be present. Zero -> NoEnvelopeError.
-        More than one valid candidate (or a valid one plus an unparseable
-        duplicate) -> AmbiguousEnvelopeError.
+        More than one -> AmbiguousEnvelopeError.
       - The verified envelope's input_digest must equal canonical_input of the
         relevant current user input (computed here).
     Returns (bound_event, cleaned_body) where cleaned_body has the envelope
@@ -362,9 +366,12 @@ def extract_and_remove_envelope(
 
     bound = verify_envelope(
         candidates[0], secret=secret, service=service, bot_id=bot_id,
-        chat_id=chat_id, message_id=message_id, input_digest=input_digest,
         now=now, max_age_s=max_age_s,
     )
+    # Bind to the ACTUAL current input: a copied envelope for a different
+    # request (different input) must fail, not just a forged/expired one.
+    if bound.input_digest != input_digest:
+        raise BindingMismatchEnvelopeError("envelope input-digest mismatch")
 
     # Remove the envelope from the request body (in place on a shallow copy).
     cleaned = {"__version__": body.get("__version__"), "messages": list(messages)}

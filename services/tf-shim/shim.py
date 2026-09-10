@@ -24,12 +24,24 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+import drhiro_event_envelope as eventenv
+
 TRUEFORGE_URL = os.environ.get("TRUEFORGE_URL", "http://trueforge:8790")
 AGENT_NAME = os.environ.get("TRUEFORGE_AGENT", "drhiro")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/3")
 MODEL_ID = os.environ.get("SHIM_MODEL_ID", "trueforge-drhiro")
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "600"))
 SESSION_TTL = int(os.environ.get("SESSION_TTL", str(60 * 60 * 24 * 90)))
+
+# R2 trusted-config identity. DRHIRO_BOT_ID is the VERIFIED Telegram bot id
+# (getMe.id) mapped from the channel account at provisioning. DRHIRO_EVENT_SECRET
+# is the HMAC signing key shared only with the minting adapter; it must live in
+# secret management, NEVER in source control or prompts.
+SERVICE = os.environ.get("DRHIRO_SERVICE", "drhiro")
+DRHIRO_BOT_ID = os.environ.get("DRHIRO_BOT_ID", "")
+EVENT_SECRET = os.environ.get("DRHIRO_EVENT_SECRET", "")
+EVENT_MAX_AGE_S = int(os.environ.get("DRHIRO_EVENT_MAX_AGE_S", "300"))
+EVENT_RECORD_TTL = int(os.environ.get("DRHIRO_EVENT_RECORD_TTL", str(60 * 60 * 24 * 7)))
 
 _redis = None
 
@@ -176,6 +188,31 @@ async def stash_user_text(text: str) -> None:
         await r.set("tfshim:last_user_text", text, ex=900)
     except Exception:
         pass
+
+
+async def bind_event(event_id: str, *, input_digest: str, issued_at: int,
+                     bot_id: str, chat_id: str, message_id: str) -> None:
+    """Persist durable, run-scoped trusted context keyed by event_id.
+
+    NOT a shared 'latest event' record: each event has its own key, so
+    concurrent turns cannot overwrite one another. The record outlives the
+    envelope (EVENT_RECORD_TTL >> EVENT_MAX_AGE_S) so a fresh authenticated
+    retry of an old event still resolves its durable result even after the
+    envelope credentials expired. The MCP/API resolve event context from this
+    record (run-scoped transport); identity never arrives as model args.
+    """
+    r = await redis_conn()
+    payload = json.dumps({
+        "event_id": event_id,
+        "service": SERVICE,
+        "bot_id": bot_id,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "input_digest": input_digest,
+        "issued_at": issued_at,
+        "bound_at": int(time.time()),
+    })
+    await r.set(f"tfshim:event:{event_id}", payload, ex=EVENT_RECORD_TTL)
 
 
 async def run_turn(session_id: str, text: str) -> str:
@@ -326,15 +363,63 @@ async def chat_completions(request: Request):
             status_code=400,
         )
 
-    text = latest_user_message(body)
+    # ---- R2: extract, verify, and REMOVE the trusted event envelope before
+    # anything is forwarded to the model. This is the adapter seam. If the
+    # trusted config (bot id / signing key) is missing we FAIL CLOSED: a
+    # consumption event must never be processed without verified identity.
+    if not DRHIRO_BOT_ID or not EVENT_SECRET:
+        return JSONResponse(
+            {"error": {"message": "event identity not configured; failing closed",
+                       "type": "server_error"}},
+            status_code=503,
+        )
+
+    try:
+        bound, cleaned = eventenv.extract_and_remove_envelope(
+            body,
+            secret=EVENT_SECRET.encode("utf-8"),
+            service=SERVICE,
+            bot_id=DRHIRO_BOT_ID,
+            now=int(time.time()),
+            max_age_s=EVENT_MAX_AGE_S,
+        )
+    except eventenv.NoEnvelopeError:
+        return JSONResponse(
+            {"error": {"message": "no event envelope in the designated block; refusing to log",
+                       "type": "invalid_request_error"}},
+            status_code=422,
+        )
+    except eventenv.EnvelopeError as e:
+        return JSONResponse(
+            {"error": {"message": f"event envelope rejected: {e.code}",
+                       "type": "invalid_request_error"}},
+            status_code=422,
+        )
+
+    # Use the CLEANED body so the envelope is never part of what reaches the
+    # model, the conversation history, or any prompt log.
+    text = latest_user_message(cleaned)
     if not text:
         return JSONResponse(
             {"error": {"message": "no user message found", "type": "invalid_request_error"}},
             status_code=400,
         )
 
-    key = conversation_key(body)
+    key = conversation_key(cleaned)
     model = body.get("model") or MODEL_ID
+
+    # Durable, run-scoped binding (per-event key, not a shared 'latest' slot).
+    try:
+        await bind_event(
+            bound.event_id, input_digest=bound.input_digest, issued_at=bound.issued_at,
+            bot_id=bound.bot_id, chat_id=bound.chat_id, message_id=bound.message_id,
+        )
+    except Exception:
+        return JSONResponse(
+            {"error": {"message": "event binding failed; refusing to log",
+                       "type": "server_error"}},
+            status_code=503,
+        )
 
     try:
         session_id = await get_or_create_session(key)

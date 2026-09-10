@@ -66,7 +66,7 @@ class TestBinding:
         body = _valid_body()
         bound, cleaned = ev.extract_and_remove_envelope(
             body, secret=SECRET, service=SERVICE, bot_id="BOT1",
-            chat_id="CHAT1", message_id="M1", now=NOW,
+            now=NOW,
         )
         assert bound.event_id == ev.derive_event_id(service=SERVICE, bot_id="BOT1", chat_id="CHAT1", message_id="M1")
         # envelope removed from the cleaned body -> never forwarded to the model
@@ -83,7 +83,7 @@ class TestBinding:
         with pytest.raises(ev.BindingMismatchEnvelopeError):
             ev.extract_and_remove_envelope(
                 body, secret=SECRET, service=SERVICE, bot_id="BOT1",
-                chat_id="CHAT1", message_id="M1", now=NOW,
+                now=NOW,
             )
 
     def test_cross_account_substitution_is_rejected(self):
@@ -92,7 +92,7 @@ class TestBinding:
         with pytest.raises(ev.BindingMismatchEnvelopeError):
             ev.extract_and_remove_envelope(
                 body, secret=SECRET, service=SERVICE, bot_id="BOT2",
-                chat_id="CHAT1", message_id="M1", now=NOW,
+                now=NOW,
             )
 
     def test_quoted_in_user_text_is_not_scanned(self):
@@ -108,7 +108,7 @@ class TestBinding:
         with pytest.raises(ev.NoEnvelopeError):
             ev.extract_and_remove_envelope(
                 body, secret=SECRET, service=SERVICE, bot_id="BOT1",
-                chat_id="CHAT1", message_id="M1", now=NOW,
+                now=NOW,
             )
 
     def test_quoted_envelope_in_history_is_not_scanned(self):
@@ -124,7 +124,7 @@ class TestBinding:
         with pytest.raises(ev.NoEnvelopeError):
             ev.extract_and_remove_envelope(
                 body, secret=SECRET, service=SERVICE, bot_id="BOT1",
-                chat_id="CHAT1", message_id="M1", now=NOW,
+                now=NOW,
             )
 
     def test_duplicate_envelopes_are_ambiguous_and_rejected(self):
@@ -137,7 +137,7 @@ class TestBinding:
         with pytest.raises(ev.AmbiguousEnvelopeError):
             ev.extract_and_remove_envelope(
                 body, secret=SECRET, service=SERVICE, bot_id="BOT1",
-                chat_id="CHAT1", message_id="M1", now=NOW,
+                now=NOW,
             )
 
     def test_missing_envelope_fails_closed(self):
@@ -148,7 +148,7 @@ class TestBinding:
         with pytest.raises(ev.NoEnvelopeError):
             ev.extract_and_remove_envelope(
                 body, secret=SECRET, service=SERVICE, bot_id="BOT1",
-                chat_id="CHAT1", message_id="M1", now=NOW,
+                now=NOW,
             )
 
     def test_expired_envelope_rejected_but_durable_result_retrievable(self):
@@ -160,7 +160,7 @@ class TestBinding:
         with pytest.raises(ev.ExpiredEnvelopeError):
             ev.extract_and_remove_envelope(
                 body, secret=SECRET, service=SERVICE, bot_id="BOT1",
-                chat_id="CHAT1", message_id="M1", now=NOW,
+                now=NOW,
             )
         # durable replay retention is INDEPENDENT of envelope expiry
         store["evt1_result"] = {"meal_id": "meal-1"}
@@ -195,15 +195,15 @@ class TestAcceptance:
             "I had 300g chicken and a glass of wine",
             _envelope(input_digest=ev.canonical_input("I had 300g chicken and a glass of wine"), message_id="M2", nonce="n2"),
         )
-        e1, _ = ev.extract_and_remove_envelope(b1, secret=SECRET, service=SERVICE, bot_id="BOT1", chat_id="CHAT1", message_id="M1", now=NOW)
-        e2, _ = ev.extract_and_remove_envelope(b2, secret=SECRET, service=SERVICE, bot_id="BOT1", chat_id="CHAT1", message_id="M2", now=NOW)
+        e1, _ = ev.extract_and_remove_envelope(b1, secret=SECRET, service=SERVICE, bot_id="BOT1", now=NOW)
+        e2, _ = ev.extract_and_remove_envelope(b2, secret=SECRET, service=SERVICE, bot_id="BOT1", now=NOW)
         assert e1.event_id != e2.event_id
 
     def test_redelivery_of_one_message_is_one_consumption(self):
         b1 = _valid_body()
         b2 = _valid_body()
-        e1, _ = ev.extract_and_remove_envelope(b1, secret=SECRET, service=SERVICE, bot_id="BOT1", chat_id="CHAT1", message_id="M1", now=NOW)
-        e2, _ = ev.extract_and_remove_envelope(b2, secret=SECRET, service=SERVICE, bot_id="BOT1", chat_id="CHAT1", message_id="M1", now=NOW)
+        e1, _ = ev.extract_and_remove_envelope(b1, secret=SECRET, service=SERVICE, bot_id="BOT1", now=NOW)
+        e2, _ = ev.extract_and_remove_envelope(b2, secret=SECRET, service=SERVICE, bot_id="BOT1", now=NOW)
         assert e1.event_id == e2.event_id
 
     def test_concurrent_runs_keep_separate_identities(self):
@@ -212,9 +212,9 @@ class TestAcceptance:
         a = _valid_body()  # a's own envelope bound to a's input
         # build body B with A's envelope but DIFFERENT user text -> must fail
         b = _openclaw_msg("A completely different meal", _envelope(input_digest=ev.canonical_input("I had 300g chicken and a glass of wine")))
-        ea, _ = ev.extract_and_remove_envelope(a, secret=SECRET, service=SERVICE, bot_id="BOT1", chat_id="CHAT1", message_id="M1", now=NOW)
+        ea, _ = ev.extract_and_remove_envelope(a, secret=SECRET, service=SERVICE, bot_id="BOT1", now=NOW)
         with pytest.raises(ev.BindingMismatchEnvelopeError):
-            ev.extract_and_remove_envelope(b, secret=SECRET, service=SERVICE, bot_id="BOT1", chat_id="CHAT1", message_id="M1", now=NOW)
+            ev.extract_and_remove_envelope(b, secret=SECRET, service=SERVICE, bot_id="BOT1", now=NOW)
         assert ea.event_id == ev.derive_event_id(service=SERVICE, bot_id="BOT1", chat_id="CHAT1", message_id="M1")
 
 
