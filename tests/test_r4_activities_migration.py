@@ -787,3 +787,147 @@ class TestForeignKeyMappingAndSchemaPolicy:
         with engine.begin() as c:
             for name in ("first", "second"):
                 c.execute(text(f"DROP SCHEMA IF EXISTS {name} CASCADE"))
+
+
+# --------------------------------------------------------------------------- #
+# REVIEW #11 - the CREATION path must obey the same-schema policy too. With
+# schema=None an unqualified CREATE TABLE lands by search_path while an unqualified
+# REFERENCES users(id) resolves independently, so creation could bind a cross-schema
+# users that the validator then rejects.
+# --------------------------------------------------------------------------- #
+class TestCreationDestinationNamespace:
+    """The destination namespace is resolved (explicit schema, or the first schema the
+    user may CREATE in for schema=None) and BOTH the table and its users target are
+    qualified to it. A destination without its own users relation fails loudly."""
+
+    @staticmethod
+    def _two_schemas(engine, first_has_users: bool, second_has_users: bool,
+                     second_has_activities: bool = False):
+        with engine.begin() as c:
+            for name in ("first", "second"):
+                c.execute(text(f"DROP SCHEMA IF EXISTS {name} CASCADE"))
+                c.execute(text(f"CREATE SCHEMA {name}"))
+            if first_has_users:
+                c.execute(text("CREATE TABLE first.users (id uuid PRIMARY KEY)"))
+            if second_has_users:
+                c.execute(text("CREATE TABLE second.users (id uuid PRIMARY KEY)"))
+            if second_has_activities:
+                c.execute(text(
+                    "CREATE TABLE second.activities ("
+                    "    id uuid NOT NULL DEFAULT gen_random_uuid(),"
+                    "    user_id uuid NOT NULL,"
+                    "    activity_date date NOT NULL,"
+                    "    title character varying(255) NOT NULL,"
+                    "    calories_burned double precision NOT NULL,"
+                    "    created_at timestamp with time zone NOT NULL DEFAULT now(),"
+                    "    updated_at timestamp with time zone NOT NULL DEFAULT now(),"
+                    "    CONSTRAINT activities_pkey PRIMARY KEY (id),"
+                    "    CONSTRAINT activities_user_id_fkey FOREIGN KEY (user_id)"
+                    "        REFERENCES second.users(id) ON DELETE CASCADE"
+                    ")"
+                ))
+                c.execute(text(
+                    "CREATE INDEX ix_activities_user_id ON second.activities (user_id)"
+                ))
+                c.execute(text(
+                    "CREATE INDEX idx_activities_user_date ON second.activities "
+                    "(user_id, activity_date)"
+                ))
+
+    @staticmethod
+    def _drop(engine):
+        with engine.begin() as c:
+            for name in ("first", "second"):
+                c.execute(text(f"DROP SCHEMA IF EXISTS {name} CASCADE"))
+
+    def _fk_of(self, conn, schema):
+        return conn.execute(text("""
+            SELECT c.confrelid, r.relname AS ref_table, n.nspname AS ref_schema,
+                   string_agg(fa.attname, ',' ORDER BY f.ord) AS ref_cols
+            FROM pg_constraint c
+            JOIN unnest(c.confkey) WITH ORDINALITY f(attnum, ord) ON true
+            JOIN pg_attribute fa ON fa.attrelid = c.confrelid AND fa.attnum = f.attnum
+            JOIN pg_class r ON r.oid = c.confrelid
+            JOIN pg_namespace n ON n.oid = r.relnamespace
+            WHERE c.conname = :fk AND c.conrelid = (
+                SELECT k.oid FROM pg_class k JOIN pg_namespace nn ON nn.oid = k.relnamespace
+                WHERE k.relname = 'activities' AND nn.nspname = :s)
+            GROUP BY c.confrelid, r.relname, n.nspname
+        """), {"fk": sa_act.FK_NAME, "s": schema}).mappings().one()
+
+    def _users_oid(self, conn, schema):
+        return conn.execute(
+            text("SELECT c.oid FROM pg_class c"
+                 " JOIN pg_namespace n ON n.oid = c.relnamespace"
+                 " WHERE c.relname = 'users' AND n.nspname = :s"), {"s": schema}
+        ).scalar()
+
+    def test_default_schema_creation_refuses_cross_schema_users(self, engine):
+        """search_path = first, second; `first` holds neither users nor activities;
+        `second` holds users but no activities.
+
+        The destination for an unqualified CREATE is `first`, and an unqualified
+        `REFERENCES users(id)` would have found `second.users` - a cross-schema
+        relationship the validator rejects. Creation must FAIL, leaving no table.
+        """
+        self._two_schemas(engine, first_has_users=False, second_has_users=True)
+        try:
+            with engine.begin() as c:
+                c.execute(text("SET search_path TO first, second"))
+                with pytest.raises(sa_act.MissingUsersRelation) as ei:
+                    sa_act.create_activities(c)
+                assert "users" in str(ei.value)
+                # no new table or indexes may survive (the caller's transaction rolls
+                # back, but assert the failure itself created nothing here)
+                assert c.execute(text(
+                    "SELECT count(*) FROM pg_class k JOIN pg_namespace n"
+                    " ON n.oid = k.relnamespace"
+                    " WHERE k.relname = 'activities' AND n.nspname = 'first'"
+                )).scalar() == 0
+            with engine.begin() as c:
+                assert c.execute(text(
+                    "SELECT count(*) FROM pg_class k JOIN pg_namespace n"
+                    " ON n.oid = k.relnamespace"
+                    " WHERE k.relname = 'activities' AND n.nspname = 'first'"
+                )).scalar() == 0
+                assert c.execute(text(
+                    "SELECT count(*) FROM pg_indexes"
+                    " WHERE schemaname = 'first' AND tablename = 'activities'"
+                )).scalar() == 0
+        finally:
+            self._drop(engine)
+
+    def test_default_schema_creation_binds_same_schema_users(self, engine):
+        """Positive: with schema=None and a destination that owns a users relation, the
+        created FK points at THAT schema's users, with the referenced column `id`."""
+        self._two_schemas(engine, first_has_users=True, second_has_users=True,
+                          second_has_activities=True)
+        try:
+            with engine.begin() as c:
+                c.execute(text("SET search_path TO first, second"))
+                sa_act.create_activities(c)
+                fk = self._fk_of(c, "first")
+                assert fk["ref_schema"] == "first", fk
+                assert fk["confrelid"] == self._users_oid(c, "first"), fk
+                assert fk["ref_cols"] == "id", fk
+                # and the resulting table validates through the same entry point
+                c.execute(text("SET search_path TO first, second"))
+                assert sa_act.diff_activities(c, schema=None)["fatal"] == []
+        finally:
+            self._drop(engine)
+
+    def test_explicit_schema_creation_ignores_misleading_search_path(self, engine):
+        """Positive: an explicit schema is created WITH its own users even when another
+        schema's users leads the search path."""
+        self._two_schemas(engine, first_has_users=True, second_has_users=True)
+        try:
+            with engine.begin() as c:
+                c.execute(text("SET search_path TO first"))   # misleading: first.users
+                sa_act.create_activities(c, schema="second")
+                fk = self._fk_of(c, "second")
+                assert fk["ref_schema"] == "second", fk
+                assert fk["confrelid"] == self._users_oid(c, "second"), fk
+                assert fk["ref_cols"] == "id", fk
+                assert sa_act.diff_activities(c, schema="second")["fatal"] == []
+        finally:
+            self._drop(engine)

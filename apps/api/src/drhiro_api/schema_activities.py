@@ -298,19 +298,79 @@ def table_exists(conn: Connection, schema: str | None = None) -> bool:
 # creation (fresh database)
 # --------------------------------------------------------------------------- #
 
+class MissingUsersRelation(RuntimeError):
+    """Fresh creation refuses to bind a `users` target from another namespace.
+
+    Under the same-schema policy the created table and the `users` it references must
+    live in ONE namespace. An unqualified `REFERENCES users(id)` instead resolves
+    through search_path at CREATE time, which can bind a different schema's users than
+    the destination schema of the new table - producing a cross-schema relationship
+    that `diff_activities` rejects. Deriving the target from whichever `users` happens
+    to resolve is exactly the bug being prevented, so creation fails loudly instead.
+    """
+
+
+def _creation_namespace_oid(conn: Connection, schema: str | None) -> int:
+    """The namespace an unqualified CREATE would actually land in.
+
+    With an explicit schema that IS the destination. With schema=None PostgreSQL
+    resolves an unqualified CREATE TABLE to the FIRST schema in the effective search
+    path in which the current user may CREATE (not merely the first that exists), so
+    that is what is resolved here rather than guessed from name resolution of some
+    other relation.
+    """
+    if schema:
+        oid = conn.execute(
+            text("SELECT oid FROM pg_namespace WHERE nspname = :s"), {"s": schema}
+        ).scalar()
+        if oid is None:
+            raise MissingUsersRelation(f"schema {schema!r} does not exist")
+        return oid
+    oid = conn.execute(text("""
+        SELECT n.oid
+        FROM pg_namespace n
+        WHERE n.nspname = ANY(current_schemas(false))
+          AND has_schema_privilege(n.oid, 'CREATE')
+        ORDER BY array_position(current_schemas(false), n.nspname)
+        LIMIT 1
+    """)).scalar()
+    if oid is None:
+        raise MissingUsersRelation(
+            "cannot determine a writable schema for an unqualified CREATE - "
+            "search_path has no schema in which the current user may CREATE"
+        )
+    return oid
+
+
 def create_activities(conn: Connection, schema: str | None = None) -> None:
     """Create the table with the declared shape (ORM columns + prod-faithful extras).
 
     Server defaults (`gen_random_uuid()`, `now()`), the CHECK and the composite
     index are taken from the measured production schema so a fresh database does
     not drift from the real one.
+
+    Both the new table AND its `users` target are emitted SCHEMA-QUALIFIED against the
+    resolved DESTINATION namespace - including when `schema` is None and the caller
+    relies on search_path. Emitting an unqualified `REFERENCES users(id)` would let the
+    FK bind a different schema's users than the table's own namespace (the same-schema
+    policy the validator enforces), and emitting an unqualified table name would place
+    the table by search_path while the FK resolved independently. If the destination
+    namespace has no `users` relation, creation FAILS rather than silently falling back
+    to another schema's users.
     """
-    q = _qualify(schema)
-    # The FK target is emitted SCHEMA-QUALIFIED against the same namespace as the table
-    # being created. An unqualified `REFERENCES users(id)` resolves through search_path
-    # at CREATE time and can bind a different schema's users than the validator (and the
-    # operator) expects - the same-schema policy must hold at creation, not only in
-    # validation.
+    dest_ns = _creation_namespace_oid(conn, schema)
+    dest_name = conn.execute(
+        text("SELECT nspname FROM pg_namespace WHERE oid = :o"), {"o": dest_ns}
+    ).scalar()
+    if not dest_name or _IDENT_RE.sub("", dest_name):
+        raise MissingUsersRelation(f"unusable destination schema name {dest_name!r}")
+    if _relation_in_namespace(conn, "users", dest_ns) is None:
+        raise MissingUsersRelation(
+            f"refusing to create {dest_name}.{TABLE}: that schema has no `users` "
+            f"relation, and the same-schema policy forbids referencing another "
+            f"schema's users"
+        )
+    q = f"{dest_name}."
     conn.execute(text(f"""
         CREATE TABLE {q}{TABLE} (
             id uuid NOT NULL DEFAULT gen_random_uuid(),
