@@ -1,0 +1,118 @@
+# Review round 9 evidence - focused corrections
+
+Generated: 2026-09-11T10:12:21Z (UTC)
+
+## Environment
+
+```
+host:            Linux 6.8.0-1060-raspi aarch64
+os:              Ubuntu 24.04.4 LTS
+python:          Python 3.12.3
+docker:          Docker version 29.5.3, build d1c06ef
+compose:         5.1.4
+postgres:        PostgreSQL 16.14 (Debian 16.14-1.pgdg13+1) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+branch:          feature/meal-liquid-idempotency
+functional base: c59cec4522f8adb70c70805caa33426cd54a39a6
+functional head: 9076937cc733fc3fe05ef53bce2ec7b149550747
+docs head:       0104940760a5403a53391888602176a7055f21db
+frozen cand.:    7e2cf6915dbd7478e8a558817d4d51aa63879e60 (unchanged)
+```
+
+## Source actually imported (rerun discipline)
+
+drhiro_api is an EDITABLE install pointing at /home/mirko/work/DrHiro/apps/api/src; a before/after
+run inside a worktree imports the MAIN tree unless PYTHONPATH is forced. These are
+the paths and hashes actually used:
+
+```
+--- HOST (fixed source, at head) ---
+resolved: /home/mirko/work/DrHiro/apps/api/src/drhiro_api/schema_activities.py
+host  17291ec49aee1d99a04eb3b0759059304b2fb65982095fa45ef47e30b1642ff2  /home/mirko/work/DrHiro/apps/api/src/drhiro_api/schema_activities.py
+host  a5d33b2a863232e58a1036fa626d3f690fbf55fc76f6267dff871c3dfc4b1d56  /home/mirko/work/DrHiro/deploy/disposable/app/ingress.py
+
+--- RUNNING INGRESS CONTAINER (what the image actually executed) ---
+ctnr  a5d33b2a863232e58a1036fa626d3f690fbf55fc76f6267dff871c3dfc4b1d56  /app/ingress.py
+ctnr  pause_hook_refs=2
+
+--- PRE-FIX WORKTREE (base source, forced via PYTHONPATH) ---
+worktree: c59cec4522f8adb70c70805caa33426cd54a39a6
+resolved: /tmp/review9-before/apps/api/src/drhiro_api/schema_activities.py
+fix markers present (must be False for a true pre-fix run):
+  _relation_oid : False
+  _type_precision: False
+  column_types(oid) len guard: False
+bef   e1be72e20dfae8c14f8b2a1726ecf7ae037f6611a262aeb2c105352ee9ce9cc9  /tmp/review9-before/apps/api/src/drhiro_api/schema_activities.py
+```
+
+## Exact commands
+
+```bash
+# migration: FAILING-BEFORE (base worktree, PRE-FIX source forced via PYTHONPATH)
+cd /tmp/review9-before
+PYTHONPATH=/tmp/review9-before/apps/api/src DRHIRO_ACTIVITIES_MIGRATION_DB=1 \
+  DRHIRO_TEST_DB_URL='postgresql+psycopg2://drhiro:drhiro@localhost:5435/drhiro_test' python -m pytest \
+  tests/test_r4_activities_migration.py::TestSchemaNoneDoesNotCombineRelations \
+  tests/test_r4_activities_migration.py::TestConservativeTypeAndDefaultEquivalence -q
+
+# migration: PASSING-AFTER (head source)
+cd /home/mirko/work/DrHiro
+DRHIRO_ACTIVITIES_MIGRATION_DB=1 DRHIRO_TEST_DB_URL='postgresql+psycopg2://drhiro:drhiro@localhost:5435/drhiro_test' \
+  python -m pytest tests/test_r4_activities_migration.py -q
+
+# ingress regression suite (requires the disposable stack UP)
+DRHIRO_ISOLATED_STACK=1 python -m pytest tests/test_t1_isolated_ingress_stack.py -q
+```
+
+## Finding 2 + 3 - failing-before / passing-after (real PostgreSQL)
+
+### FAILING-BEFORE - new negatives against the PRE-FIX validator
+
+```
+E       assert False
+E        +  where False = any(<generator object TestConservativeTypeAndDefaultEquivalence.test_timestamp_precision_is_fatal.<locals>.<genexpr> at 0xffff8a4272a0>)
+
+tests/test_r4_activities_migration.py:656: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_r4_activities_migration.py::TestSchemaNoneDoesNotCombineRelations::test_types_and_checks_come_from_the_intended_relation
+FAILED tests/test_r4_activities_migration.py::TestSchemaNoneDoesNotCombineRelations::test_unqualified_fk_resolves_to_intended_relation
+FAILED tests/test_r4_activities_migration.py::TestConservativeTypeAndDefaultEquivalence::test_varchar1_title_is_fatal
+FAILED tests/test_r4_activities_migration.py::TestConservativeTypeAndDefaultEquivalence::test_timestamp_precision_is_fatal
+4 failed, 4 passed in 2.66s
+```
+
+### PASSING-AFTER - full R4 suite against the FIXED validator
+
+```
+................................                                         [100%]
+32 passed in 3.10s
+```
+
+## Ingress regression suite (disposable stack; captured while RUNNING)
+
+Finding 1 coverage (TestExhaustionSweepRespectsActiveLease):
+  - live final claim survives a concurrent recovery pass (status/token/lease
+    intact; exhausted=0); worker released -> exactly one consumption + completion
+  - expired final claim is swept to exhausted and refuses redelivery
+
+```
+.......................................................                  [100%]
+55 passed in 785.21s (0:13:05)
+```
+
+## B7 - status
+
+SENDER IDENTITY: still UNIMPLEMENTED. A verified bot identity authenticates the
+bot, not the sender; every message maps to one fixed disposable user.
+
+EDITS / CONTENT CONFLICTS: still UNIMPLEMENTED. An edited message_id is treated as
+a duplicate receipt, not a revision.
+
+POLLING OFFSET: implemented (review 8), real Bot API offset contract with a durable
+offset in telegram_consumer_offset. Not full production polling acceptance.
+
+## Capability labelling
+
+Container uptimes unchanged support 'no observed restart' only; they do not
+independently prove that configuration, credentials or data were unchanged. Every
+action targeted the disposable stack or a disposable test database. Passing
+disposable-stack tests are EVIDENCE, not production acceptance.
