@@ -133,8 +133,7 @@ class TestB6SchemaReconciled:
     def test_raw_sql_syntax_valid(self):
         """The raw SQL file has no syntax errors (no '#' used as comment)."""
         sql_path = os.path.join(
-            os.path.dirname(__file__), "..", "docs", "deliverables",
-            "meal-liquid-idempotency", "B_schema_migration_up.sql"
+            os.path.dirname(__file__), "fixtures", "B_schema_migration_up.sql"
         )
         with open(sql_path) as f:
             content = f.read()
@@ -159,8 +158,7 @@ class TestB6SchemaReconciled:
     def test_raw_sql_has_updated_at_on_all_tables(self):
         """Raw SQL includes updated_at on consumption_items and beverage_measurements."""
         sql_path = os.path.join(
-            os.path.dirname(__file__), "..", "docs", "deliverables",
-            "meal-liquid-idempotency", "B_schema_migration_up.sql"
+            os.path.dirname(__file__), "fixtures", "B_schema_migration_up.sql"
         )
         with open(sql_path) as f:
             content = f.read()
@@ -188,8 +186,7 @@ class TestB6SchemaReconciled:
     def test_raw_sql_no_partial_indexes(self):
         """Raw SQL uses UNIQUE indexes (not partial WHERE-clause indexes)."""
         sql_path = os.path.join(
-            os.path.dirname(__file__), "..", "docs", "deliverables",
-            "meal-liquid-idempotency", "B_schema_migration_up.sql"
+            os.path.dirname(__file__), "fixtures", "B_schema_migration_up.sql"
         )
         with open(sql_path) as f:
             content = f.read()

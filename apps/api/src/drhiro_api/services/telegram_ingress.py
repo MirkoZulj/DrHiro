@@ -11,7 +11,7 @@ The model may propose quantities/food matches. It never chooses the user, the
 event identity, operation ownership, or authorization, and its output is
 validated before use and never trusted for nutrition values.
 
-See docs/deliverables/meal-liquid-idempotency/T1_ingress_design_and_writer_ownership.md
+See the T1 ingress design note for writer ownership.
 """
 from __future__ import annotations
 

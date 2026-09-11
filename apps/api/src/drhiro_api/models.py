@@ -485,7 +485,7 @@ class FoodIngredient(Base):
 
 
 # ── Consumption idempotency + item identity + beverage linkage ──────────────
-# Added by feature/meal-liquid-idempotency. See docs/deliverables/meal-liquid-idempotency/.
+# Added by feature/meal-liquid-idempotency.
 
 
 class ConsumptionOperation(Base, TimestampMixin):

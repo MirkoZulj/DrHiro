@@ -13,7 +13,7 @@ Two responsibilities:
    authenticated callers are unaffected and keep their explicit idempotency
    contract.
 
-See docs/deliverables/meal-liquid-idempotency/T1_ingress_design_and_writer_ownership.md
+See the T1 ingress design note for writer ownership.
 """
 from __future__ import annotations
 
