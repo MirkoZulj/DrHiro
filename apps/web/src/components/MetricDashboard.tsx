@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { authClient } from '../lib/auth'
 import { MetricConfig } from '../lib/types'
+import BmrCalculator from './BmrCalculator'
 
 type TF = 'D' | 'W' | 'M'
 
@@ -186,8 +187,11 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
           ) : isLiquid ? (
             <LiquidDashboard liquids={liquids} />
           ) : (
-            <MetricChartView points={points} config={config} goal={goalForTf} goalLabel={goalLabel} granularity={granularity}
-               />
+            <>
+              <MetricChartView points={points} config={config} goal={goalForTf} goalLabel={goalLabel} granularity={granularity}
+                 />
+              {config.key === 'activity' && <BmrCalculator />}
+            </>
           )}
         </div>
 

@@ -1,0 +1,124 @@
+# Shape A — post-message DB verification + ops note
+
+Date: 2026-09-11. Messages verified: `300ml orange juice`, `water 500ml`, `walk 180 kcal`.
+Baseline before them: meals 41 / measurements 3059 / activities 3.
+
+## 1. Deltas — the three routing contracts PASS
+
+    totals after:  meals=42  measurements=3061  activities=4  meal_items=137
+    delta:         meals +1  measurements +2      activities +1  meal_items +1
+
+| message | result | verdict |
+|---|---|---|
+| `300ml orange juice` | 1 meal (snack, confirmed, kcal 45) AND 1 liquid `{category:"non_alcoholic", amount_ml:300}` | PASS — dual write, not meal-only |
+| `water 500ml` | 1 liquid `{category:"water", amount_ml:500}`, 0 meals | PASS — liquid only |
+| `walk 180 kcal` | 1 activity `title:"walk", calories_burned:180`, 0 meals, 0 liquids | PASS — walk is NOT a meal |
+
+Neither rollback trigger fired: juice is not meal-only, and walk is not a meal.
+**No rollback performed.**
+
+## 2. The category split — juice is NOT counted as water, but it is not shown as juice either
+
+Real summary, computed in-process against the deployed API:
+
+```json
+{ "water_ml_today": 800,
+  "liquids_today": { "total_ml": 800, "water": 500, "juice": 0, "other": 300 },
+  "meals_logged_today": 1, "calories_kcal_today": 45.0, "activity_kcal_today": 180.0 }
+```
+
+Juice is **not** in `water` (500 only) — the owner's stated condition holds. But the
+300 ml is in `other`, not `juice`.
+
+Root cause is upstream, not in the dashboard: the liquid WRITER stored
+`category: "non_alcoholic"` for an orange juice. No rearrangement of the
+dashboard's category list can turn that into `juice`.
+
+## 3. REGRESSION I INTRODUCED — the web UI reads the LEGACY keys
+
+The deployed bundle `/usr/share/nginx/html/assets/index-C-s2BbhV.js` builds the
+water tile breakdown from fixed legacy keys:
+
+```js
+breakdown: N.key==="water" && e.liquids_today ? [
+  {label:"Water",         ml:e.liquids_today.water},
+  {label:"Non-alcoholic", ml:e.liquids_today.non_alcoholic},
+  {label:"Beer",          ml:e.liquids_today.beer},
+  {label:"Wine",          ml:e.liquids_today.wine},
+  {label:"Spirits",       ml:e.liquids_today.spirits},
+  {label:"Other alcohol", ml:e.liquids_today.other_alcohol},
+].filter(M => M.ml > 0) : void 0
+```
+
+The Shape A dashboard change replaced that legacy list with canonical categories
+(water, coffee, tea, juice, soda, milk, alcohol, smoothie, broth, other). So:
+
+- `non_alcoholic`, `beer`, `wine`, `spirits`, `other_alcohol` are now **undefined**.
+- `.filter(M => M.ml > 0)` drops undefined rows, so the **300 ml juice no longer
+  appears in the tile breakdown at all**, even though `total_ml` (800) still
+  includes it and the Water row still shows 500.
+- Any beer/wine/spirits entry would likewise vanish from the breakdown, since the
+  writer's `alcohol` never surfaces under the legacy `beer`/`wine`/`spirits` keys.
+
+Net: the dashboard change is **incompatible with the deployed web image**. It
+removed legacy buckets the UI depends on without the UI learning the new keys.
+
+Correct fix (not applied): emit BOTH key sets (superset) from the API, or land the
+writer's canonical categories AND the web UI's new keys together. The writer must
+also stop storing `non_alcoholic` for a juice.
+
+## 4. Ops note — tonight's facts
+
+- **The production build root `/opt/drhiro` is NOT a checkout of the repo.** 13 API
+  files diverge; the repo contains no `infra/docker-compose.yml` at all (production's
+  compose exists only on the VPS, beside `.env`). There are hand-edit `.bak` files in
+  production source. Treat a commit as a donor of hunks, never as a build root.
+- **Production answers `404` for `/api/v1/ingest/telegram/event` and
+  `/api/v1/settings`** — those routes are not registered there (the repo's `main.py`
+  registers both). Ingress stays 404 through Shape A.
+- **Shape A deployed file list** (merged onto `/opt/drhiro`, 6 files, +128/-45):
+  `services/log_intents.py` (new), `services/text_meal_parser.py`,
+  `services/date_parser.py`, `routers/openclaw_tools.py`, `routers/meals.py`,
+  `routers/dashboard.py`. `models.py` NOT changed. Withheld: `Request`/header
+  fallback, the `require_model_writer_allowed` gate, `correct_log`/`delete_log`.
+- **Do NOT map `deleted_at` on the ORM.** `deferred=True` still emits the column in
+  the INSERT, and with a `server_default` it then emits `RETURNING <col>`, which
+  500s on this schema. Use capability-guarded raw SQL instead.
+- **The live Telegram flow does not use `create_meal_from_text`.** The verified rows
+  carry `input_method: text_intelligent` and `source_provider: manual`, i.e. the
+  intelligent-meal path. Shape A's from-text changes are inert for this user's
+  Telegram messages; the liquid dual-write seen here came from that other path.
+
+## 5. HOTFIX APPLIED — summary key superset (api only, no rollback)
+
+One file changed: live `routers/dashboard.py`, summary function only.
+`liquids_today` now emits BOTH key sets, all numeric, default 0, with each
+millilitre counted exactly once in `total_ml` (summed over canonical buckets).
+
+    stored category -> canonical, legacy
+    water          -> water,    (none)
+    juice          -> juice,    non_alcoholic
+    soda           -> soda,     non_alcoholic
+    coffee         -> coffee,   non_alcoholic
+    tea            -> tea,      non_alcoholic
+    milk           -> milk,     non_alcoholic
+    smoothie       -> smoothie, non_alcoholic
+    broth          -> broth,    non_alcoholic
+    non_alcoholic  -> other,    non_alcoholic
+    beer           -> alcohol,  beer
+    wine           -> alcohol,  wine
+    spirits        -> alcohol,  spirits
+    other_alcohol  -> alcohol,  other_alcohol
+    alcohol        -> alcohol,  other_alcohol
+    other/unknown  -> other,    non_alcoholic
+
+Deployed payload after the three existing rows:
+
+    total_ml 800 | water 500 | juice 0 | other 300 | non_alcoholic 300
+    beer 0 | wine 0 | spirits 0 | other_alcohol 0
+    meals_logged_today 1 | activity_kcal_today 180
+
+Tile now renders Water 500 + Non-alcoholic 300 (both > 0). `water` stays 500.
+health 200, ingest 404, alembic d5e6f7a8b9c0. Worker image untouched.
+Rollback tags available: drhiro-api:shapeA-nokeyfix-20260911 and
+drhiro-api:rollback-shapeA-20260911T192953Z.

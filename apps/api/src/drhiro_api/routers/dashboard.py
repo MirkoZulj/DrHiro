@@ -246,22 +246,55 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
     )
     # Liquid breakdown by category (value_json may carry a "category" key;
     # missing -> "water" for backward compat with old rows).
-    # Canonical drink categories. The previous list was legacy
-    # (water/non_alcoholic/beer/wine/spirits/other_alcohol), so EVERY modern
-    # category -- juice, coffee, tea, soda, milk -- fell through to "water" and a
-    # 300 ml orange juice was reported as water. Unknown values now land in
-    # "other" rather than being silently relabelled as water.
+    # SUPERSET of two key sets. This endpoint has two consumers with different
+    # expectations and BOTH must be satisfied:
+    #
+    #  * canonical categories (water/coffee/tea/juice/soda/milk/alcohol/smoothie/
+    #    broth/other) -- what the logging work emits;
+    #  * the LEGACY keys the DEPLOYED web bundle still reads. The water tile
+    #    breakdown in /usr/share/nginx/html/assets/index-*.js is built from fixed
+    #    keys (water, non_alcoholic, beer, wine, spirits, other_alcohol) and drops
+    #    undefined rows with `.filter(M => M.ml > 0)`. Emitting canonical keys
+    #    alone therefore made a logged drink VANISH from the tile even though
+    #    total_ml still counted it.
+    #
+    # Each millilitre is counted exactly ONCE in total_ml (summed over the
+    # canonical buckets only) and additionally surfaced under its legacy key.
     liquid_cats = ["water", "coffee", "tea", "juice", "soda", "milk", "alcohol",
                    "smoothie", "broth", "other"]
-    liquid_today: dict[str, int] = {c: 0 for c in liquid_cats}
+    legacy_cats = ["non_alcoholic", "beer", "wine", "spirits", "other_alcohol"]
+    liquid_today: dict[str, int] = {c: 0 for c in liquid_cats + legacy_cats}
+    # stored value_json.category -> (canonical bucket, legacy bucket or None)
+    liquid_map = {
+        "water": ("water", None),
+        "juice": ("juice", "non_alcoholic"),
+        "soda": ("soda", "non_alcoholic"),
+        "coffee": ("coffee", "non_alcoholic"),
+        "tea": ("tea", "non_alcoholic"),
+        "milk": ("milk", "non_alcoholic"),
+        "smoothie": ("smoothie", "non_alcoholic"),
+        "broth": ("broth", "non_alcoholic"),
+        "non_alcoholic": ("other", "non_alcoholic"),
+        "beer": ("alcohol", "beer"),
+        "wine": ("alcohol", "wine"),
+        "spirits": ("alcohol", "spirits"),
+        "other_alcohol": ("alcohol", "other_alcohol"),
+        "alcohol": ("alcohol", "other_alcohol"),
+    }
     for m in measurements:
         if m["metric_type"] != MetricType.WATER or m["start_at"] < today_start:
             continue
-        cat = (m["value_json"].get("category") or "water")
-        if cat not in liquid_today:
-            cat = "other"
-        liquid_today[cat] += m["value_json"].get("amount_ml", 0)
-    liquids_today = {"total_ml": sum(liquid_today.values()), **liquid_today}
+        value = m.get("value_json") or {}
+        cat = value.get("category") or "water"
+        canon, legacy = liquid_map.get(cat, ("other", "non_alcoholic"))
+        ml = value.get("amount_ml", 0) or 0
+        liquid_today[canon] += ml
+        if legacy:
+            liquid_today[legacy] += ml
+    liquids_today = {
+        "total_ml": sum(liquid_today[c] for c in liquid_cats),
+        **liquid_today,
+    }
     # Last water measurement ANY day (for "last log" display)
     water_last = None
     for m in reversed(measurements):

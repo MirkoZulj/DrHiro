@@ -1,0 +1,112 @@
+# Suite L — restore-verified backup (VPS, production instance)
+
+Date: 2026-09-11. Executed on the VPS at the owner's explicit instruction.
+Scope: read-only, plus one dump and one scratch-database restore.
+
+## Result: PASS
+
+## 1. Dump
+
+    path     /opt/drhiro/backups/drhiro-20260911T192502Z.dump
+    bytes    20366132
+    UTC time 2026-09-11T19:25:02Z
+    sha256   f9e672f12d6b003d0da2974b18e3b70c132152a17c7ce12f0316b32cd09d3417
+    archive  readable: `pg_restore -l` lists 54 table/table-data entries
+    restore  `pg_restore --no-owner` exit 0, zero errors
+
+## 2. Names (discovered, not assumed)
+
+    container  drhiro-postgres-1   (postgres:16, healthy)
+    live DB    drhiro
+    role       drhiro             (there is NO `postgres` role in this instance —
+                                   `psql -U postgres` fails; POSTGRES_USER=drhiro)
+
+`/opt/drhiro/backups` did not exist and was created.
+
+## 3. Live counts (drhiro)
+
+    users = 3
+    meals = 41
+    meal_items = 136
+    measurements = 3059
+    activities = 3
+    recipes = 2
+    public_tables = 27
+    alembic_version = d5e6f7a8b9c0
+    has_consumption_operations = false
+    has_measurements_deleted_at = 0
+    has_activities_deleted_at = 0
+
+## 4. Restore counts (drhiro_restore_check)
+
+    users = 3
+    meals = 41
+    meal_items = 136
+    measurements = 3059
+    activities = 3
+    recipes = 2
+    public_tables = 27
+    alembic_version = d5e6f7a8b9c0
+    has_consumption_operations = false
+    has_measurements_deleted_at = 0
+    has_activities_deleted_at = 0
+
+Every line matches live.
+
+## 5. Spot-check and content digests
+
+Same query run against both databases. The five most recent meals and five most
+recent measurements are identical, and full-table content digests match:
+
+                                              LIVE                               RESTORE
+    users         dab0a7026eec09aeb4ed194ff719f211   =   dab0a7026eec09aeb4ed194ff719f211
+    meals         c4441cd19976023f7172e68d099ef01e   =   c4441cd19976023f7172e68d099ef01e
+    meal_items    4d227bf45669fabc0f77358d6afbd08f   =   4d227bf45669fabc0f77358d6afbd08f
+    measurements  fa6333bdadeba353fb2a8b854d0bf38b   =   fa6333bdadeba353fb2a8b854d0bf38b
+    activities    5281a8a050ecebaf44d8277a479ee60f   =   5281a8a050ecebaf44d8277a479ee60f
+
+    digest = md5(string_agg(md5(row::text), '' ORDER BY id::text))
+
+Most recent meals (both DBs):
+
+    173dee6e  dinner     confirmed  09-08 19:14  1 item
+    37febf63  dinner     confirmed  09-08 18:55  4 items
+    9670bc34  breakfast  confirmed  09-08 12:35  6 items
+    88ecc44f  dinner     confirmed  09-08 12:33  5 items
+    a01faf4f  dinner     confirmed  09-07 06:22  1 item
+
+Most recent measurements (both DBs):
+
+    917178c1  steps     09-09 22:00  {"count": 2611}
+    1a679194  exercise  09-09 06:03  {"exercise_type": "79", "duration_min": 46}
+    238fe4f3  steps     09-08 22:00  {"count": 19115}
+    858312d1  sleep     09-08 20:51  {"duration_min": 227}
+    8426f3f1  sleep     09-08 20:51  {"duration_min": 474}
+
+## 6. dropdb scope
+
+Only `drhiro_restore_check` was dropped. Databases remaining:
+
+    drhiro, drhiro_broken, drhiro_probe, postgres, template0, template1
+
+`drhiro_probe` and `drhiro_broken` pre-existed this work and were not touched.
+Post-drop re-check on live: meals 41, measurements 3059, alembic_version
+d5e6f7a8b9c0.
+
+## 7. Confirmation of what was NOT done
+
+    alembic was not run — no upgrade, no current, no stamp
+    no compose pull, no compose up, no image build
+    no .env edit, no ingress secret set
+    no writes to production tables
+    the dump file was retained; its sha256 is unchanged after the restore
+
+## 8. Observations for the owner (not L failures)
+
+- Production independently confirms the Shape A premise: 27 tables, no
+  `consumption_operations`, no `deleted_at`. The same shape as the scratch DB
+  used for K7-K10.
+- The live ledgers are roughly two days stale: the newest meal is 09-08 19:14
+  and the newest measurement 09-09 22:00, while today is 09-11. Counts match and
+  the restore is sound, so this is not an L failure — but it may be a live
+  logging problem deserving its own investigation, outside this release.

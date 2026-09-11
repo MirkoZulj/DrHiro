@@ -49,6 +49,9 @@ export default function Meals() {
   const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'meals' | 'drinks'>('meals')
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set(['breakfast']))
+  // Liquid-ledger rows per day (water never creates a meal, so it can only
+  // reach this tab from `measurements` via /trends/liquids).
+  const [weekLiquids, setWeekLiquids] = useState<Record<string, { label: string; ml: number }[]>>({})
 
   const dateStr = useMemo(() => isoDate(selectedDate), [selectedDate])
   const todayStr = useMemo(() => isoDate(), [])
@@ -69,6 +72,37 @@ export default function Meals() {
         map[d].push(m)
       }
       setWeekMeals(map)
+      // The Drinks tab also shows the liquid ledger. Water and other
+      // liquid-only entries have NO meal row, so a meal-derived list can
+      // never show them. /trends/liquids gives per-day category totals and
+      // uses the same legacy category keys as the summary.
+      try {
+        const monday = new Date(days[0])
+        const today = new Date()
+        const todayMon = new Date(today)
+        todayMon.setDate(today.getDate() - ((today.getDay() + 6) % 7))
+        todayMon.setHours(0, 0, 0, 0)
+        monday.setHours(0, 0, 0, 0)
+        const weeksBack = Math.max(0,
+          Math.round((todayMon.getTime() - monday.getTime()) / (7 * 86400000)))
+        const liq = await authClient.api(
+          `/trends/liquids?granularity=day&offset=${weeksBack}`)
+        const byDay: Record<string, { label: string; ml: number }[]> = {}
+        const LIQ_ROWS: [string, string][] = [
+          ['water', 'Water'], ['non_alcoholic', 'Non-alcoholic'],
+          ['beer', 'Beer'], ['wine', 'Wine'],
+          ['spirits', 'Spirits'], ['other_alcohol', 'Other alcohol'],
+        ]
+        for (const p of liq?.points ?? []) {
+          const rows = LIQ_ROWS
+            .map(([k, label]) => ({ label, ml: Number(p[k] ?? 0) }))
+            .filter((r) => r.ml > 0)
+          if (rows.length) byDay[p.date] = rows
+        }
+        setWeekLiquids(byDay)
+      } catch {
+        // Drinks tab degrades to the meal-derived rows only.
+      }
     } catch (e) {
       setError(String(e))
     } finally {
@@ -280,20 +314,42 @@ export default function Meals() {
         </div>
       ) : (
         <div className="drinks-list">
-          {drinks.length === 0 ? (
-            <div className="empty">No drinks logged.</div>
-          ) : (
-            drinks.map((m) => (
-              <div key={m.id} className="drink-row">
-                <span className="drink-icon">💧</span>
-                <div className="drink-info">
-                  <span className="drink-name">{m.items?.[0]?.display_name || m.items?.[0]?.food_name || 'Drink'}</span>
-                  <span className="drink-amount">{m.items?.[0]?.grams} ml</span>
-                </div>
-                <span className="drink-kcal">{Math.round(m.totals_json?.kcal ?? 0)} kcal</span>
-              </div>
-            ))
-          )}
+          {(() => {
+            const liqRows = weekLiquids[dateStr] ?? []
+            if (drinks.length === 0 && liqRows.length === 0) {
+              return <div className="empty">No drinks logged.</div>
+            }
+            return (
+              <>
+                {liqRows.length > 0 && (
+                  <div className="drinks-label">Liquids logged</div>
+                )}
+                {liqRows.map((r) => (
+                  <div key={`liq-${r.label}`} className="drink-row">
+                    <span className="drink-icon">💧</span>
+                    <div className="drink-info">
+                      <span className="drink-name">{r.label}</span>
+                      <span className="drink-amount">{r.ml} ml</span>
+                    </div>
+                    <span className="drink-kcal" />
+                  </div>
+                ))}
+                {drinks.length > 0 && (
+                  <div className="drinks-label">Drinks in meals</div>
+                )}
+                {drinks.map((m) => (
+                  <div key={m.id} className="drink-row">
+                    <span className="drink-icon">💧</span>
+                    <div className="drink-info">
+                      <span className="drink-name">{m.items?.[0]?.display_name || m.items?.[0]?.food_name || 'Drink'}</span>
+                      <span className="drink-amount">{m.items?.[0]?.grams} ml</span>
+                    </div>
+                    <span className="drink-kcal">{Math.round(m.totals_json?.kcal ?? 0)} kcal</span>
+                  </div>
+                ))}
+              </>
+            )
+          })()}
         </div>
       )}
     </div>
