@@ -108,43 +108,47 @@ def _dedup_sleep(records):
 def _dedup_steps(records: list[dict]) -> int:
     """Sum step counts without double-counting overlapping intervals.
 
-    Health Connect returns step records at multiple aggregation levels
-    (30-min summaries containing per-minute + per-second detail records).
-    Summing ALL records double-counts sub-intervals.  The prior heuristic
-    gave every record proportional credit for its uncovered fraction, which
-    HALVED real per-minute data even when there were no summaries (the user's
-    band showed ~6.6k, the tile 3.4k).
+    Health Connect returns the SAME steps at two levels:
+      1. 30-minute AGGREGATE buckets (spans ~1799s / 29:59, matching what the
+         user's band shows), and
+      2. finer per-minute / per-second detail records inside those buckets.
+    Summing both double-counts (observed ~13.5k vs the band's ~7.1k).
 
-    Option B (the defensible fix): granular records (< 30 min) are real,
-    distinct measurements — count them fully.  A coarse record (>= 30 min
-    summary) contributes ONLY for the time NOT already covered by granular
-    records (gap-filling).  Never trim a granular record.
+    The 30-minute aggregate buckets are authoritative — their sum matches the
+    device.  So we count buckets FULLY, and only credit a detail record for
+    time NOT already covered by a bucket (gap-filling).  A detail record that
+    sits entirely inside a bucket contributes nothing.
+
+    A bucket is recognised by its long span: Health Connect 30-min summaries
+    land at ~1799s, just UNDER a naive 1800s (30 min) cutoff — which is exactly
+    why the old code misclassified them as granular and double-counted.  We use
+    a ~28-minute threshold so the real summaries are treated as buckets.
     """
     if not records:
         return 0
 
-    GRANULAR = 30 * 60  # 30-minute summary threshold (seconds)
+    BUCKET_SECS = 28 * 60  # ~30-min Health Connect aggregate summaries
 
-    granular = [
+    detail = [
         r for r in records
-        if (r.get("end_at") or r["start_at"]) - r["start_at"] < timedelta(seconds=GRANULAR)
+        if (r.get("end_at") or r["start_at"]) - r["start_at"] < timedelta(seconds=BUCKET_SECS)
     ]
-    coarse = [
+    buckets = [
         r for r in records
-        if (r.get("end_at") or r["start_at"]) - r["start_at"] >= timedelta(seconds=GRANULAR)
+        if (r.get("end_at") or r["start_at"]) - r["start_at"] >= timedelta(seconds=BUCKET_SECS)
     ]
 
-    # Granular records: fully counted; occupy their intervals.
+    # Buckets are authoritative: count fully, occupy their whole interval.
     occupied: list[tuple[datetime, datetime]] = []
     total = 0
-    for rec in granular:
+    for rec in buckets:
         start = rec["start_at"]
         end = rec.get("end_at") or start
         total += (rec.get("value_json") or {}).get("count", 0)
         occupied.append((start, end))
 
-    # Coarse summaries: only uncovered (gap) time is credited, proportionally.
-    for rec in coarse:
+    # Detail records: only credit the portion NOT covered by any bucket.
+    for rec in detail:
         start = rec["start_at"]
         end = rec.get("end_at") or start
         count = (rec.get("value_json") or {}).get("count", 0)
@@ -163,7 +167,7 @@ def _dedup_steps(records: list[dict]) -> int:
             if not uncovered:
                 break
         if not uncovered:
-            continue  # fully covered by granular records
+            continue  # fully covered by buckets
         unc_sec = sum((e - s).total_seconds() for s, e in uncovered)
         total_sec = (end - start).total_seconds()
         if total_sec > 0 and unc_sec > 0:
@@ -972,6 +976,62 @@ def trends_bucketed(
             d = day_at(i)
             lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
             points.append({"date": d.isoformat(), "value": v, "label": lab})
+        return {"granularity": granularity, "metric": metric, "period_label": period_label,
+                "period_key": period_key, "points": points}
+
+    # ---- activity_kcal / burned: total daily burn = BMR + active(walking) + sport ----
+    # Matches /energy-balance's burned definition. Active energy comes from the
+    # tracker ACTIVE_CALORIES when present, else steps-derived (0.04 kcal/step).
+    if metric in ("activity_kcal", "burned_kcal", "activity"):
+        bmr = user.basal_metabolism_kcal or 0.0
+        # sport (manual Activity rows) by local day
+        sport_rows = (db.query(Activity)
+                      .filter(Activity.user_id == user.id,
+                              Activity.activity_date >= start, Activity.activity_date <= end)
+                      .all())
+        sport: dict[date_type, float] = {}
+        for a in sport_rows:
+            sport[a.activity_date] = sport.get(a.activity_date, 0.0) + float(a.calories_burned or 0)
+        # active/walking energy + steps by local day
+        meas = (db.query(Measurement)
+                .filter(Measurement.user_id == user.id,
+                        Measurement.start_at >= start_dt, Measurement.start_at < end_dt)
+                .all())
+        active: dict[date_type, float] = {}
+        steps_by_day: dict[date_type, float] = {}
+        active_avail = False
+        for m in meas:
+            day = m.start_at.astimezone(tz).date()
+            if m.metric_type == MetricType.ACTIVE_CALORIES:
+                v = float((m.value_json or {}).get("value") or (m.value_json or {}).get("count") or 0)
+                active[day] = active.get(day, 0.0) + v
+                active_avail = True
+            elif m.metric_type == MetricType.STEPS:
+                steps_by_day[day] = steps_by_day.get(day, 0.0) + float((m.value_json or {}).get("count") or 0)
+        # walking kcal: prefer tracker active energy, else steps*0.04
+        buckets: list[list[float]] = [[] for _ in range(n)]
+        for i in range(n):
+            d = day_at(i)
+            dt = datetime.combine(d, datetime.min.time(), tzinfo=tz)
+            idx, _ = bucket_of(dt)
+            if idx is None:
+                continue
+            steps = steps_by_day.get(d, 0.0)
+            has_activity_data = steps > 0 or d in active or d in sport
+            walking = active.get(d, 0.0) if active_avail else (steps * 0.04 if steps else 0.0)
+            burned = bmr + walking + sport.get(d, 0.0)
+            buckets[idx].append(burned if has_activity_data else float("nan"))
+        points = []
+        for i in range(n):
+            vals = buckets[i]
+            present = [v for v in vals if v == v]  # drop NaN (no-data days)
+            if not present:
+                points.append({"date": day_at(i).isoformat(), "value": None, "label": ""})
+                continue
+            v = present[-1]  # most recent day with data in the bucket
+            d = day_at(i)
+            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+            points.append({"date": d.isoformat(), "value": round(v, 1), "label": lab})
         return {"granularity": granularity, "metric": metric, "period_label": period_label,
                 "period_key": period_key, "points": points}
 
