@@ -5,7 +5,7 @@ NOT a release candidate. Contents:
   * the functional diff (base = the reviewed round-8 functional head), exact commit ids;
   * the changed source files and regression tests;
   * documentation/evidence, identified separately;
-  * evidence/review9_test_results.txt;
+  * evidence/review10_test_results.txt;
   * a full 64-char SHA-256 manifest over the payload.
 
 EXCLUDED: previous archives, exported review trees, embedded historical patches. The
@@ -25,10 +25,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 BUNDLE = REPO / "docs/deliverables/meal-liquid-idempotency/review_bundle"
-BUILD = BUNDLE / "review9"
-DIST = BUNDLE / "review9_focused_bundle.tar.gz"
+BUILD = BUNDLE / "review10"
+DIST = BUNDLE / "review10_focused_bundle.tar.gz"
 
-FUNC_BASE = "c59cec4522f8adb70c70805caa33426cd54a39a6"   # fully-reviewed round-8 state (docs head)
+FUNC_BASE = "afa410366c10da0c02b39a97d9a8738539832579"   # fully-reviewed round-9 state (docs head)
 FUNC_HEAD = ""                                            # filled from git log
 
 FROZEN_CANDIDATE = "7e2cf6915dbd7478e8a558817d4d51aa63879e60"
@@ -42,6 +42,7 @@ FORBIDDEN_PATH_PARTS = (
     "review_bundle/review7",
     "review_bundle/review8",
     "review_bundle/review9",
+    "review_bundle/review10",
     "drhiro_meal_liquid_review_bundle_FINAL",
 )
 
@@ -65,15 +66,15 @@ def main() -> int:
             print("ABORT: frozen archive changed")
             return 1
 
-    # The functional head is the fix(review9) commit; the docs head is HEAD.
+    # The functional head is the fix(review10) commit; the docs head is HEAD.
     heads = run("git", "log", "--format=%H", "-10").splitlines()
     FUNC_HEAD = ""
     for h in heads:
-        if "fix(review9)" in run("git", "log", "-1", "--format=%s", h):
+        if "fix(review10)" in run("git", "log", "-1", "--format=%s", h):
             FUNC_HEAD = h
             break
     if not FUNC_HEAD:
-        print("ABORT: fix(review9) commit not found")
+        print("ABORT: fix(review10) commit not found")
         return 1
     docs_head = run("git", "rev-parse", "HEAD")
 
@@ -96,7 +97,7 @@ def main() -> int:
         subprocess.run(["git", "diff", FUNC_HEAD, docs_head], cwd=REPO,
                        capture_output=True, text=True, check=True).stdout)
 
-    verify = Path(tempfile.mkdtemp(prefix="review9-verify-"))
+    verify = Path(tempfile.mkdtemp(prefix="review10-verify-"))
     try:
         subprocess.run(["git", "worktree", "add", "--detach", str(verify), FUNC_BASE],
                        cwd=REPO, capture_output=True, text=True, check=True)
@@ -171,7 +172,7 @@ for functional code.
 
 ## Evidence scope
 
-`documentation/docs/deliverables/meal-liquid-idempotency/review_bundle/evidence/review9_test_results.txt`
+`documentation/docs/deliverables/meal-liquid-idempotency/review_bundle/evidence/review10_test_results.txt`
 
 The evidence records the source path+hash ACTUALLY LOADED BY THE RUNNING INGRESS
 CONTAINER (in addition to host and pre-fix worktree hashes), the migration

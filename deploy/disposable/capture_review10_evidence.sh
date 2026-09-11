@@ -17,10 +17,11 @@ DB="postgresql+psycopg2://drhiro:drhiro@localhost:5435/drhiro_test"
 BEFORE_TREE="/tmp/review9-before"     # clean worktree of the BASE (pre-fix) commit
 STACK_SUITE="${1:-(stack result supplied at capture time)}"
 
-FUNC_BASE="${FUNC_BASE:-c59cec4522f8adb70c70805caa33426cd54a39a6}"   # fully-reviewed round-8 state
-FUNC_HEAD="${FUNC_HEAD:-$(git -C "$REPO" log --format=%H -1 --grep='fix(review9)')}"
+FUNC_BASE="${FUNC_BASE:-afa410366c10da0c02b39a97d9a8738539832579}"   # fully-reviewed round-9 state (docs head)
+FUNC_HEAD="${FUNC_HEAD:-$(git -C "$REPO" log --format=%H -1 --grep='fix(review10)')}"
+FUNC_R9="${FUNC_R9:-9076937cc733fc3fe05ef53bce2ec7b149550747}"   # round-9 functional head
 
-echo "# Review round 9 evidence - focused corrections"
+echo "# Review round 10 evidence - focused FK mapping + schema policy"
 echo
 echo "Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ') (UTC)"
 echo
@@ -36,7 +37,11 @@ echo "postgres:        $(psql "postgresql://drhiro:drhiro@localhost:5435/drhiro_
 echo "branch:          $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
 echo "functional base: $FUNC_BASE"
 echo "functional head: $FUNC_HEAD"
-echo "docs head:       $(git -C "$REPO" rev-parse HEAD)"
+echo "docs head (capture-time revision): $(git -C "$REPO" rev-parse HEAD)"
+echo "  NOTE: this is the repository revision AT CAPTURE TIME. The evidence file "
+echo "  records its own commit, so committing it necessarily creates a NEWER docs"
+echo "  head; BASE_AND_HEAD.md in the bundle names that final one. The two are not"
+echo "  the same revision by construction and must not be presented as such."
 echo "frozen cand.:    7e2cf6915dbd7478e8a558817d4d51aa63879e60 (unchanged)"
 echo '```'
 echo
@@ -104,6 +109,21 @@ PYTHONPATH="$BEFORE_TREE/apps/api/src" DRHIRO_ACTIVITIES_MIGRATION_DB=1 \
   -q -p no:cacheprovider 2>&1 | tail -10
 echo '```'
 echo
+echo "## Finding: FK mapping + schema policy - failing-before against the ROUND-9 validator"
+echo
+echo "The round-9 validator dropped the referenced-COLUMN comparison and resolved"
+echo "\`users\` independently through search_path. Both regressions below fail against"
+echo "the round-9 validator (commit 9076937) and pass after the correction."
+echo
+echo '```'
+R9_TREE="/tmp/review10-r9"   # clean worktree of the round-9 functional head
+cd "$R9_TREE"
+PYTHONPATH="$R9_TREE/apps/api/src" DRHIRO_ACTIVITIES_MIGRATION_DB=1 \
+  DRHIRO_TEST_DB_URL="$DB" $VENV -m pytest \
+  tests/test_r4_activities_migration.py::TestForeignKeyMappingAndSchemaPolicy \
+  -q -p no:cacheprovider 2>&1 | tail -8
+echo '```'
+echo
 echo "### PASSING-AFTER - full R4 suite against the FIXED validator"
 echo
 echo '```'
@@ -133,6 +153,16 @@ echo "a duplicate receipt, not a revision."
 echo
 echo "POLLING OFFSET: implemented (review 8), real Bot API offset contract with a durable"
 echo "offset in telegram_consumer_offset. Not full production polling acceptance."
+echo
+echo "## Default suite (production inspection excluded; captured in this run)"
+echo
+echo '```'
+cd "$REPO"
+env -u DRHIRO_ISOLATED_STACK -u DRHIRO_R1R2_ALEMBIC_DB -u DRHIRO_R4_ALEMBIC_DB \
+  -u DRHIRO_T1_ALEMBIC_DB -u DRHIRO_ACTIVITIES_MIGRATION_DB -u DRHIRO_DEPLOY_ASSERT \
+  -u DRHIRO_DOCKER_CMD -u DRHIRO_TEST_DB_URL -u REDIS_URL \
+  $VENV -m pytest tests/ -q -p no:cacheprovider 2>&1 | tail -2
+echo '```'
 echo
 echo "## Capability labelling"
 echo
