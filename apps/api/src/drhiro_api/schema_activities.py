@@ -52,7 +52,7 @@ COLUMNS: dict[str, tuple[str, bool]] = {
     "id": ("UUID", False),
     "user_id": ("UUID", False),
     "activity_date": ("DATE", False),
-    "title": ("VARCHAR", False),
+    "title": ("VARCHAR(255)", False),
     "description": ("TEXT", True),
     "calories_burned": ("FLOAT", False),
     "created_at": ("TIMESTAMP WITH TIME ZONE", False),
@@ -75,15 +75,34 @@ EXPECTED_DEFAULTS: dict[str, str] = {
 def _canon_default(expr: Any) -> str:
     """Canonicalise a server default expression for EQUALITY comparison.
 
-    Erases only formatting and casts (`now()::timestamp with time zone` is the same
-    default as `now()`), never structure - so a modified expression stays unequal.
+    Erases ONLY formatting (whitespace, case, trailing semicolon, a redundant outer
+    parenthesis pair) - NEVER a cast. `now()::date` is not equivalent to `now()`: the
+    cast changes both the value and the type, and any row written through it differs.
+    PostgreSQL's exact stored rendering (pg_get_expr) is the comparison basis; the
+    test database supplies that rendering, not a fixture.
     """
-    s = str(expr or "").strip().lower()
-    # Drop casts: `now()::timestamp with time zone`, `'1 day'::interval`.
-    s = re.sub(r"::\s*[a-z_][a-z0-9_ ]*", "", s)
+    s = str(expr or "").strip()
     s = re.sub(r"\s+", " ", s).strip()
-    # Trailing semicolons/quotes are not part of the expression.
-    return s.strip(";").strip()
+    s = s.strip(";").strip()
+    # Drop a single redundant outer parenthesis pair, repeatedly.
+    for _ in range(10):
+        if not (s.startswith("(") and s.endswith(")")):
+            break
+        depth = 0
+        wraps = True
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    wraps = False
+                    break
+        if wraps:
+            s = s[1:-1].strip()
+        else:
+            break
+    return s.lower()
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -94,6 +113,17 @@ def _qualify(schema: str | None) -> str:
     if not _IDENT_RE.match(schema):
         raise ValueError(f"unsafe schema name: {schema!r}")
     return f"{schema}."
+
+
+def _type_precision(rendered: str) -> str:
+    """Extract the numeric precision/scale a type renders, if any.
+
+    `TIMESTAMP(6) WITH TIME ZONE` -> '6'; `character varying(255)` -> '255';
+    `double precision` -> '' (its scale is not a parenthesised length). The declared
+    shape carries no precision, so a non-empty result is a difference to reject.
+    """
+    m = re.search(r"\((\d+(?:\s*,\s*\d+)?)\)", rendered)
+    return m.group(1) if m else ""
 
 
 def _canon_type(t: Any) -> str:
@@ -111,20 +141,30 @@ def _canon_type(t: Any) -> str:
     """
     tz = getattr(t, "timezone", None)
     if tz is not None:
-        return "TIMESTAMP WITH TIME ZONE" if tz else "TIMESTAMP WITHOUT TIME ZONE"
+        # SQLAlchemy type object: preserve the precision, not just the zone.
+        prec = _type_precision(str(t))
+        zone = "WITH TIME ZONE" if tz else "WITHOUT TIME ZONE"
+        return f"TIMESTAMP({prec}) {zone}" if prec else f"TIMESTAMP {zone}"
     s = str(t).upper()
-    # Normalise `TIMESTAMP(6) WITH TIME ZONE`, `TIMESTAMP WITH TIME ZONE`, etc.
+    prec = _type_precision(s)
+    # Normalise `TIMESTAMP(6) WITH TIME ZONE`, `TIMESTAMP WITH TIME ZONE`, etc. The
+    # declared shape has NO precision, so any precision is a difference - conservative.
     if "TIMESTAMP" in s or "DATETIME" in s:
         if "WITH TIME ZONE" in s or "TIMESTAMPTZ" in s:
-            return "TIMESTAMP WITH TIME ZONE"
+            return f"TIMESTAMP({prec}) WITH TIME ZONE" if prec else "TIMESTAMP WITH TIME ZONE"
         if "WITHOUT TIME ZONE" in s:
-            return "TIMESTAMP WITHOUT TIME ZONE"
+            return (f"TIMESTAMP({prec}) WITHOUT TIME ZONE" if prec
+                    else "TIMESTAMP WITHOUT TIME ZONE")
         # A bare TIMESTAMP means "without time zone" in PostgreSQL.
-        return "TIMESTAMP WITHOUT TIME ZONE"
+        return (f"TIMESTAMP({prec}) WITHOUT TIME ZONE" if prec
+                else "TIMESTAMP WITHOUT TIME ZONE")
     if "DOUBLE PRECISION" in s or "FLOAT" in s:
         return "FLOAT"
-    if "CHARACTER VARYING" in s or s.startswith("VARCHAR"):
-        return "VARCHAR"
+    # Preserve VARCHAR length: VARCHAR(1) is NOT equivalent to VARCHAR(255); ordinary
+    # activity titles will fail to insert into a 1-character column.
+    m = re.search(r"(?:CHARACTER VARYING|VARCHAR)\s*\((\d+)\)", s)
+    if m or "CHARACTER VARYING" in s or s.startswith("VARCHAR"):
+        return f"VARCHAR({m.group(1)})" if m else "VARCHAR"
     if "TEXT" in s:
         return "TEXT"
     if "UUID" in s:
@@ -134,6 +174,30 @@ def _canon_type(t: Any) -> str:
     return re.sub(r"\(.*\)", "", s).strip()
 
 
+def _relation_oid(conn: Connection, name: str, schema: str | None) -> int | None:
+    """Resolve the ONE intended relation to its OID.
+
+    Name resolution follows the SAME policy as the migration's own unqualified SQL:
+    when `schema` is None the name resolves through the connection's search_path
+    (to_regclass('activities')); when given, it is schema-qualified. This is the
+    crux of review finding 2: with the public API's default schema=None, every
+    catalog read must anchor to THIS relation's OID. Filtering by `relname = :t` with
+    `(:s IS NULL OR nspname = :s)` instead combined public.activities with
+    unrelated.activities when schema was None - column types, indexes and CHECKs from
+    one relation could be mixed with columns and foreign keys from another.
+    """
+    if not name or _IDENT_RE.sub("", name):
+        return None
+    if schema is not None and not _IDENT_RE.match(schema):
+        return None
+    qualified = f"{schema}.{name}" if schema else name
+    # `to_regclass` yields the regclass type, whose TEXT form is the relation NAME
+    # (psycopg2 returns the name, not the OID). Cast to oid explicitly so we get the
+    # numeric identity every catalog query below anchors on.
+    return conn.execute(text("SELECT pg_catalog.to_regclass(:q)::oid"),
+                        {"q": qualified}).scalar()
+
+
 def column_types(conn: Connection, schema: str | None = None) -> dict[str, str]:
     """Authoritative column types from the catalog (`format_type`).
 
@@ -141,18 +205,18 @@ def column_types(conn: Connection, schema: str | None = None) -> dict[str, str]:
     ("timestamp with time zone") and the length ("character varying(255)"), so the
     comparison does not depend on how a driver or ORM renders the type.
     """
+    oid = _relation_oid(conn, TABLE, schema)
+    if oid is None:
+        return {}
     rows = conn.execute(text("""
         SELECT a.attname AS column_name,
                format_type(a.atttypid, a.atttypmod) AS column_type
         FROM pg_attribute a
-        JOIN pg_class t ON t.oid = a.attrelid
-        JOIN pg_namespace n ON n.oid = t.relnamespace
-        WHERE t.relname = :t
+        WHERE a.attrelid = :oid
           AND a.attnum > 0
           AND NOT a.attisdropped
-          AND (:s IS NULL OR n.nspname = :s)
         ORDER BY a.attnum
-    """), {"t": TABLE, "s": schema}).mappings().all()
+    """), {"oid": oid}).mappings().all()
     return {r["column_name"]: r["column_type"] for r in rows}
 
 
@@ -164,6 +228,9 @@ def index_definitions(conn: Connection, schema: str | None = None) -> dict[str, 
     `WHERE user_id IS NULL` reads as equivalent. Read the catalog instead so method,
     uniqueness and partiality are all visible and comparable.
     """
+    oid = _relation_oid(conn, TABLE, schema)
+    if oid is None:
+        return {}
     rows = conn.execute(text("""
         SELECT i.relname            AS index_name,
                am.amname            AS method,
@@ -173,13 +240,10 @@ def index_definitions(conn: Connection, schema: str | None = None) -> dict[str, 
                pg_get_indexdef(ix.indexrelid) AS indexdef
         FROM pg_index ix
         JOIN pg_class i ON i.oid = ix.indexrelid
-        JOIN pg_class t ON t.oid = ix.indrelid
-        JOIN pg_namespace n ON n.oid = t.relnamespace
         JOIN pg_am am ON am.oid = i.relam
-        WHERE t.relname = :t
-          AND (:s IS NULL OR n.nspname = :s)
+        WHERE ix.indrelid = :oid
         ORDER BY i.relname
-    """), {"t": TABLE, "s": schema}).mappings().all()
+    """), {"oid": oid}).mappings().all()
     out: dict[str, dict] = {}
     for r in rows:
         out[r["index_name"]] = {
@@ -193,7 +257,9 @@ def index_definitions(conn: Connection, schema: str | None = None) -> dict[str, 
 
 
 def table_exists(conn: Connection, schema: str | None = None) -> bool:
-    return TABLE in inspect(conn).get_table_names(schema=schema)
+    # OID-resolved, not a name list: get_table_names(schema=None) would return every
+    # schema's tables and a name test would be ambiguous across schemas.
+    return _relation_oid(conn, TABLE, schema) is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -384,43 +450,56 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
         )
 
     # FOREIGN KEY must be user_id -> users(id) ON DELETE CASCADE, where `users` is
-    # the table in the SAME schema as `activities`. Checking only the referred TABLE
-    # NAME accepts `unrelated.users(id)`: a different table that merely shares the
-    # name, which is a different constraint entirely.
+    # the table in the SAME schema as `activities`. Compared by OID: both the
+    # activities relation and the intended users relation are resolved once (same
+    # search_path/schema policy as the migration's own SQL), and the constraint's
+    # confrelid must equal the intended users OID. Name-only comparison accepts
+    # `unrelated.users(id)` - a different table that merely shares the name; relying
+    # on the reflected referred_schema is also unsafe, because reflection can omit
+    # schema qualification based on search_path visibility.
     def _fk_faults() -> list[str]:
         faults: list[str] = []
+        acts_oid = _relation_oid(conn, TABLE, schema)
+        users_oid = _relation_oid(conn, "users", schema)
+        if acts_oid is None:
+            return [f"cannot resolve {TABLE} to validate its foreign key"]
+        rows = conn.execute(text("""
+            SELECT c.conname,
+                   c.confrelid,
+                   c.confdeltype,
+                   string_agg(a.attname, ',' ORDER BY k.ord) AS cols,
+                   r.relname AS referred_table,
+                   n.nspname AS referred_schema
+            FROM pg_constraint c
+            JOIN unnest(c.conkey) WITH ORDINALITY k(attnum, ord) ON true
+            JOIN unnest(c.confkey) WITH ORDINALITY f(attnum, ord) ON f.ord = k.ord
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+            JOIN pg_class r ON r.oid = c.confrelid
+            JOIN pg_namespace n ON n.oid = r.relnamespace
+            WHERE c.conrelid = :oid AND c.contype = 'f'
+            GROUP BY c.conname, c.confrelid, c.confdeltype, r.relname, n.nspname
+            ORDER BY c.conname
+        """), {"oid": acts_oid}).mappings().all()
         found = False
-        for fk in insp.get_foreign_keys(TABLE, schema=schema):
-            if fk.get("name") != FK_NAME:
+        for r in rows:
+            if r["conname"] != FK_NAME:
                 continue
             found = True
-            opts = fk.get("options") or {}
-            referred_schema = fk.get("referred_schema")
-            # A None referred_schema means "the same schema as the table".
-            if (referred_schema or schema) != schema:
+            cols = (r["cols"] or "").split(",")
+            if cols != ["user_id"]:
                 faults.append(
-                    f"foreign key {FK_NAME} targets schema "
-                    f"{referred_schema!r}, expected {schema!r}"
+                    f"foreign key {FK_NAME} constrains {cols}, expected ['user_id']"
                 )
-            if list(fk.get("constrained_columns") or []) != ["user_id"]:
+            if r["confrelid"] != users_oid:
                 faults.append(
-                    f"foreign key {FK_NAME} constrains "
-                    f"{fk.get('constrained_columns')}, expected ['user_id']"
+                    f"foreign key {FK_NAME} refers to {r['referred_schema']}."
+                    f"{r['referred_table']} (oid {r['confrelid']}); expected the "
+                    f"users relation in the activities schema (oid {users_oid})"
                 )
-            if fk.get("referred_table") != "users":
+            if r["confdeltype"] != "c":
                 faults.append(
-                    f"foreign key {FK_NAME} refers to table "
-                    f"{fk.get('referred_table')!r}, expected 'users'"
-                )
-            if list(fk.get("referred_columns") or []) != ["id"]:
-                faults.append(
-                    f"foreign key {FK_NAME} refers to columns "
-                    f"{fk.get('referred_columns')}, expected ['id']"
-                )
-            if opts.get("ondelete", "NO ACTION") != "CASCADE":
-                faults.append(
-                    f"foreign key {FK_NAME} ON DELETE is "
-                    f"{opts.get('ondelete', 'NO ACTION')!r}, expected 'CASCADE'"
+                    f"foreign key {FK_NAME} ON DELETE is {r['confdeltype']!r}, "
+                    "expected 'c' (CASCADE)"
                 )
         if not found:
             faults.append(
@@ -460,18 +539,18 @@ def not_null_columns(conn: Connection, schema: str | None = None) -> list[str]:
     pg_constraint with contype='n'. Reading pg_attribute is correct on every
     version, so nothing here parses NOT NULL out of the constraint catalog.
     """
+    oid = _relation_oid(conn, TABLE, schema)
+    if oid is None:
+        return []
     rows = conn.execute(text("""
         SELECT a.attname
         FROM pg_attribute a
-        JOIN pg_class t ON t.oid = a.attrelid
-        JOIN pg_namespace n ON n.oid = t.relnamespace
-        WHERE t.relname = :t
+        WHERE a.attrelid = :oid
           AND a.attnotnull
           AND a.attnum > 0
           AND NOT a.attisdropped
-          AND (:s IS NULL OR n.nspname = :s)
         ORDER BY a.attnum
-    """), {"t": TABLE, "s": schema}).fetchall()
+    """), {"oid": oid}).fetchall()
     return [r[0] for r in rows]
 
 
@@ -490,16 +569,16 @@ def _check_constraints(conn: Connection, schema: str | None = None) -> list[tupl
     three pg_constraint rows - 'c' (the CHECK), 'f' (the FK) and 'p' (the PK) -
     with NOT NULL columns absent from pg_constraint entirely.
     """
+    oid = _relation_oid(conn, TABLE, schema)
+    if oid is None:
+        return []
     rows = conn.execute(text("""
         SELECT c.conname, pg_get_constraintdef(c.oid)
         FROM pg_constraint c
-        JOIN pg_class t ON t.oid = c.conrelid
-        JOIN pg_namespace n ON n.oid = t.relnamespace
-        WHERE t.relname = :t
+        WHERE c.conrelid = :oid
           AND c.contype = 'c'
           AND pg_get_constraintdef(c.oid) LIKE 'CHECK%'
-          AND (:s IS NULL OR n.nspname = :s)
-    """), {"t": TABLE, "s": schema}).fetchall()
+    """), {"oid": oid}).fetchall()
     return [(r[0], r[1]) for r in rows]
 
 

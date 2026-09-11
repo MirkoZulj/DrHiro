@@ -128,6 +128,7 @@ _process_owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 # They are absent in normal operation; only a test (via the trusted side) creates them.
 CRASH_MARKER = "/var/spool/telegram/crash_after_receipt.marker"
 FAIL_MARKER = "/var/spool/telegram/fail_before_consume.marker"
+PAUSE_AFTER_CLAIM_MARKER = "/var/spool/telegram/pause_after_claim.marker"
 _engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # Deterministic user identity for this bot (trusted, server-side; never supplied
@@ -589,6 +590,13 @@ def process_update(*, event_key, bot_id, chat_id, message_id, text, update_id,
             log("test_crash_after_receipt_commit")
             os._exit(1)
 
+        # Test-only pause hook: after acquiring the claim (here, the worker's FINAL
+        # permitted claim - attempts now at the cap - with a valid lease) but before
+        # any consumption work. While the marker exists the worker genuinely holds
+        # the lease, which the exhaustion sweep must respect.
+        while os.path.exists(PAUSE_AFTER_CLAIM_MARKER):
+            time.sleep(0.2)
+
         try:
             # Test-only failure hook (B1): deterministic "failure before consumption
             # persistence" - fail_receipt releases the claim; recovery re-drives.
@@ -673,6 +681,13 @@ def recover_receipts(*, limit: int | None = None) -> dict:
     # REVIEW #1: a receipt at or over the retry budget is EXCLUDED by the scan's
     # `attempts < cap` filter, so without this sweep it silently stalls in 'received'
     # forever - neither redriven nor reported. Mark it operator-visible instead.
+    #
+    # REVIEW #9 (finding 1): the sweep MUST NOT revoke a claim whose lease is still
+    # held. The final permitted claim increments attempts to the cap AND acquires a
+    # valid lease; that receipt is genuinely being worked. The predicate uses the SAME
+    # ownership condition as claim acquisition, so an in-flight final attempt is left
+    # alone. Only once the lease is expired or abandoned is the spent budget surfaced
+    # as 'exhausted'.
     conn2 = _conn()
     try:
         with conn2, conn2.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -688,7 +703,9 @@ def recover_receipts(*, limit: int | None = None) -> dict:
                            'attempt budget exhausted after ' || attempts || ' claims'
                  WHERE status NOT IN ('completed', 'exhausted')
                    AND attempts >= %s
-                RETURNING event_key, attempts
+                   AND (claim_token IS NULL OR lease_expires_at IS NULL
+                        OR lease_expires_at < now())
+                 RETURNING event_key, attempts
                 """,
                 (RECEIPT_MAX_ATTEMPTS,),
             )

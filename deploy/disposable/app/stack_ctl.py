@@ -245,6 +245,18 @@ def main() -> int:
                 print(json.dumps({"ok": True, "rowcount": cur.rowcount}))
         finally:
             conn.close()
+    elif cmd == "recover-direct":
+        # recover-direct
+        #
+        # Run the receipt recovery pass + exhaustion sweep in THIS process, importing
+        # ingress directly. That makes it a genuinely CONCURRENT actor: the polling
+        # worker in the ingress container may be mid-claim, and this runs recovery
+        # from a separate process against the same database. Used to prove that a
+        # concurrent recovery pass does not revoke a worker's live lease.
+        import ingress
+        rec_counts = ingress.recover_receipts()
+        print(json.dumps(rec_counts))
+
     elif cmd == "resend-stale-probe":
         # resend-stale-probe <operation_id> <claim_chat_id>
         #

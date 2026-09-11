@@ -502,3 +502,187 @@ class TestDefinitionEquivalenceIsConservative:
         diff = sa_act.diff_activities(conn, schema=SCHEMA)
         assert any("created_at" in f and "type" in f for f in diff["fatal"]), \
             f"timestamp without time zone was accepted: fatal={diff['fatal']}"
+
+
+# --------------------------------------------------------------------------- #
+# REVIEW #9 finding 2 - the DEFAULT schema=None entry point must not combine
+# relations that share a name across schemas.
+#
+# The public API's default schema is None. Before this round the catalog reads used
+# `(:s IS NULL OR nspname = :s)` and keyed their results by column/index name only,
+# so with schema=None they read EVERY `activities` table in EVERY schema and could
+# mix column types, indexes or CHECKs from one relation with columns and FKs from
+# another. They now resolve the ONE intended relation by OID (search_path policy,
+# same as the migration's own unqualified SQL) and anchor every catalog read to it.
+# --------------------------------------------------------------------------- #
+OTHER = "unrelated"
+
+
+def _full_valid_activities(ddl, ref_table):
+    """Create a full valid `activities` shape in `ddl`'s schema referencing
+    `ref_table` (schema-qualified)."""
+    for stmt in ddl.format(s=SCHEMA).split(";"):
+        if stmt.strip():
+            yield stmt
+
+
+class TestSchemaNoneDoesNotCombineRelations:
+    """Two schemas each contain `activities` (and `users`). The intended relation is
+    the one in search_path. Misleading metadata in the OTHER schema must neither mask
+    a genuine defect nor create a false mismatch."""
+
+    @staticmethod
+    def _prod_shape(conn):
+        conn.execute(text(PROD_SHAPE_DDL.format(s=SCHEMA)))
+
+    @pytest.fixture()
+    def two_schema(self, engine):
+        with engine.begin() as c:
+            c.execute(text(f"SET search_path TO {SCHEMA}"))
+            c.execute(text(f"DROP SCHEMA IF EXISTS {OTHER} CASCADE"))
+            c.execute(text(f"CREATE SCHEMA {OTHER}"))
+            c.execute(text(f"CREATE TABLE {OTHER}.users (id uuid PRIMARY KEY)"))
+            c.execute(text(
+                f"CREATE TABLE {OTHER}.activities ("
+                "    id uuid NOT NULL DEFAULT gen_random_uuid(),"
+                "    user_id uuid NOT NULL,"
+                "    activity_date date NOT NULL,"
+                "    title character varying(1) NOT NULL,"            # misleading
+                "    description text,"
+                "    calories_burned double precision NOT NULL,"
+                "    created_at timestamp without time zone NOT NULL DEFAULT now(),"
+                "    updated_at timestamp with time zone NOT NULL DEFAULT now(),"
+                "    CONSTRAINT activities_pkey PRIMARY KEY (id),"
+                "    CONSTRAINT activities_calories_burned_check "
+                "        CHECK (calories_burned >= 0::double precision),"  # VALID here
+                "    CONSTRAINT activities_user_id_fkey FOREIGN KEY (user_id)"
+                "        REFERENCES {s}.users(id) ON DELETE CASCADE"
+                ")".format(s=OTHER)
+            ))
+            c.execute(text(
+                f"CREATE INDEX idx_activities_user_date ON {OTHER}.activities "
+                "(user_id) WHERE false"          # partial, misleading
+            ))
+        yield
+        with engine.begin() as c:
+            c.execute(text(f"DROP SCHEMA IF EXISTS {OTHER} CASCADE"))
+
+    def test_types_and_checks_come_from_the_intended_relation(self, two_schema, conn):
+        """The intended (search_path) `activities` is valid; the OTHER schema holds a
+        VALID `>= 0` CHECK and a WRONG `created_at` type. Neither may leak: the
+        intended relation's correct types must be accepted, and a wrong CHECK in the
+        intended relation must NOT be masked by the OTHER relation's valid one."""
+        conn.execute(text(PROD_SHAPE_DDL.format(s=SCHEMA)))
+        # No leak of the OTHER schema's timestamp-without-tz into created_at:
+        diff = sa_act.diff_activities(conn, schema=None)
+        assert diff["fatal"] == [], diff["fatal"]
+
+        # Now corrupt the INTENDED relation's CHECK. Its wrong bound must be FATAL
+        # even though the OTHER relation carries a valid `>= 0` check.
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities DROP CONSTRAINT "
+            "activities_calories_burned_check"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ADD CONSTRAINT "
+            "activities_calories_burned_check CHECK (calories_burned >= -100)"
+        ))
+        diff = sa_act.diff_activities(conn, schema=None)
+        assert any("calories_burned" in f for f in diff["fatal"]),             f"wrong CHECK masked by the other schema's valid check: fatal={diff['fatal']}"
+
+    def test_foreign_key_resolved_by_identity_not_name(self, two_schema, conn):
+        """A faulty target relation (OTHER.users) is FATAL through schema=None; the
+        intended relation's own users must not be confused with the OTHER schema's."""
+        conn.execute(text(PROD_SHAPE_DDL.format(s=SCHEMA)))
+        # repoint the FK at OTHER.users: wrong identity, shared name
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities DROP CONSTRAINT "
+            "activities_user_id_fkey"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ADD CONSTRAINT activities_user_id_fkey "
+            f"FOREIGN KEY (user_id) REFERENCES {OTHER}.users(id) ON DELETE CASCADE"
+        ))
+        diff = sa_act.diff_activities(conn, schema=None)
+        assert any("foreign key" in f for f in diff["fatal"]),             f"cross-schema FK accepted through schema=None: fatal={diff['fatal']}"
+
+    def test_unqualified_fk_resolves_to_intended_relation(self, two_schema, conn):
+        """`REFERENCES users(id)` (schema omitted, search_path-visible) must resolve
+        to the intended users relation and be ACCEPTED - the reviewer's
+        search_path-sensitive reflection case, in real PostgreSQL."""
+        conn.execute(text(PROD_SHAPE_DDL.format(s=SCHEMA)))
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities DROP CONSTRAINT activities_user_id_fkey"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ADD CONSTRAINT activities_user_id_fkey "
+            "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"
+        ))
+        diff = sa_act.diff_activities(conn, schema=None)
+        assert diff["fatal"] == [], diff["fatal"]
+
+
+class TestConservativeTypeAndDefaultEquivalence:
+    """REVIEW #9 finding 3: type ATTRIBUTES (VARCHAR length, timestamp precision)
+    and casts in defaults are part of equivalence and must be preserved."""
+
+    @staticmethod
+    def _prod_shape(conn):
+        conn.execute(text(PROD_SHAPE_DDL.format(s=SCHEMA)))
+
+    def test_varchar1_title_is_fatal(self, conn):
+        """VARCHAR(1) cannot hold ordinary activity titles; it is not equivalent."""
+        self._prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ALTER COLUMN title TYPE varchar(1)"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("title" in f and "type" in f for f in diff["fatal"]),             f"VARCHAR(1) accepted: fatal={diff['fatal']}"
+
+    def test_varchar255_baseline_is_accepted(self, conn):
+        """The declared length is preserved and the unchanged shape stays clean."""
+        self._prod_shape(conn)
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert diff["fatal"] == [], diff["fatal"]
+
+    def test_timestamp_precision_is_fatal(self, conn):
+        """`timestamp(3) with time zone` differs from the declared no-precision shape."""
+        self._prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ALTER COLUMN created_at "
+            "TYPE timestamp(3) with time zone"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("created_at" in f and "type" in f for f in diff["fatal"]),             f"timestamp(3) accepted: fatal={diff['fatal']}"
+
+    def test_cast_changing_default_is_fatal(self, conn):
+        """A cast-altered default is not equivalent. Verified against PostgreSQL's
+        EXACT stored rendering (pg_get_expr), not a fixture normaliser."""
+        self._prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ALTER COLUMN created_at "
+            "SET DEFAULT (now()::date)"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("created_at" in f and "default" in f for f in diff["fatal"]),             f"cast-changed default accepted: fatal={diff['fatal']}"
+
+    def test_redundant_cast_pg_rendering_decides(self, conn):
+        """PG may simplify a redundant cast away; whatever it stores is the basis.
+        The declared `DEFAULT now()` on the intended relation stays accepted."""
+        self._prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ALTER COLUMN created_at "
+            "SET DEFAULT now()"
+        ))
+        got = conn.execute(text(
+            f"SELECT pg_get_expr(d.adbin, d.adrelid) "
+            f"FROM pg_attrdef d "
+            f"JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
+            f"JOIN pg_class c ON c.oid = d.adrelid "
+            f"JOIN pg_namespace n ON n.oid = c.relnamespace "
+            f"WHERE c.relname = 'activities' AND n.nspname = '{SCHEMA}' "
+            f"AND a.attname = 'created_at'"
+        )).scalar()
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert got.strip() == "now()", f"unexpected stored rendering: {got!r}"
+        assert diff["fatal"] == [], diff["fatal"]

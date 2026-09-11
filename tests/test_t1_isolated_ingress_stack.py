@@ -954,20 +954,36 @@ class TestDuplicateReceiptHandling:
 
     def test_unfinished_duplicate_is_redriven_from_stored_text(self, clean_state):
         """An unfinished receipt must be re-driven from the TRUSTED STORED input,
-        not from whatever text the redelivery happens to carry."""
-        # Fail before consumption so the receipt stays unfinished with stored text.
-        touch_marker("fail_before_consume.marker")
-        ctl_api("enqueue", CHAT_ID, "200 g steak", "800201")
-        wait_for(lambda: counters().get("consume_failed_claim_released", 0) >= 1,
-                 timeout=90, what="the failure-before-consumption to be recorded")
-        row = ctl("receipt-row", f"{BOT_ID}:{CHAT_ID}:800201")["row"]
-        assert row["status"] != "completed" and row["attempts"] >= 1
-        assert row["raw_text"] == "200 g steak", "trusted input was not persisted"
+        not from whatever text the redelivery happens to carry.
 
-        # Stop failing, then REDELIVER the same message id with DIFFERENT text.
-        ctl("rm-marker", "fail_before_consume.marker")
-        errors_before = counters().get("consume_error", 0)
+        The re-drive must go through the REDELIVERY (poll) branch, not only periodic
+        recovery - recovery uses process_update directly and never increments the
+        duplicate counter. This test stages an unfinished receipt, holds the worker
+        at the post-claim pause hook so the receipt stays unfinished, then redelivers
+        a DIFFERENT text and asserts the duplicate branch counter advanced."""
+        event_key = f"{BOT_ID}:{CHAT_ID}:800201"
+
+        # Hold the worker at the pause hook FIRST, so neither periodic recovery nor
+        # the redelivery can complete the receipt before we observe the branch.
+        touch_marker("pause_after_claim.marker")
+
+        # Stage an UNFINISHED receipt whose trusted stored input is the steak message.
+        ctl("stage-capped", BOT_ID, CHAT_ID, "800201", "200 g steak", "1")
+        row = ctl("receipt-row", event_key)["row"]
+        assert row["status"] == "received" and row["raw_text"] == "200 g steak", row
+
+        # Redeliver the SAME message id with DIFFERENT text. The poll path must see
+        # the unfinished receipt, enter the duplicate branch, and re-drive the STORED
+        # text - never the newly delivered one.
         ctl_api("enqueue", CHAT_ID, "5 kg chocolate cake", "800201")
+
+        # The duplicate branch (receipt_duplicate_unfinished) MUST advance - proof the
+        # re-drive went through the redelivery path, not silently via recovery.
+        wait_for(lambda: counters().get("receipt_duplicate_unfinished", 0) >= 1,
+                 timeout=90, what="the redelivery to enter the duplicate branch")
+
+        # Release the worker: it persists the STORED text and completes.
+        ctl("rm-marker", "pause_after_claim.marker")
         wait_for(lambda: ctl("counts")["receipt_status"].get("completed"),
                  timeout=90, what="the unfinished duplicate to be re-driven")
 
@@ -1170,3 +1186,81 @@ class TestAttemptFencingInFlight:
             f"attempt numbering double-counted: {first['delivery_attempt']} -> "
             f"{second['delivery_attempt']}"
         )
+
+
+class TestExhaustionSweepRespectsActiveLease:
+    """REVIEW #9 finding 1: the exhaustion sweep must NOT revoke a claim whose lease
+    is still held.
+
+    The FINAL permitted claim increments attempts to the cap AND acquires a valid
+    lease; that receipt is genuinely being worked. The sweep must leave it alone and
+    only surface the spent budget once the lease is expired or abandoned.
+    """
+
+    def test_concurrent_recovery_does_not_revoke_live_final_claim(self, clean_state):
+        event_key = f"{BOT_ID}:{CHAT_ID}:900101"
+
+        # Stage the SECOND-TO-LAST permitted claim (attempts = cap - 1, unclaimed).
+        ctl("stage-capped", BOT_ID, CHAT_ID, "900101", "final claim",
+            str(RECEIPT_MAX_ATTEMPTS - 1))
+
+        # Pause the worker AFTER it acquires this - its FINAL - claim.
+        touch_marker("pause_after_claim.marker")
+        ctl_api("enqueue", CHAT_ID, "final claim", "900101")
+
+        # The worker claims (attempts -> cap, valid lease) and stalls before work.
+        def at_cap_processing():
+            row = (ctl("receipt-row", event_key) or {}).get("row") or {}
+            return row.get("status") == "processing" and row.get("attempts") >= RECEIPT_MAX_ATTEMPTS
+        wait_for(at_cap_processing, timeout=90, what="the final claim to be acquired")
+        before = ctl("receipt-row", event_key)["row"]
+        assert before["claim_token"], "the final claim must hold a claim token"
+
+        # A CONCURRENT recovery pass (separate process) must leave the live claim
+        # intact - status, token and lease unchanged, nothing exhausted.
+        rec = ctl("recover-direct")
+        assert rec.get("exhausted") == 0, f"sweep revoked a live claim: {rec}"
+        after = ctl("receipt-row", event_key)["row"]
+        assert after["status"] == "processing", after
+        assert after["claim_token"] == before["claim_token"], after
+        assert after["attempts"] >= RECEIPT_MAX_ATTEMPTS, after
+
+        # Release the worker: it persists exactly ONE consumption and completes.
+        ctl("rm-marker", "pause_after_claim.marker")
+        wait_for(lambda: (ctl("receipt-row", event_key)["row"] or {}).get("status")
+                 == "completed",
+                 timeout=90, what="the final claim to complete after release")
+        meals = int(postgres_q("SELECT count(*) FROM meals"))
+        assert meals == 1, f"expected exactly one consumption, got {meals}"
+        done = ctl("receipt-row", event_key)["row"]
+        assert done["status"] == "completed", done
+
+    def test_expired_final_claim_is_exhausted_and_refuses_redelivery(self, clean_state):
+        event_key = f"{BOT_ID}:{CHAT_ID}:900102"
+
+        # An at-cap receipt whose lease has EXPIRED: the worker that took it died
+        # (or abandoned it) mid-work. Recovery must surface it and refuse further
+        # attempts.
+        ctl("stage-capped", BOT_ID, CHAT_ID, "900102", "abandoned final",
+            str(RECEIPT_MAX_ATTEMPTS))
+        postgres_q(
+            "UPDATE telegram_receipts SET claim_token = 'ABANDONED-TOKEN', "
+            "lease_expires_at = now() - interval '1 hour' "
+            f"WHERE event_key = '{event_key}'"
+        )
+
+        # A concurrent recovery pass surfaces it as exhausted.
+        rec = ctl("recover-direct")
+        assert rec.get("exhausted") == 1, f"expired final claim not swept: {rec}"
+        row = ctl("receipt-row", event_key)["row"]
+        assert row["status"] == "exhausted", row
+        assert "budget" in (row["last_error"] or "").lower(), row
+
+        # A redelivery is refused: no new claim, no consumption.
+        meals_before = int(postgres_q("SELECT count(*) FROM meals"))
+        ctl_api("enqueue", CHAT_ID, "abandoned final", "900102")
+        time.sleep(6)
+        row = ctl("receipt-row", event_key)["row"]
+        assert row["status"] == "exhausted", row
+        meals_after = int(postgres_q("SELECT count(*) FROM meals"))
+        assert meals_after == meals_before, "an exhausted receipt was redelivered"
