@@ -5,12 +5,14 @@ import { authClient } from '../lib/auth'
  * BMR calculator. Katch–McArdle:
  *   BMR = 370 + 21.6 × LBM(kg),  LBM = weight × (1 − bodyfat/100)
  *
- * This existed as `components/ActivityBalancePopups.tsx` but that module was
- * imported nowhere, so the calculator never reached a build. It lives here as a
- * self-contained component so the Activity popup can render it.
+ * This began life in `components/ActivityBalancePopups.tsx`, which was imported
+ * nowhere, so it never reached a build. Backed by GET/PATCH
+ * /api/v1/activity/settings (basal_metabolism_kcal); the value applies to all
+ * days.
  *
- * Backed by GET/PATCH /api/v1/activity/settings (basal_metabolism_kcal), which
- * applies to all days.
+ * Layout note: the popup is narrow on phones, so fields are laid out as two
+ * short rows (given data, then the result + save) rather than one row of three
+ * controls, which squashed the inputs into unreadable slivers.
  */
 
 function katchMcardle(weightKg: number, bodyFatPct: number): number {
@@ -25,6 +27,7 @@ export default function BmrCalculator({ onSaved }: { onSaved?: () => void }) {
   const [fat, setFat] = useState('')
   const [result, setResult] = useState<number | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -39,23 +42,24 @@ export default function BmrCalculator({ onSaved }: { onSaved?: () => void }) {
   function calculate() {
     const w = parseFloat(weight)
     const f = parseFloat(fat)
-    if (!Number.isFinite(w) || !Number.isFinite(f) || w <= 0 || f < 0 || f >= 60) {
-      setMsg('Enter a valid weight (kg) and body fat (%).')
+    if (!Number.isFinite(w) || !Number.isFinite(f) || w <= 0 || w > 500 || f < 0 || f >= 60) {
+      setErr('Enter a weight in kg and a body fat % between 0 and 60.')
       return
     }
+    setErr(null)
     const v = Math.round(katchMcardle(w, f))
     setResult(v)
     setDraft(String(v))
-    setMsg(null)
   }
 
   async function save() {
     const v = parseFloat(draft)
     if (!Number.isFinite(v) || v < 500 || v > 6000) {
-      setMsg('BMR must be between 500 and 6000 kcal.')
+      setErr('BMR must be between 500 and 6000 kcal.')
       return
     }
     setBusy(true)
+    setErr(null)
     setMsg(null)
     try {
       await authClient.api('/activity/settings', {
@@ -66,37 +70,41 @@ export default function BmrCalculator({ onSaved }: { onSaved?: () => void }) {
       setMsg('BMR saved — applies to all days.')
       onSaved?.()
     } catch (e) {
-      setMsg(String(e))
+      setErr(String(e))
     } finally {
       setBusy(false)
     }
   }
 
   return (
-    <section className="section">
+    <section className="section manual-entry-section">
       <h3>BMR calculator</h3>
-      <p className="popup-hint">
-        {bmr != null
-          ? `Current BMR: ${Math.round(bmr)} kcal. `
-          : 'BMR not set yet. '}
+      <p className="muted">
+        {bmr != null ? <>Current: <strong>{Math.round(bmr)} kcal</strong>. </> : 'Not set yet. '}
         Katch–McArdle: 370 + 21.6 × lean body mass.
       </p>
+
       <div className="quick-entry-row">
-        <input type="number" inputMode="decimal" value={weight}
+        <input type="number" inputMode="decimal" step="0.1" value={weight}
           onChange={(e) => setWeight(e.target.value)} placeholder="Weight (kg)" />
-        <input type="number" inputMode="decimal" value={fat}
+        <input type="number" inputMode="decimal" step="0.1" value={fat}
           onChange={(e) => setFat(e.target.value)} placeholder="Body fat (%)" />
-        <button className="small" onClick={calculate}>Calculate</button>
       </div>
-      {result != null && (
-        <p className="popup-hint">Calculated BMR: <strong>{result} kcal</strong></p>
-      )}
-      <div className="quick-entry-row">
+      <div className="quick-entry-row" style={{ marginTop: 8 }}>
+        <button className="small" onClick={calculate}>Calculate</button>
+        {result != null && <span className="muted" style={{ alignSelf: 'center' }}>
+          → <strong>{result} kcal</strong>
+        </span>}
+      </div>
+
+      <div className="quick-entry-row" style={{ marginTop: 8 }}>
         <input type="number" inputMode="decimal" value={draft}
           onChange={(e) => setDraft(e.target.value)} placeholder="BMR (kcal)" />
-        <button className="small" onClick={save} disabled={busy}>{busy ? '…' : 'Save BMR'}</button>
+        <button className="small" onClick={save} disabled={busy}>{busy ? '…' : 'Save'}</button>
       </div>
-      {msg && <p className="popup-hint">{msg}</p>}
+
+      {err && <div className="error" style={{ marginTop: 8 }}>{err}</div>}
+      {msg && <div className="status" style={{ marginTop: 8 }}>{msg}</div>}
     </section>
   )
 }

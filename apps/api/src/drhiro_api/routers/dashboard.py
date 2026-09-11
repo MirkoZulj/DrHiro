@@ -260,27 +260,11 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
     #
     # Each millilitre is counted exactly ONCE in total_ml (summed over the
     # canonical buckets only) and additionally surfaced under its legacy key.
-    liquid_cats = ["water", "coffee", "tea", "juice", "soda", "milk", "alcohol",
-                   "smoothie", "broth", "other"]
-    legacy_cats = ["non_alcoholic", "beer", "wine", "spirits", "other_alcohol"]
+    liquid_cats = LIQUID_CANONICAL_CATS
+    legacy_cats = LIQUID_LEGACY_CATS[1:]  # "water" is already in liquid_cats
     liquid_today: dict[str, int] = {c: 0 for c in liquid_cats + legacy_cats}
     # stored value_json.category -> (canonical bucket, legacy bucket or None)
-    liquid_map = {
-        "water": ("water", None),
-        "juice": ("juice", "non_alcoholic"),
-        "soda": ("soda", "non_alcoholic"),
-        "coffee": ("coffee", "non_alcoholic"),
-        "tea": ("tea", "non_alcoholic"),
-        "milk": ("milk", "non_alcoholic"),
-        "smoothie": ("smoothie", "non_alcoholic"),
-        "broth": ("broth", "non_alcoholic"),
-        "non_alcoholic": ("other", "non_alcoholic"),
-        "beer": ("alcohol", "beer"),
-        "wine": ("alcohol", "wine"),
-        "spirits": ("alcohol", "spirits"),
-        "other_alcohol": ("alcohol", "other_alcohol"),
-        "alcohol": ("alcohol", "other_alcohol"),
-    }
+    liquid_map = LIQUID_CATEGORY_MAP
     for m in measurements:
         if m["metric_type"] != MetricType.WATER or m["start_at"] < today_start:
             continue
@@ -1071,6 +1055,46 @@ def trends_bucketed(
             "period_key": period_key, "points": points}
 
 
+# --------------------------------------------------------------------------- #
+# Liquid category bucketing (single source of truth)
+# --------------------------------------------------------------------------- #
+# Stored `value_json.category` -> (canonical bucket, legacy bucket or None).
+# Each millilitre is counted ONCE in the canonical buckets; the legacy keys are
+# an additional view kept because the deployed web bundle's chart reads them.
+LIQUID_CANONICAL_CATS = [
+    "water", "coffee", "tea", "juice", "soda", "milk", "alcohol",
+    "smoothie", "broth", "other",
+]
+LIQUID_LEGACY_CATS = [
+    "water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol",
+]
+LIQUID_CATEGORY_MAP: dict[str, tuple[str, str | None]] = {
+    "water": ("water", None),
+    "juice": ("juice", "non_alcoholic"),
+    "soda": ("soda", "non_alcoholic"),
+    "coffee": ("coffee", "non_alcoholic"),
+    "tea": ("tea", "non_alcoholic"),
+    "milk": ("milk", "non_alcoholic"),
+    "smoothie": ("smoothie", "non_alcoholic"),
+    "broth": ("broth", "non_alcoholic"),
+    "non_alcoholic": ("other", "non_alcoholic"),
+    "beer": ("alcohol", "beer"),
+    "wine": ("alcohol", "wine"),
+    "spirits": ("alcohol", "spirits"),
+    "other_alcohol": ("alcohol", "other_alcohol"),
+    "alcohol": ("alcohol", "other_alcohol"),
+}
+
+
+def liquid_category_buckets(cat: str | None) -> tuple[str, str | None]:
+    """Map a stored liquid category to (canonical bucket, legacy bucket).
+
+    Unknown categories fall back to the non-alcoholic bucket rather than to
+    water, so an unrecognised drink is never silently counted as water.
+    """
+    return LIQUID_CATEGORY_MAP.get(cat or "water", ("other", "non_alcoholic"))
+
+
 @router.get("/trends/liquids")
 def liquids_bucketed(
     granularity: Literal["day", "week", "month"] = "day",
@@ -1091,7 +1115,8 @@ def liquids_bucketed(
     """
     tz = ZoneInfo(user.timezone or "UTC")
     today = datetime.now(tz).date()
-    cats = ["water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol"]
+    cats = LIQUID_LEGACY_CATS        # chart series (unchanged key names)
+    canon_cats = LIQUID_CANONICAL_CATS  # drinks-list series
 
     if granularity == "day":
         base_monday, _ = _iso_week_bounds(today)
@@ -1156,8 +1181,9 @@ def liquids_bucketed(
             .order_by(Measurement.start_at.asc())
             .all())
 
-    # per-bucket per-category sums
+    # per-bucket per-category sums (legacy view + canonical view)
     buckets = [dict((c, 0) for c in cats) for _ in range(n)]
+    canon_buckets = [dict((c, 0) for c in canon_cats) for _ in range(n)]
     for m in rows:
         vj = m.value_json or {}
         amt = vj.get("amount_ml") or vj.get("volume_ml") or vj.get("water_ml")
@@ -1166,26 +1192,35 @@ def liquids_bucketed(
         idx, _ = bucket_of(m.start_at)
         if idx is None:
             continue
-        cat = vj.get("category") or "water"
-        if cat not in cats:
-            cat = "water"
-        buckets[idx][cat] += float(amt)
+        # Canonical + legacy, explicitly. Previously an unrecognised category
+        # was forced into "water"; with canonical categories stored by the
+        # writer that would silently turn a juice into water.
+        canon, legacy = liquid_category_buckets(vj.get("category"))
+        canon_buckets[idx][canon] += float(amt)
+        if legacy:
+            buckets[idx][legacy] += float(amt)
 
     points = []
     for i in range(n):
         row = buckets[i]
-        has = any(v > 0 for v in row.values())
-        d = day_at(i)
-        lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+        crow = canon_buckets[i]
+        # total counts each millilitre once, from the canonical buckets
+        has = any(v > 0 for v in crow.values())
+        day = day_at(i)
+        lab = bucket_of(datetime.combine(day, datetime.min.time(), tzinfo=tz))[1]
         points.append({
-            "date": d.isoformat(),
+            "date": day.isoformat(),
             "label": lab,
-            "total_ml": round(sum(row.values()), 1) if has else None,
+            "total_ml": round(sum(crow.values()), 1) if has else None,
+            # legacy keys (the chart's series; key names must not change)
             **{c: (round(row[c], 1) if row[c] > 0 else None) for c in cats},
+            # canonical keys (the drinks list names these)
+            **{c: (round(crow[c], 1) if crow[c] > 0 else None) for c in canon_cats},
         })
 
     return {"granularity": granularity, "metric": "liquids", "period_label": period_label,
-            "period_key": period_key, "categories": cats, "points": points}
+            "period_key": period_key, "categories": cats,
+            "canonical_categories": canon_cats, "points": points}
 
 
 @router.get("/goals")

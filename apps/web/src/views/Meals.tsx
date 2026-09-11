@@ -88,10 +88,14 @@ export default function Meals() {
         const liq = await authClient.api(
           `/trends/liquids?granularity=day&offset=${weeksBack}`)
         const byDay: Record<string, { label: string; ml: number }[]> = {}
+        // Canonical categories: the API's legacy keys fold juice/coffee/tea/
+        // soda/milk into "non_alcoholic" for the chart, which hides what was
+        // actually drunk. Use the canonical keys and name the drink.
         const LIQ_ROWS: [string, string][] = [
-          ['water', 'Water'], ['non_alcoholic', 'Non-alcoholic'],
-          ['beer', 'Beer'], ['wine', 'Wine'],
-          ['spirits', 'Spirits'], ['other_alcohol', 'Other alcohol'],
+          ['water', 'Water'], ['juice', 'Juice'], ['coffee', 'Coffee'],
+          ['tea', 'Tea'], ['soda', 'Soda'], ['milk', 'Milk'],
+          ['smoothie', 'Smoothie'], ['broth', 'Broth'],
+          ['alcohol', 'Alcohol'], ['other', 'Other'],
         ]
         for (const p of liq?.points ?? []) {
           const rows = LIQ_ROWS

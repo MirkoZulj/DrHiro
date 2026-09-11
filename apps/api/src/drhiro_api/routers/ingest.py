@@ -408,7 +408,16 @@ _GLASSES_RE = re.compile(r"\b(\d+)\s+glass(?:es)?\b", re.IGNORECASE)
 # value_json = {"amount_ml": N, "category": <liquid_category>}.
 # Old rows have no category -> treated as "water".
 LIQUID_CATEGORIES = [
-    "water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol",
+    "water",
+    # canonical beverage categories (what the user actually drank). The
+    # dashboard folds these into the legacy non_alcoholic/alcohol buckets for
+    # the chart, but they are stored distinctly so the drinks list can name
+    # them. Before this, juice/coffee/tea/soda/milk all stored as one
+    # undifferentiated "non_alcoholic".
+    "juice", "coffee", "tea", "soda", "milk", "smoothie", "broth",
+    # legacy names (still accepted for old rows / manual callers)
+    "non_alcoholic", "beer", "wine", "spirits", "other_alcohol",
+    "alcohol", "other",
 ]
 # Keyword -> category, evaluated in order (most specific first). Croatian +
 # English keywords. Each value is a compiled regex matched as a word boundary
@@ -422,8 +431,18 @@ _LIQUID_KEYWORDS: list[tuple[str, re.Pattern]] = [
     ("beer", re.compile(r"\b(?:beer|pivo|lager|ale|stout|heineken|ozujsko|karlovačko|karlovacko|točeno|toceno|radler)\b", re.IGNORECASE)),
     # other alcoholic (cocktails, liqueurs, cider)
     ("other_alcohol", re.compile(r"\b(?:cocktail|koktel|cider|jabolčnik|jabolcnik|liqueur|liker|aperol|martini|baileys|amaretto|mojito|negroni|spritz)\b", re.IGNORECASE)),
-    # non-alcoholic beverages (coffee, tea, juice, soda, milk, energy, ...)
-    ("non_alcoholic", re.compile(r"\b(?:coffee|kava|cappuccino|latte|tea|čaj|caj|ice\s*tea|juice|sok|soda|cola|coke|coca|fanta|sprite|smoothie|shake|milk|mlijeko|mliko|energy|redbull|monster|cedevita|limunada|nectar)\b", re.IGNORECASE)),
+    # Canonical beverages. These come BEFORE the non_alcoholic catch-all so the
+    # stored category says what was drunk ("juice"), not just "not alcohol".
+    # The dashboard folds each into the legacy non_alcoholic bucket for the
+    # chart, so the tile/chart grouping is unchanged.
+    ("juice", re.compile(r"\b(?:juice|sok|nectar|cedevita|limunada)\b", re.IGNORECASE)),
+    ("coffee", re.compile(r"\b(?:coffee|kava|cappuccino|latte|espresso|macchiato|frappe)\b", re.IGNORECASE)),
+    ("tea", re.compile(r"\b(?:tea|čaj|caj|ice\s*tea)\b", re.IGNORECASE)),
+    ("soda", re.compile(r"\b(?:soda|cola|coke|coca|fanta|sprite|energy|redbull|monster)\b", re.IGNORECASE)),
+    ("milk", re.compile(r"\b(?:milk|mlijeko|mliko)\b", re.IGNORECASE)),
+    ("smoothie", re.compile(r"\b(?:smoothie|shake)\b", re.IGNORECASE)),
+    # anything else non-alcoholic
+    ("non_alcoholic", re.compile(r"\b(?:beverage|drink|pice|piće)\b", re.IGNORECASE)),
     # water (lowest priority)
     ("water", re.compile(r"\b(?:water|voda|mineral)\b", re.IGNORECASE)),
 ]
