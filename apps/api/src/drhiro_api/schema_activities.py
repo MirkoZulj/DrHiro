@@ -310,14 +310,34 @@ class MissingUsersRelation(RuntimeError):
     """
 
 
-def _creation_namespace_oid(conn: Connection, schema: str | None) -> int:
-    """The namespace an unqualified CREATE would actually land in.
+class CreationPrivilegeError(RuntimeError):
+    """The destination schema exists but the current user may not CREATE in it.
 
-    With an explicit schema that IS the destination. With schema=None PostgreSQL
-    resolves an unqualified CREATE TABLE to the FIRST schema in the effective search
-    path in which the current user may CREATE (not merely the first that exists), so
-    that is what is resolved here rather than guessed from name resolution of some
-    other relation.
+    PostgreSQL does NOT fall through to a later schema in this case: an unqualified
+    CREATE TABLE targets the FIRST schema of the effective search path and fails with
+    `permission denied for schema <first>` when the user lacks CREATE there. Skipping
+    ahead to the next schema that happens to grant CREATE would place the table
+    somewhere native SQL never would, so creation fails here too, with the same
+    destination named.
+    """
+
+
+def _creation_namespace_oid(conn: Connection, schema: str | None) -> int:
+    """The namespace an unqualified CREATE would ACTUALLY land in.
+
+    Matches PostgreSQL's own selection rather than approximating it. When the name is
+    unqualified, `RangeVarGetCreationNamespace` takes the FIRST entry of the effective
+    search path (existing schemas only, implicit system schemas excluded - the same
+    list as `current_schemas(false)`) and then REQUIRES create privilege on it. It does
+    not scan for a schema that grants CREATE; insufficient privilege on the first entry
+    is an error, verified empirically against PostgreSQL 16:
+
+        search_path = ns_first, ns_second   (USAGE on ns_first, CREATE on ns_second)
+        unqualified CREATE TABLE t (...)  ->  permission denied for schema ns_first
+
+    So this helper takes the first existing schema and fails if the user may not CREATE
+    there, which guarantees an unqualified CREATE and this module never disagree about
+    the destination.
     """
     if schema:
         oid = conn.execute(
@@ -325,19 +345,33 @@ def _creation_namespace_oid(conn: Connection, schema: str | None) -> int:
         ).scalar()
         if oid is None:
             raise MissingUsersRelation(f"schema {schema!r} does not exist")
+        if not conn.execute(
+            text("SELECT has_schema_privilege(:oid, 'CREATE')"), {"oid": oid}
+        ).scalar():
+            raise CreationPrivilegeError(
+                f"permission denied for schema {schema} (CREATE)"
+            )
         return oid
-    oid = conn.execute(text("""
-        SELECT n.oid
-        FROM pg_namespace n
-        WHERE n.nspname = ANY(current_schemas(false))
-          AND has_schema_privilege(n.oid, 'CREATE')
-        ORDER BY array_position(current_schemas(false), n.nspname)
-        LIMIT 1
-    """)).scalar()
-    if oid is None:
-        raise MissingUsersRelation(
-            "cannot determine a writable schema for an unqualified CREATE - "
-            "search_path has no schema in which the current user may CREATE"
+
+    first = conn.execute(text("SELECT (current_schemas(false))[1]")).scalar()
+    if not first:
+        raise CreationPrivilegeError(
+            "no schema has been selected to create in"
+        )
+    oid = conn.execute(
+        text("SELECT oid FROM pg_namespace WHERE nspname = :s"), {"s": first}
+    ).scalar()
+    if oid is None:                                    # pragma: no cover - race
+        raise CreationPrivilegeError(
+            f"no schema has been selected to create in ({first!r} vanished)"
+        )
+    if not conn.execute(
+        text("SELECT has_schema_privilege(:oid, 'CREATE')"), {"oid": oid}
+    ).scalar():
+        # Same destination, same refusal as native SQL - never a silent fall-through.
+        raise CreationPrivilegeError(
+            f"permission denied for schema {first} (CREATE); PostgreSQL would target "
+            f"this first search_path schema and fail, so no later schema is used"
         )
     return oid
 

@@ -931,3 +931,63 @@ class TestCreationDestinationNamespace:
                 assert sa_act.diff_activities(c, schema="second")["fatal"] == []
         finally:
             self._drop(engine)
+
+
+    def test_first_schema_without_create_is_not_skipped(self, engine):
+        """REVIEW #12: PostgreSQL does NOT scan for a schema that grants CREATE.
+
+        `first` grants only USAGE; `second` grants CREATE. An unqualified CREATE TABLE
+        targets the FIRST existing schema of the search path and fails with
+        `permission denied for schema first`. Native SQL and create_activities must
+        therefore agree on the destination - and neither may fall through to `second`.
+        """
+        with engine.begin() as c:
+            for name in ("first", "second"):
+                c.execute(text(f"DROP SCHEMA IF EXISTS {name} CASCADE"))
+                c.execute(text(f"CREATE SCHEMA {name}"))
+            c.execute(text("DROP ROLE IF EXISTS creation_probe_role"))
+            c.execute(text("CREATE ROLE creation_probe_role NOLOGIN"))
+            c.execute(text("GRANT USAGE ON SCHEMA first TO creation_probe_role"))
+            c.execute(text(
+                "GRANT CREATE, USAGE ON SCHEMA second TO creation_probe_role"))
+        try:
+            # 1. Native unqualified CREATE: the destination is `first`, and the
+            #    privilege check there is fatal - it does NOT move on to `second`.
+            with engine.begin() as c:
+                c.execute(text("SET ROLE creation_probe_role"))
+                c.execute(text("SET search_path TO first, second"))
+                assert c.execute(
+                    text("SELECT (current_schemas(false))[1]")).scalar() == "first"
+                with pytest.raises(Exception) as native:
+                    c.execute(text("CREATE TABLE native_probe (id int)"))
+                assert "permission denied for schema first" in str(native.value), \
+                    f"native CREATE did not fail on `first`: {native.value}"
+            with engine.begin() as c:
+                c.execute(text("RESET ROLE"))
+                assert c.execute(text(
+                    "SELECT count(*) FROM pg_class k JOIN pg_namespace n"
+                    " ON n.oid = k.relnamespace"
+                    " WHERE k.relname = 'native_probe' AND n.nspname = 'second'"
+                )).scalar() == 0, "native CREATE fell through to `second`"
+
+            # 2. Our helper must pick the SAME destination and fail there too.
+            with engine.begin() as c:
+                c.execute(text("SET ROLE creation_probe_role"))
+                c.execute(text("SET search_path TO first, second"))
+                with pytest.raises(sa_act.CreationPrivilegeError) as ours:
+                    sa_act.create_activities(c)
+                assert "first" in str(ours.value), ours.value
+                assert "second" not in str(ours.value), ours.value
+            with engine.begin() as c:
+                c.execute(text("RESET ROLE"))
+                assert c.execute(text(
+                    "SELECT count(*) FROM pg_class k JOIN pg_namespace n"
+                    " ON n.oid = k.relnamespace"
+                    " WHERE k.relname = 'activities' AND n.nspname = 'second'"
+                )).scalar() == 0, "create_activities fell through to `second`"
+        finally:
+            with engine.begin() as c:
+                c.execute(text("RESET ROLE"))
+                for name in ("first", "second"):
+                    c.execute(text(f"DROP SCHEMA IF EXISTS {name} CASCADE"))
+                c.execute(text("DROP ROLE IF EXISTS creation_probe_role"))
