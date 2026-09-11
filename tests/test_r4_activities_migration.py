@@ -686,3 +686,104 @@ class TestConservativeTypeAndDefaultEquivalence:
         diff = sa_act.diff_activities(conn, schema=SCHEMA)
         assert got.strip() == "now()", f"unexpected stored rendering: {got!r}"
         assert diff["fatal"] == [], diff["fatal"]
+
+
+# --------------------------------------------------------------------------- #
+# REVIEW #10 - the FK must validate the complete COLUMN MAPPING, and the users
+# target must come from the RESOLVED activities namespace (same-schema policy).
+# --------------------------------------------------------------------------- #
+class TestForeignKeyMappingAndSchemaPolicy:
+    """The OID rewrite in round 9 checked the referred TABLE but dropped the referred
+    COLUMN list, so `REFERENCES users(alternate_id)` could pass against a compatible
+    unique UUID column. Round 10 compares both sides of the mapping in ordinal order,
+    and derives the intended users relation from the resolved activities namespace."""
+
+    @staticmethod
+    def _prod_shape(conn):
+        conn.execute(text(PROD_SHAPE_DDL.format(s=SCHEMA)))
+
+    @staticmethod
+    def _reqpoint_fk(conn, target: str):
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities DROP CONSTRAINT activities_user_id_fkey"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ADD CONSTRAINT activities_user_id_fkey "
+            f"FOREIGN KEY (user_id) REFERENCES {target} ON DELETE CASCADE"
+        ))
+
+    def test_referenced_column_alternate_id_is_fatal(self, conn):
+        """A different referenced COLUMN is a different constraint, even on the right
+        table with a compatible unique UUID type."""
+        self._prod_shape(conn)
+        # The baseline (references users(id)) must pass first.
+        assert sa_act.diff_activities(conn, schema=SCHEMA)["fatal"] == []
+
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.users ADD COLUMN alternate_id uuid UNIQUE"
+        ))
+        self._reqpoint_fk(conn, "users(alternate_id)")
+
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("references columns" in f and "id" in f for f in diff["fatal"]), \
+            f"REFERENCES users(alternate_id) was accepted: fatal={diff['fatal']}"
+
+    def test_intended_fk_baseline_still_passes(self, conn):
+        self._prod_shape(conn)
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert diff["fatal"] == [], diff["fatal"]
+
+    def test_users_only_leading_schema_is_not_used(self, engine):
+        """search_path = first, second; `first` holds users ONLY, `second` holds both.
+
+        `activities` resolves to second.activities, so the same-schema policy requires
+        the users relation in SECOND's namespace. A FK pointing at first.users (which
+        an independent unqualified lookup of `users` would have found) must be FATAL.
+        """
+        with engine.begin() as c:
+            for name in ("first", "second"):
+                c.execute(text(f"DROP SCHEMA IF EXISTS {name} CASCADE"))
+                c.execute(text(f"CREATE SCHEMA {name}"))
+                c.execute(text(f"CREATE TABLE {name}.users (id uuid PRIMARY KEY)"))
+            c.execute(text(
+                f"CREATE TABLE second.activities ("
+                "    id uuid NOT NULL DEFAULT gen_random_uuid(),"
+                "    user_id uuid NOT NULL,"
+                "    activity_date date NOT NULL,"
+                "    title character varying(255) NOT NULL,"
+                "    description text,"
+                "    calories_burned double precision NOT NULL,"
+                "    created_at timestamp with time zone NOT NULL DEFAULT now(),"
+                "    updated_at timestamp with time zone NOT NULL DEFAULT now(),"
+                "    CONSTRAINT activities_pkey PRIMARY KEY (id),"
+                f"    CONSTRAINT activities_calories_burned_check CHECK ({sa_act.CHECK_EXPR}),"
+                "    CONSTRAINT activities_user_id_fkey FOREIGN KEY (user_id)"
+                "        REFERENCES second.users(id) ON DELETE CASCADE"
+                ")"
+            ))
+            c.execute(text(
+                "CREATE INDEX ix_activities_user_id ON second.activities (user_id)"
+            ))
+            c.execute(text(
+                "CREATE INDEX idx_activities_user_date ON second.activities "
+                "(user_id, activity_date)"
+            ))
+            # first leads the search_path but has NO activities.
+            c.execute(text("SET search_path TO first, second"))
+            # the same-schema target is accepted through the DEFAULT schema=None entry
+            assert sa_act.diff_activities(c, schema=None)["fatal"] == []
+
+            # Repoint at first.users - the schema an independent `users` lookup finds.
+            c.execute(text(
+                "ALTER TABLE second.activities DROP CONSTRAINT activities_user_id_fkey"
+            ))
+            c.execute(text(
+                "ALTER TABLE second.activities ADD CONSTRAINT activities_user_id_fkey "
+                "FOREIGN KEY (user_id) REFERENCES first.users(id) ON DELETE CASCADE"
+            ))
+            diff = sa_act.diff_activities(c, schema=None)
+            assert any("foreign key" in f for f in diff["fatal"]), \
+                f"cross-namespace target accepted under users-only-leading search_path: {diff['fatal']}"
+        with engine.begin() as c:
+            for name in ("first", "second"):
+                c.execute(text(f"DROP SCHEMA IF EXISTS {name} CASCADE"))

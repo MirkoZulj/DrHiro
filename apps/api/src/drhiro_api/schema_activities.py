@@ -198,6 +198,38 @@ def _relation_oid(conn: Connection, name: str, schema: str | None) -> int | None
                         {"q": qualified}).scalar()
 
 
+def _namespace_of(conn: Connection, oid: int) -> int | None:
+    """The pg_namespace OID that a resolved relation lives in."""
+    return conn.execute(
+        text("SELECT relnamespace FROM pg_class WHERE oid = :oid"), {"oid": oid}
+    ).scalar()
+
+
+def _relation_in_namespace(conn: Connection, name: str, ns_oid: int | None) -> int | None:
+    """Resolve `name` INSIDE a specific namespace, by OID.
+
+    SCHEMA POLICY (review #10): the foreign key must target the `users` relation in the
+    SAME namespace as the `activities` relation the migration operates on. Resolving
+    both names independently through search_path does NOT enforce that: with a
+    search_path of `first, second` where `first` holds users but no activities and
+    `second` holds both, `activities` resolves to `second.activities` while a separate
+    unqualified lookup of `users` resolves to `first.users`. Comparing OIDs would then
+    accept a constraint the module's own diagnostic calls cross-schema. The intended
+    users relation is therefore derived from the RESOLVED activities namespace, which
+    matches what the migration creates (a fresh table's FK is emitted
+    schema-qualified against the same namespace).
+    """
+    if not name or _IDENT_RE.sub("", name) or ns_oid is None:
+        return None
+    return conn.execute(text("""
+        SELECT c.oid
+        FROM pg_class c
+        WHERE c.relname = :n
+          AND c.relnamespace = :ns
+          AND c.relkind IN ('r', 'p')
+    """), {"n": name, "ns": ns_oid}).scalar()
+
+
 def column_types(conn: Connection, schema: str | None = None) -> dict[str, str]:
     """Authoritative column types from the catalog (`format_type`).
 
@@ -274,6 +306,11 @@ def create_activities(conn: Connection, schema: str | None = None) -> None:
     not drift from the real one.
     """
     q = _qualify(schema)
+    # The FK target is emitted SCHEMA-QUALIFIED against the same namespace as the table
+    # being created. An unqualified `REFERENCES users(id)` resolves through search_path
+    # at CREATE time and can bind a different schema's users than the validator (and the
+    # operator) expects - the same-schema policy must hold at creation, not only in
+    # validation.
     conn.execute(text(f"""
         CREATE TABLE {q}{TABLE} (
             id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -286,7 +323,7 @@ def create_activities(conn: Connection, schema: str | None = None) -> None:
             updated_at timestamp with time zone NOT NULL DEFAULT now(),
             CONSTRAINT {CHECK_NAME} CHECK ({CHECK_EXPR}),
             CONSTRAINT {PK_NAME} PRIMARY KEY (id),
-            CONSTRAINT {FK_NAME} FOREIGN KEY (user_id) REFERENCES users(id)
+            CONSTRAINT {FK_NAME} FOREIGN KEY (user_id) REFERENCES {q}users(id)
                 ON DELETE CASCADE
         )
     """))
@@ -460,21 +497,28 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
     def _fk_faults() -> list[str]:
         faults: list[str] = []
         acts_oid = _relation_oid(conn, TABLE, schema)
-        users_oid = _relation_oid(conn, "users", schema)
         if acts_oid is None:
             return [f"cannot resolve {TABLE} to validate its foreign key"]
+        # SCHEMA POLICY (review #10): the target is the `users` relation in the SAME
+        # namespace as the RESOLVED activities relation - derived from activities'
+        # namespace, not resolved independently through search_path (which can bind a
+        # different schema's users than this module's own same-schema rule requires).
+        acts_ns = _namespace_of(conn, acts_oid)
+        users_oid = _relation_in_namespace(conn, "users", acts_ns)
         rows = conn.execute(text("""
             SELECT c.conname,
                    c.confrelid,
                    c.confdeltype,
-                   string_agg(a.attname, ',' ORDER BY k.ord) AS cols,
-                   r.relname AS referred_table,
-                   n.nspname AS referred_schema
+                   string_agg(a.attname,  ',' ORDER BY k.ord) AS cols,
+                   string_agg(fa.attname, ',' ORDER BY f.ord) AS ref_cols,
+                   r.relname  AS referred_table,
+                   n.nspname  AS referred_schema
             FROM pg_constraint c
-            JOIN unnest(c.conkey) WITH ORDINALITY k(attnum, ord) ON true
+            JOIN unnest(c.conkey)  WITH ORDINALITY k(attnum, ord) ON true
             JOIN unnest(c.confkey) WITH ORDINALITY f(attnum, ord) ON f.ord = k.ord
-            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
-            JOIN pg_class r ON r.oid = c.confrelid
+            JOIN pg_attribute a  ON a.attrelid  = c.conrelid  AND a.attnum  = k.attnum
+            JOIN pg_attribute fa ON fa.attrelid = c.confrelid AND fa.attnum = f.attnum
+            JOIN pg_class r     ON r.oid = c.confrelid
             JOIN pg_namespace n ON n.oid = r.relnamespace
             WHERE c.conrelid = :oid AND c.contype = 'f'
             GROUP BY c.conname, c.confrelid, c.confdeltype, r.relname, n.nspname
@@ -486,15 +530,26 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
                 continue
             found = True
             cols = (r["cols"] or "").split(",")
+            # BOTH sides of the mapping, each aggregated in ORDINAL order, so the
+            # pairing is what is compared - `REFERENCES users(alternate_id)` is a
+            # different constraint from `REFERENCES users(id)` even when both are
+            # unique UUID columns on the same table.
+            ref_cols = (r["ref_cols"] or "").split(",")
             if cols != ["user_id"]:
                 faults.append(
                     f"foreign key {FK_NAME} constrains {cols}, expected ['user_id']"
+                )
+            if ref_cols != ["id"]:
+                faults.append(
+                    f"foreign key {FK_NAME} references columns {ref_cols} on "
+                    f"{r['referred_schema']}.{r['referred_table']}; expected ['id']"
                 )
             if r["confrelid"] != users_oid:
                 faults.append(
                     f"foreign key {FK_NAME} refers to {r['referred_schema']}."
                     f"{r['referred_table']} (oid {r['confrelid']}); expected the "
-                    f"users relation in the activities schema (oid {users_oid})"
+                    f"users relation in the SAME namespace as {TABLE} "
+                    f"(oid {users_oid})"
                 )
             if r["confdeltype"] != "c":
                 faults.append(

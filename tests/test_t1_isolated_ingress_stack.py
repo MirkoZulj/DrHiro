@@ -1216,14 +1216,38 @@ class TestExhaustionSweepRespectsActiveLease:
         before = ctl("receipt-row", event_key)["row"]
         assert before["claim_token"], "the final claim must hold a claim token"
 
+        # The lease must exist and be UNEXPIRED at the checkpoint - otherwise the
+        # sweep would be correct to revoke it and the test would prove nothing.
+        lease_before = postgres_q(
+            "SELECT lease_expires_at > now() FROM telegram_receipts "
+            f"WHERE event_key = '{event_key}'"
+        ).strip()
+        assert lease_before == "t", f"claim does not hold a live lease: {lease_before!r}"
+        lease_ts_before = postgres_q(
+            "SELECT lease_expires_at FROM telegram_receipts "
+            f"WHERE event_key = '{event_key}'"
+        ).strip()
+
         # A CONCURRENT recovery pass (separate process) must leave the live claim
-        # intact - status, token and lease unchanged, nothing exhausted.
+        # intact - status, token AND lease unchanged, nothing exhausted.
         rec = ctl("recover-direct")
         assert rec.get("exhausted") == 0, f"sweep revoked a live claim: {rec}"
         after = ctl("receipt-row", event_key)["row"]
         assert after["status"] == "processing", after
         assert after["claim_token"] == before["claim_token"], after
         assert after["attempts"] >= RECEIPT_MAX_ATTEMPTS, after
+        lease_ts_after = postgres_q(
+            "SELECT lease_expires_at FROM telegram_receipts "
+            f"WHERE event_key = '{event_key}'"
+        ).strip()
+        assert lease_ts_after == lease_ts_before, (
+            f"the lease changed during concurrent recovery: "
+            f"{lease_ts_before!r} -> {lease_ts_after!r}"
+        )
+        assert postgres_q(
+            "SELECT lease_expires_at > now() FROM telegram_receipts "
+            f"WHERE event_key = '{event_key}'"
+        ).strip() == "t", "the lease was not left unexpired"
 
         # Release the worker: it persists exactly ONE consumption and completes.
         ctl("rm-marker", "pause_after_claim.marker")
