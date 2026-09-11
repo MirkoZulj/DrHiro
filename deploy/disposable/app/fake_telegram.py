@@ -92,7 +92,22 @@ class Handler(BaseHTTPRequestHandler):
                        "first_name": "Disposable"},
         })
 
-    def _handle_get_updates(self):
+    def _handle_get_updates(self, offset=None):
+        """Real Bot API offset semantics.
+
+        `offset` CONFIRMS every update with a lower update_id (they are discarded and
+        never returned again) and returns only updates with update_id >= offset. This
+        replaces the previous non-standard /ack endpoint: acknowledgement is now part
+        of the polling contract, exactly as with the real API, so the ingress must
+        track and persist an offset rather than rely on a bespoke ack route.
+        """
+        with _lock:
+            if offset is not None:
+                off = int(offset)
+                _updates[:] = [u for u in _updates if u["update_id"] >= off]
+            return self._send_json({"ok": True, "result": list(_updates)})
+
+    def _handle_get_updates_legacy(self):
         # NOTE: delivery-failure modes must NOT affect polling, or a test that wants
         # a failing *send* would stop the consumer from receiving anything at all.
         with _lock:
@@ -109,12 +124,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True})
         if self.path == "/_control/sent":
             return self._handle_sent()
+        if self.path == "/_control/updates":
+            # PENDING (not yet acknowledged) updates. An unhandled duplicate is never
+            # acked, so it stays here forever - this is how a test can prove the
+            # duplicate branch actually succeeded instead of merely changing nothing.
+            with _lock:
+                return self._send_json({"ok": True, "pending": len(_updates),
+                                        "updates": list(_updates)})
 
         method = self._method()
         if method == "getMe":
             return self._handle_get_me()
         if method == "getUpdates":
-            return self._handle_get_updates()
+            return self._handle_get_updates(body.get("offset"))
         return self._send_json({"ok": False, "description": "not found"}, 404)
 
     def do_POST(self):
@@ -144,19 +166,11 @@ class Handler(BaseHTTPRequestHandler):
                 _next_update_id[0] = 1000
             return self._send_json({"ok": True})
 
-        if self.path == "/_control/ack":
-            # Acknowledge delivered updates so getUpdates stops returning them
-            # (mirrors offset-based consumption).
-            with _lock:
-                acked = {int(u) for u in body.get("update_ids", [])}
-                _updates[:] = [u for u in _updates if u["update_id"] not in acked]
-            return self._send_json({"ok": True, "remaining": len(_updates)})
-
         method = self._method()
         if method == "getMe":
             return self._handle_get_me()
         if method == "getUpdates":
-            return self._handle_get_updates()
+            return self._handle_get_updates(body.get("offset"))
 
         if method == "sendMessage":
             mode = _mode[0]

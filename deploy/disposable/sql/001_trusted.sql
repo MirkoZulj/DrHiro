@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS telegram_receipts (
     attempts          integer NOT NULL DEFAULT 0,
     last_error        text,
     CONSTRAINT ck_receipts_status
-        CHECK (status IN ('received', 'processing', 'completed'))
+        CHECK (status IN ('received', 'processing', 'completed', 'exhausted'))
 );
 
 CREATE INDEX IF NOT EXISTS ix_receipts_status_lease
@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS reply_audit (
     from_state         text NOT NULL,
     to_state           text NOT NULL,
     delivery_attempt   integer NOT NULL DEFAULT 0,
+    attempt_id         text,                   -- immutable id of the send attempt
+    applied            boolean NOT NULL DEFAULT true,  -- false = observation only
     detail             text,
     created_at         timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT ck_reply_audit_action

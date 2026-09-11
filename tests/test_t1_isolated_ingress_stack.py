@@ -17,6 +17,7 @@ project name `drhiro-iso`, on internal networks with a throwaway database.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 import uuid
@@ -30,6 +31,8 @@ STACK_DIR = REPO / "deploy" / "disposable"
 COMPOSE_FILE = STACK_DIR / "docker-compose.isolated.yml"
 PROJECT = "drhiro-iso"
 CHAT_ID = "555000111"
+BOT_ID = "8677922871"          # fake Telegram bot identity
+RECEIPT_MAX_ATTEMPTS = int(os.environ.get("RECEIPT_MAX_ATTEMPTS", "10"))
 
 # Names that must never be readable from a model-accessible container.
 FORBIDDEN_SECRET_NAMES = {
@@ -223,6 +226,11 @@ def clean_state(stack_running):
             "TRUNCATE meals, meal_items, measurements, beverage_measurements, "
             "consumption_operations, reply_outbox, reply_audit, telegram_receipts "
             "CASCADE;")
+    # The polling offset is DURABLE, so it must be cleared with the state it refers
+    # to: after `reset` the fake restarts its update ids at 1000, and a stale offset
+    # would confirm-but-never-return them. This is a property of the test harness,
+    # not of the ingress, which must never rewind a real offset.
+    postgres_q("DELETE FROM telegram_consumer_offset")
     ctl_api("mode", "normal")
     yield
     ctl_api("mode", "normal")
@@ -888,3 +896,277 @@ class TestHttpClassification:
         assert state["reply_state"] == {"unknown": 1}
         assert "sent" not in state["reply_state"], "ok=false must not be recorded sent"
         assert state["telegram_consumptions"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# REVIEW ROUND 8 — B1 duplicate handling, retry budget, B4 fencing, strict confirm
+# --------------------------------------------------------------------------- #
+
+def counters() -> dict:
+    """Ingress observability counters. The main loop CATCHES consume exceptions, so
+    without these a broken duplicate/redelivery path leaves the queue stuck while the
+    suite still looks green."""
+    return ctl("status").get("counters") or {}
+
+
+def enqueue_and_wait_completed(chat_id: str, text: str, message_id: str, timeout: float = 90):
+    ctl_api("enqueue", chat_id, text, message_id)
+    wait_for(lambda: (ctl("counts")["receipt_status"].get("completed")),
+             timeout=timeout, what=f"completion of {message_id}")
+
+
+class TestDuplicateReceiptHandling:
+    """REVIEW #1: the duplicate branch must actually run.
+
+    Previously the branch chained `.fetchone()` onto a psycopg2 `execute()` (which
+    returns None) and indexed the row out of range, so EVERY existing-receipt case
+    raised - the update was never acked, and the queue could never drain. The old
+    count-based test passed anyway because counts stayed unchanged. These tests
+    assert SUCCESSFUL handling, not merely unchanged numbers.
+    """
+
+    def test_completed_duplicate_is_acknowledged_and_queue_drains(self, clean_state):
+        enqueue_and_wait_completed(CHAT_ID, "duplicate check", "800101")
+        before = ctl("counts")
+        errors_before = counters().get("consume_error", 0)
+
+        # Redeliver the SAME (chat, message_id) -> same event key.
+        ctl_api("enqueue", CHAT_ID, "duplicate check", "800101")
+        wait_for(lambda: counters().get("receipt_duplicate_completed", 0) >= 1,
+                 timeout=60, what="the completed-duplicate branch to actually run")
+
+        after = ctl("counts")
+        assert after["receipts"] == before["receipts"] == 1
+        assert after["telegram_consumptions"] == before["telegram_consumptions"] == 1
+        assert after["outbox"] == before["outbox"] == 1
+        assert counters().get("consume_error", 0) == errors_before, \
+            "duplicate handling raised instead of acknowledging"
+
+        # The queue must be EMPTY: an unhandled duplicate is never acked and would
+        # be redelivered forever. This is the observable the count-based test lacked.
+        wait_for(lambda: ctl_api("pending").get("pending") == 0,
+                 timeout=30, what="the update queue to drain")
+
+        # A subsequent NEW message still processes.
+        enqueue_and_wait_completed(CHAT_ID, "after duplicate", "800102")
+        assert ctl("counts")["receipts"] == 2
+        assert counters().get("consume_error", 0) == errors_before
+
+    def test_unfinished_duplicate_is_redriven_from_stored_text(self, clean_state):
+        """An unfinished receipt must be re-driven from the TRUSTED STORED input,
+        not from whatever text the redelivery happens to carry."""
+        # Fail before consumption so the receipt stays unfinished with stored text.
+        touch_marker("fail_before_consume.marker")
+        ctl_api("enqueue", CHAT_ID, "200 g steak", "800201")
+        wait_for(lambda: counters().get("consume_failed_claim_released", 0) >= 1,
+                 timeout=90, what="the failure-before-consumption to be recorded")
+        row = ctl("receipt-row", f"{BOT_ID}:{CHAT_ID}:800201")["row"]
+        assert row["status"] != "completed" and row["attempts"] >= 1
+        assert row["raw_text"] == "200 g steak", "trusted input was not persisted"
+
+        # Stop failing, then REDELIVER the same message id with DIFFERENT text.
+        ctl("rm-marker", "fail_before_consume.marker")
+        errors_before = counters().get("consume_error", 0)
+        ctl_api("enqueue", CHAT_ID, "5 kg chocolate cake", "800201")
+        wait_for(lambda: ctl("counts")["receipt_status"].get("completed"),
+                 timeout=90, what="the unfinished duplicate to be re-driven")
+
+        # The outputs must reflect the STORED text ("200 g steak"), never the
+        # newly delivered "5 kg chocolate cake".
+        out = real_output()
+        names = " ".join(str(i.get("display_name", "")) for i in out["meal_items"]).lower()
+        assert "steak" in names, f"stored input was not used for the re-drive: {names}"
+        assert "chocolate" not in names, \
+            f"redelivered text was used instead of the stored trusted input: {names}"
+        assert len(out["meal_items"]) == 1
+        assert ctl("counts")["telegram_consumptions"] == 1
+
+    def test_retry_budget_is_exhausted_and_operator_visible(self, clean_state):
+        """The budget is enforced at CLAIM time, so repeated REDELIVERY (not just the
+        recovery pass) cannot drive an update forever."""
+        event_key = f"{BOT_ID}:{CHAT_ID}:800301"
+
+        # Stage the spent-budget state directly. Letting a real attempt fail and then
+        # editing the row RACES the periodic recovery, which can legitimately complete
+        # the receipt before the cap is observed - that race is a property of the test,
+        # not of the ingress.
+        ctl("stage-capped", BOT_ID, CHAT_ID, "800301", "budget probe",
+            str(RECEIPT_MAX_ATTEMPTS))
+        row = ctl("receipt-row", event_key)["row"]
+        assert row["status"] == "received" and row["attempts"] >= RECEIPT_MAX_ATTEMPTS, row
+
+        # REDELIVERY is the entry path under test: the claim must be refused.
+        ctl_api("enqueue", CHAT_ID, "budget probe", "800301")
+
+        def exhausted():
+            row = ctl("receipt-row", event_key)["row"]
+            return row and row["status"] == "exhausted"
+
+        wait_for(exhausted, timeout=60, what="the attempt budget to be exhausted")
+        row = ctl("receipt-row", event_key)["row"]
+        assert row["status"] == "exhausted", row
+        # Operator-visible: the reason is recorded, not silently swallowed.
+        assert "budget" in (row["last_error"] or "").lower(), row["last_error"]
+        assert counters().get("receipt_attempt_budget_exhausted", 0) >= 1
+        # It must not have consumed anything.
+        assert ctl("counts")["telegram_consumptions"] == 0
+
+    def test_budget_also_bounds_the_lease_recovery_path(self, clean_state):
+        """LEASE RECOVERY is the entry path under test: recover_receipts re-drives
+        unfinished receipts, but a spent budget must stop it AND make the receipt
+        operator-visible rather than silently skipping it forever."""
+        event_key = f"{BOT_ID}:{CHAT_ID}:800302"
+
+        # Unfinished, no claim held, budget spent: the recovery scan's `attempts < cap`
+        # filter EXCLUDES exactly this row, so without the sweep it would stall in
+        # 'received' forever - never redriven, never reported.
+        ctl("stage-capped", BOT_ID, CHAT_ID, "800302", "recovery budget",
+            str(RECEIPT_MAX_ATTEMPTS))
+        row = ctl("receipt-row", event_key)["row"]
+        # The periodic sweep runs every few seconds, so it may ALREADY have surfaced
+        # this row - that is the behaviour under test, not a test defect. Accept either
+        # staged state; the assertions below are what must hold.
+        assert row["status"] in ("received", "exhausted"), row
+        assert row["attempts"] >= RECEIPT_MAX_ATTEMPTS, row
+
+        # Drive one recovery pass explicitly and assert the sweep surfaced it.
+        ctl("recover")
+        wait_for(lambda: (ctl("receipt-row", event_key)["row"] or {}).get("status")
+                 == "exhausted",
+                 timeout=60, what="recovery to surface the exhausted budget")
+        row = ctl("receipt-row", event_key)["row"]
+        assert row["status"] == "exhausted", row
+        assert "budget" in (row["last_error"] or "").lower(), row["last_error"]
+        assert ctl("counts")["telegram_consumptions"] == 0
+
+
+class TestResendStrictConfirmation:
+    """REVIEW #4: `bool(payload.get(...))` coerced non-boolean values. The string
+    "false" is truthy, so a refusal read as consent."""
+
+    @pytest.mark.parametrize("bad_value", ["false", "true", 1, 0, "", [], {}])
+    def test_non_boolean_ack_is_rejected_and_changes_nothing(self, bad_value, clean_state):
+        op = force_unknown()
+        before = ctl("counts")
+        audit_before = len(ctl("audit").get("audit") or [])
+        sent_before = ctl_api("sent")["delivered"]
+
+        res = ctl("resolve-raw", op, CHAT_ID,
+                  json.dumps({"operation_id": op, "action": "resend",
+                              "claim_chat_id": CHAT_ID,
+                              "duplicate_risk_ack": bad_value}))
+        body = res["body"]
+        assert body.get("ok") is False, f"non-boolean ack accepted: {bad_value!r}"
+        assert body.get("error") == "duplicate_risk_not_acknowledged"
+
+        # Nothing sent, nothing claimed, no state change, no new audit row.
+        after = ctl("counts")
+        assert after["outbox"] == before["outbox"]
+        assert ctl_api("sent")["delivered"] == sent_before, \
+            "a rejected resend still sent a message"
+        audit_after = len(ctl("audit").get("audit") or [])
+        assert audit_after == audit_before, "a rejected resend still wrote an audit row"
+        assert ctl("status")["outbox"][0]["reply_state"] == "unknown"
+
+    def test_missing_and_null_ack_is_rejected(self, clean_state):
+        op = force_unknown()
+        for payload in (
+            {"operation_id": op, "action": "resend", "claim_chat_id": CHAT_ID},
+            {"operation_id": op, "action": "resend", "claim_chat_id": CHAT_ID,
+             "duplicate_risk_ack": None},
+        ):
+            body = ctl("resolve-raw", op, CHAT_ID, json.dumps(payload))["body"]
+            assert body.get("ok") is False, payload
+            assert body.get("error") == "duplicate_risk_not_acknowledged"
+
+    def test_literal_true_is_accepted(self, clean_state):
+        op = force_unknown()
+        body = ctl("resolve-raw", op, CHAT_ID,
+                   json.dumps({"operation_id": op, "action": "resend",
+                               "claim_chat_id": CHAT_ID,
+                               "duplicate_risk_ack": True}))["body"]
+        assert body.get("ok") is True, body
+        assert body.get("applied") is True
+        assert body.get("to_state") == "resolved_resent"
+
+
+class TestAttemptFencingInFlight:
+    """REVIEW #4: the previously missing case - a late result arriving WHILE A NEWER
+    ATTEMPT IS ACTIVELY IN FLIGHT (state in_flight, a different current attempt id),
+    for BOTH ordinary delivery and the explicit-resend endpoint."""
+
+    def test_late_result_while_newer_attempt_in_flight_is_not_applied(self, clean_state):
+        op = force_unknown()
+        # A newer attempt is actively in flight (not acked, not unknown).
+        newer = str(uuid.uuid4())
+        postgres_q(
+            "UPDATE reply_outbox SET reply_state = 'in_flight', "
+            f"current_attempt_id = '{newer}' WHERE operation_id = '{op}'"
+        )
+        # The OLD attempt's result arrives late. (current_attempt_id is a uuid
+        # column, so the id must be a real uuid, not a label.)
+        old_attempt = str(uuid.uuid4())
+        res = ctl("late-result", op, old_attempt, "sent")
+        assert res.get("applied") is False, res
+
+        state = ctl("status")["outbox"][0]
+        assert state["reply_state"] == "in_flight", "a stale result changed the state"
+        assert str(state["current_attempt_id"]) == newer, \
+            "a stale result clobbered the newer attempt id"
+
+    def test_explicit_resend_stale_completion_reports_not_applied(self, clean_state):
+        """The resend endpoint itself must honour its UPDATE's rowcount: if a newer
+        attempt took over during the send, the result must NOT claim a transition."""
+        op = force_unknown()
+        probe = ctl("resend-stale-probe", op, CHAT_ID)
+        assert "raised" not in probe["result"], probe
+
+        res = probe["result"]
+        assert res["ok"] is True
+        assert res["applied"] is False, f"a superseded send reported a transition: {res}"
+        assert res.get("stale") is True
+        assert res.get("to_state") != "resolved_resent", res
+        assert res.get("current_state") == "in_flight"
+        assert res.get("current_attempt_id") == probe["newer_attempt"]
+
+        # The DB state is the newer attempt's, untouched.
+        assert probe["state"]["reply_state"] == "in_flight"
+        assert str(probe["state"]["current_attempt_id"]) == probe["newer_attempt"]
+
+        # And the audit says so: recorded as an OBSERVATION, not an applied change.
+        stale = [a for a in probe["audit"] if a["applied"] is False]
+        assert stale, f"no observation-only audit row: {probe['audit']}"
+        assert stale[-1]["to_state"] != "resolved_resent"
+        assert "superseded" in (stale[-1]["detail"] or "")
+        assert stale[-1]["attempt_id"], "the audit did not record the attempt id"
+
+    def test_resend_attempt_numbering_does_not_double_count(self, clean_state):
+        """review #4: counting audit ROWS counted each resend twice (start row +
+        completion row). Attempts must be counted, not events."""
+        op = force_unknown()
+        first = ctl("resolve-raw", op, CHAT_ID,
+                    json.dumps({"operation_id": op, "action": "resend",
+                                "claim_chat_id": CHAT_ID,
+                                "duplicate_risk_ack": True}))["body"]
+        assert first["applied"] is True
+
+        # The resend start and completion rows share ONE attempt id, so the next
+        # attempt's number is start+1, not start+2.
+        rows = [a for a in ctl("audit").get("audit", []) if a["operation_id"] == op]
+        attempt_ids = {a["attempt_id"] for a in rows if a.get("attempt_id")}
+        assert len(attempt_ids) == 1, f"one resend produced {len(attempt_ids)} attempt ids"
+
+        # Drive a second resend and confirm the reported attempt number advanced once.
+        postgres_q(
+            "UPDATE reply_outbox SET reply_state = 'unknown' "
+            f"WHERE operation_id = '{op}'"
+        )
+        second = ctl("resolve-raw", op, CHAT_ID,
+                     json.dumps({"operation_id": op, "action": "resend",
+                                 "claim_chat_id": CHAT_ID,
+                                 "duplicate_risk_ack": True}))["body"]
+        assert second["applied"] is True
+        assert second["delivery_attempt"] == first["delivery_attempt"] + 1, (
+            f"attempt numbering double-counted: {first['delivery_attempt']} -> "
+            f"{second['delivery_attempt']}"
+        )

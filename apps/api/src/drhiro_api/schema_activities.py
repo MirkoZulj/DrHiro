@@ -55,18 +55,35 @@ COLUMNS: dict[str, tuple[str, bool]] = {
     "title": ("VARCHAR", False),
     "description": ("TEXT", True),
     "calories_burned": ("FLOAT", False),
-    "created_at": ("TIMESTAMP", False),
-    "updated_at": ("TIMESTAMP", False),
+    "created_at": ("TIMESTAMP WITH TIME ZONE", False),
+    "updated_at": ("TIMESTAMP WITH TIME ZONE", False),
 }
 
-# Server defaults the adopted table must carry (substring match against the
-# canonicalised default). Measured from production: id defaults to gen_random_uuid(),
-# created_at/updated_at to now().
+# Server defaults the adopted table must carry, compared as EXACT canonical
+# expressions (not substrings). Measured from production: id defaults to
+# gen_random_uuid(), created_at/updated_at to now().
+#
+# Exactness matters: a substring test accepts `now() + interval '1 day'` because it
+# CONTAINS "now". Any additional expression changes behaviour and is not equivalent.
 EXPECTED_DEFAULTS: dict[str, str] = {
-    "id": "gen_random_uuid",
-    "created_at": "now",
-    "updated_at": "now",
+    "id": "gen_random_uuid()",
+    "created_at": "now()",
+    "updated_at": "now()",
 }
+
+
+def _canon_default(expr: Any) -> str:
+    """Canonicalise a server default expression for EQUALITY comparison.
+
+    Erases only formatting and casts (`now()::timestamp with time zone` is the same
+    default as `now()`), never structure - so a modified expression stays unequal.
+    """
+    s = str(expr or "").strip().lower()
+    # Drop casts: `now()::timestamp with time zone`, `'1 day'::interval`.
+    s = re.sub(r"::\s*[a-z_][a-z0-9_ ]*", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # Trailing semicolons/quotes are not part of the expression.
+    return s.strip(";").strip()
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -80,10 +97,30 @@ def _qualify(schema: str | None) -> str:
 
 
 def _canon_type(t: Any) -> str:
-    """Canonicalise a column type for comparison (ORM and DB spellings differ)."""
+    """Canonicalise a column type for comparison (ORM and DB spellings differ).
+
+    Deliberately CONSERVATIVE: only spelling differences are erased. Meaningful
+    attributes are preserved, because collapsing them makes the validator accept a
+    schema that is not equivalent. In particular `timestamp with time zone` and
+    `timestamp without time zone` are DIFFERENT types and must not compare equal -
+    the expected production shape is `with time zone`.
+
+    Type ATTRIBUTES are read before falling back to `str()`, because SQLAlchemy
+    renders `TIMESTAMP(timezone=True)` as plain "TIMESTAMP" - stringifying alone
+    would erase exactly the distinction being checked.
+    """
+    tz = getattr(t, "timezone", None)
+    if tz is not None:
+        return "TIMESTAMP WITH TIME ZONE" if tz else "TIMESTAMP WITHOUT TIME ZONE"
     s = str(t).upper()
+    # Normalise `TIMESTAMP(6) WITH TIME ZONE`, `TIMESTAMP WITH TIME ZONE`, etc.
     if "TIMESTAMP" in s or "DATETIME" in s:
-        return "TIMESTAMP"
+        if "WITH TIME ZONE" in s or "TIMESTAMPTZ" in s:
+            return "TIMESTAMP WITH TIME ZONE"
+        if "WITHOUT TIME ZONE" in s:
+            return "TIMESTAMP WITHOUT TIME ZONE"
+        # A bare TIMESTAMP means "without time zone" in PostgreSQL.
+        return "TIMESTAMP WITHOUT TIME ZONE"
     if "DOUBLE PRECISION" in s or "FLOAT" in s:
         return "FLOAT"
     if "CHARACTER VARYING" in s or s.startswith("VARCHAR"):
@@ -95,6 +132,64 @@ def _canon_type(t: Any) -> str:
     if "DATE" in s:
         return "DATE"
     return re.sub(r"\(.*\)", "", s).strip()
+
+
+def column_types(conn: Connection, schema: str | None = None) -> dict[str, str]:
+    """Authoritative column types from the catalog (`format_type`).
+
+    `format_type` spells the FULL type including the timezone attribute
+    ("timestamp with time zone") and the length ("character varying(255)"), so the
+    comparison does not depend on how a driver or ORM renders the type.
+    """
+    rows = conn.execute(text("""
+        SELECT a.attname AS column_name,
+               format_type(a.atttypid, a.atttypmod) AS column_type
+        FROM pg_attribute a
+        JOIN pg_class t ON t.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE t.relname = :t
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND (:s IS NULL OR n.nspname = :s)
+        ORDER BY a.attnum
+    """), {"t": TABLE, "s": schema}).mappings().all()
+    return {r["column_name"]: r["column_type"] for r in rows}
+
+
+def index_definitions(conn: Connection, schema: str | None = None) -> dict[str, dict]:
+    """Full index definitions: columns, method, uniqueness and PREDICATE.
+
+    `inspect().get_indexes()` gives the columns but not a partial index's predicate,
+    so an index named and columned correctly but created `WHERE false` (empty) or
+    `WHERE user_id IS NULL` reads as equivalent. Read the catalog instead so method,
+    uniqueness and partiality are all visible and comparable.
+    """
+    rows = conn.execute(text("""
+        SELECT i.relname            AS index_name,
+               am.amname            AS method,
+               ix.indisunique       AS is_unique,
+               ix.indisprimary      AS is_primary,
+               (ix.indpred IS NOT NULL) AS is_partial,
+               pg_get_indexdef(ix.indexrelid) AS indexdef
+        FROM pg_index ix
+        JOIN pg_class i ON i.oid = ix.indexrelid
+        JOIN pg_class t ON t.oid = ix.indrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_am am ON am.oid = i.relam
+        WHERE t.relname = :t
+          AND (:s IS NULL OR n.nspname = :s)
+        ORDER BY i.relname
+    """), {"t": TABLE, "s": schema}).mappings().all()
+    out: dict[str, dict] = {}
+    for r in rows:
+        out[r["index_name"]] = {
+            "method": r["method"],
+            "unique": bool(r["is_unique"]),
+            "primary": bool(r["is_primary"]),
+            "partial": bool(r["is_partial"]),
+            "definition": r["indexdef"],
+        }
+    return out
 
 
 def table_exists(conn: Connection, schema: str | None = None) -> bool:
@@ -203,12 +298,14 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
     insp = inspect(conn)
 
     cols = {c["name"]: c for c in insp.get_columns(TABLE, schema=schema)}
+    # Prefer the catalog's full type spelling over the reflected type object.
+    cat_types = column_types(conn, schema)
     for name, (want_type, want_nullable) in COLUMNS.items():
         got = cols.get(name)
         if got is None:
             fatal.append(f"missing column {TABLE}.{name}")
             continue
-        got_type = _canon_type(got["type"])
+        got_type = _canon_type(cat_types.get(name, got["type"]))
         if got_type != want_type:
             fatal.append(
                 f"column {TABLE}.{name} type is {got_type}, expected {want_type}"
@@ -220,19 +317,21 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
                 f"column {TABLE}.{name} is {got_n}, expected {want_n}"
             )
 
-    # Server defaults (the promised gen_random_uuid() / now()).
+    # Server defaults: EXACT canonical expression, never a substring. A modified
+    # expression (`now() + interval '1 day'`) must be fatal, not accepted.
     for name, want in EXPECTED_DEFAULTS.items():
-        got = (cols.get(name) or {}).get("default") or ""
-        got_norm = re.sub(r"[^a-z0-9]", "", str(got).lower())
-        want_norm = re.sub(r"[^a-z0-9]", "", want.lower())
-        if want_norm not in got_norm:
+        got = (cols.get(name) or {}).get("default")
+        if _canon_default(got) != _canon_default(want):
             fatal.append(
-                f"column {TABLE}.{name} default is {got!r}, expected containing {want}()"
+                f"column {TABLE}.{name} default is {got!r}, expected exactly {want}"
             )
 
-    # Indexes: match on DEFINITION (columns), not just name. A name with the wrong
-    # columns is fatal - it cannot be fixed by adding a differently-shaped index.
-    index_defs = {
+    # Indexes: match on the FULL definition - columns, access method, uniqueness and
+    # partiality. A name with the wrong columns is fatal (it cannot be fixed by
+    # adding a differently-shaped index), and so is a correctly named/columned index
+    # that is PARTIAL or non-btree: both change what the index actually covers.
+    cat_indexes = index_definitions(conn, schema)
+    insp_idx_cols = {
         i["name"]: list(i.get("column_names") or i.get("columns") or [])
         for i in insp.get_indexes(TABLE, schema=schema)
     }
@@ -240,14 +339,38 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
         (ORM_INDEX, ["user_id"]),
         (PROD_INDEX, ["user_id", "activity_date"]),
     ):
-        if index_name not in index_defs:
+        got_cols = insp_idx_cols.get(index_name)
+        meta = cat_indexes.get(index_name)
+        if got_cols is None and meta is None:
             reconcilable.append(
                 f"missing index {index_name} ({', '.join(want_cols)})"
             )
-        elif index_defs[index_name] != want_cols:
+            continue
+        if got_cols != want_cols:
             fatal.append(
-                f"index {index_name} columns {index_defs[index_name]} do not match "
+                f"index {index_name} columns {got_cols} do not match "
                 f"expected {want_cols}"
+            )
+            continue
+        # Columns match: reject unsupported differences instead of assuming
+        # equivalence. Only a plain, non-unique, non-partial btree index is the
+        # declared shape.
+        if meta is None:
+            fatal.append(f"index {index_name} columns match but definition unreadable")
+            continue
+        if meta["partial"]:
+            fatal.append(
+                f"index {index_name} is PARTIAL; expected a non-partial index "
+                f"({meta['definition']})"
+            )
+        if meta["unique"] and index_name != PK_NAME:
+            fatal.append(
+                f"index {index_name} is UNIQUE; expected a non-unique index"
+            )
+        if meta["method"] != "btree":
+            fatal.append(
+                f"index {index_name} uses access method {meta['method']}; "
+                "expected btree"
             )
 
     # PRIMARY KEY must be activities_pkey on (id).
@@ -260,25 +383,53 @@ def diff_activities(conn: Connection, schema: str | None = None) -> dict[str, li
             f"expected {PK_NAME}(id)"
         )
 
-    # FOREIGN KEY must be user_id -> users(id) ON DELETE CASCADE.
-    def _fk_equivalent() -> bool:
+    # FOREIGN KEY must be user_id -> users(id) ON DELETE CASCADE, where `users` is
+    # the table in the SAME schema as `activities`. Checking only the referred TABLE
+    # NAME accepts `unrelated.users(id)`: a different table that merely shares the
+    # name, which is a different constraint entirely.
+    def _fk_faults() -> list[str]:
+        faults: list[str] = []
+        found = False
         for fk in insp.get_foreign_keys(TABLE, schema=schema):
+            if fk.get("name") != FK_NAME:
+                continue
+            found = True
             opts = fk.get("options") or {}
-            if (
-                fk.get("name") == FK_NAME
-                and list(fk.get("constrained_columns")) == ["user_id"]
-                and fk.get("referred_table") == "users"
-                and list(fk.get("referred_columns")) == ["id"]
-                and opts.get("ondelete", "NO ACTION") == "CASCADE"
-            ):
-                return True
-        return False
+            referred_schema = fk.get("referred_schema")
+            # A None referred_schema means "the same schema as the table".
+            if (referred_schema or schema) != schema:
+                faults.append(
+                    f"foreign key {FK_NAME} targets schema "
+                    f"{referred_schema!r}, expected {schema!r}"
+                )
+            if list(fk.get("constrained_columns") or []) != ["user_id"]:
+                faults.append(
+                    f"foreign key {FK_NAME} constrains "
+                    f"{fk.get('constrained_columns')}, expected ['user_id']"
+                )
+            if fk.get("referred_table") != "users":
+                faults.append(
+                    f"foreign key {FK_NAME} refers to table "
+                    f"{fk.get('referred_table')!r}, expected 'users'"
+                )
+            if list(fk.get("referred_columns") or []) != ["id"]:
+                faults.append(
+                    f"foreign key {FK_NAME} refers to columns "
+                    f"{fk.get('referred_columns')}, expected ['id']"
+                )
+            if opts.get("ondelete", "NO ACTION") != "CASCADE":
+                faults.append(
+                    f"foreign key {FK_NAME} ON DELETE is "
+                    f"{opts.get('ondelete', 'NO ACTION')!r}, expected 'CASCADE'"
+                )
+        if not found:
+            faults.append(
+                f"foreign key {FK_NAME} (user_id -> users(id) ON DELETE CASCADE) "
+                "not found"
+            )
+        return faults
 
-    if not _fk_equivalent():
-        fatal.append(
-            f"foreign key {FK_NAME} (user_id -> users(id) ON DELETE CASCADE) not "
-            "found or not equivalent"
-        )
+    fatal.extend(_fk_faults())
 
     # CHECK: missing -> reconcilable; present-but-wrong -> fatal.
     checks = _check_constraints(conn, schema)

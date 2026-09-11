@@ -400,3 +400,105 @@ class TestAdoptionRejectsInvalidSchemas:
         assert any("default" in d for d in diff["fatal"]), diff["fatal"]
         with pytest.raises(RuntimeError):
             sa_act.reconcile_activities(conn, schema=SCHEMA)
+
+
+class TestDefinitionEquivalenceIsConservative:
+    """REVIEW #6: the validator must reject NON-EQUIVALENT definitions.
+
+    The previous checks rejected the submitted negative cases but still accepted
+    schemas that are not equivalent to the declared shape:
+
+      * a modified default that merely CONTAINS the expected expression;
+      * a correctly named/columned index that is PARTIAL or the wrong method;
+      * a foreign key that targets a SAME-NAMED table in a different schema;
+      * `timestamp without time zone` where the declared shape is `with time zone`.
+
+    Each test builds the valid production shape, applies exactly one such
+    alteration, and asserts it is FATAL. The companion baseline test asserts the
+    unaltered shape is NOT flagged, so these tests cannot pass by rejecting
+    everything.
+    """
+
+    def _prod_shape(self, conn):
+        conn.execute(text(PROD_SHAPE_DDL.format(s=SCHEMA)))
+        conn.execute(
+            text(f"CREATE INDEX ix_activities_user_id ON {SCHEMA}.activities (user_id)")
+        )
+
+    def test_unaltered_production_shape_is_accepted(self, conn):
+        """Baseline: the declared shape must remain valid under the strict checks."""
+        self._prod_shape(conn)
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert diff["fatal"] == [], diff["fatal"]
+        assert diff["reconcilable"] == [], diff["reconcilable"]
+
+    def test_modified_default_expression_is_fatal(self, conn):
+        """`now() + interval '1 day'` CONTAINS `now` but is a different default."""
+        self._prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ALTER COLUMN created_at "
+            "SET DEFAULT now() + interval '1 day'"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("created_at" in f and "default" in f for f in diff["fatal"]), \
+            f"modified default was accepted: fatal={diff['fatal']}"
+
+    def test_partial_index_is_fatal(self, conn):
+        """Right name, right columns, but WHERE false covers no rows."""
+        self._prod_shape(conn)
+        conn.execute(text(f"DROP INDEX {SCHEMA}.idx_activities_user_date"))
+        conn.execute(text(
+            f"CREATE INDEX idx_activities_user_date ON {SCHEMA}.activities "
+            "(user_id, activity_date) WHERE false"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("idx_activities_user_date" in f for f in diff["fatal"]), \
+            f"partial index was accepted: fatal={diff['fatal']}"
+
+    def test_unique_index_is_fatal(self, conn):
+        """Uniqueness is a meaningful difference, not a spelling variant."""
+        self._prod_shape(conn)
+        conn.execute(text(f"DROP INDEX {SCHEMA}.idx_activities_user_date"))
+        conn.execute(text(
+            f"CREATE UNIQUE INDEX idx_activities_user_date ON {SCHEMA}.activities "
+            "(user_id, activity_date)"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("idx_activities_user_date" in f for f in diff["fatal"]), \
+            f"unique index was accepted: fatal={diff['fatal']}"
+
+    def test_foreign_key_to_same_name_in_other_schema_is_fatal(self, conn):
+        """`unrelated.users` shares the name but is a different table."""
+        conn.execute(text("DROP SCHEMA IF EXISTS unrelated CASCADE"))
+        conn.execute(text("CREATE SCHEMA unrelated"))
+        conn.execute(text("CREATE TABLE unrelated.users (id uuid PRIMARY KEY)"))
+        conn.execute(text(
+            f"CREATE TABLE {SCHEMA}.activities ("
+            "    id uuid NOT NULL DEFAULT gen_random_uuid(),"
+            "    user_id uuid NOT NULL,"
+            "    activity_date date NOT NULL,"
+            "    title character varying(255) NOT NULL,"
+            "    description text,"
+            "    calories_burned double precision NOT NULL,"
+            "    created_at timestamp with time zone NOT NULL DEFAULT now(),"
+            "    updated_at timestamp with time zone NOT NULL DEFAULT now(),"
+            "    CONSTRAINT activities_pkey PRIMARY KEY (id),"
+            f"    CONSTRAINT activities_calories_burned_check CHECK ({sa_act.CHECK_EXPR}),"
+            "    CONSTRAINT activities_user_id_fkey FOREIGN KEY (user_id)"
+            "        REFERENCES unrelated.users(id) ON DELETE CASCADE"
+            ")"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("foreign key" in f for f in diff["fatal"]), \
+            f"cross-schema FK was accepted: fatal={diff['fatal']}"
+
+    def test_timestamp_without_time_zone_is_fatal(self, conn):
+        """The declared shape is `with time zone`; dropping it is a real change."""
+        self._prod_shape(conn)
+        conn.execute(text(
+            f"ALTER TABLE {SCHEMA}.activities ALTER COLUMN created_at "
+            "TYPE timestamp without time zone USING created_at AT TIME ZONE 'UTC'"
+        ))
+        diff = sa_act.diff_activities(conn, schema=SCHEMA)
+        assert any("created_at" in f and "type" in f for f in diff["fatal"]), \
+            f"timestamp without time zone was accepted: fatal={diff['fatal']}"

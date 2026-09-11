@@ -24,9 +24,11 @@ a crash mid-send is visible to recovery as "attempted, outcome unknown" and beco
 delivered. A crash BEFORE the attempt leaves `pending`, which is safe to retry.
 
 OUT OF PROVEN SCOPE (explicit limitations, not claims):
-  * POLLING OFFSET - this slice acknowledges via the fake Telegram `/ack` endpoint,
-    not a real polling-offset contract (last_update_id persistence). Real offset
-    management is production ingress behaviour and is NOT proven here.
+  * (RESOLVED in review round 8) POLLING OFFSET - acknowledgement now uses the REAL
+    Bot API offset contract: `getUpdates(offset=N)` confirms updates below N, and the
+    offset is DURABLE in `telegram_consumer_offset`. The old bespoke `/ack` route is
+    gone. The offset is written AFTER processing, so a crash re-fetches rather than
+    skips; the durable receipt remains the correctness boundary.
   * SENDER IDENTITY - a verified bot identity authenticates the BOT, not the SENDER.
     This slice maps every incoming message to one fixed disposable user
     (USER_UUID derived from the bot id) and does NOT resolve the Telegram sender id
@@ -85,6 +87,31 @@ CONSUMER_ID = "telegram:primary"          # single logical consumer
 # Administrator identity bound to the shared admin token (review #3): the audited
 # actor is ALWAYS this principal, never a caller-supplied string.
 ADMIN_IDENTITY = os.environ.get("INGRESS_ADMIN_IDENTITY", "admin")
+# Observability: the main loop CATCHES consume exceptions, so a broken duplicate or
+# recovery path can leave the suite green while the queue never drains. These counters
+# make the failure observable instead of log-only.
+_COUNTERS: dict[str, int] = {
+    "consume_error": 0,
+    "receipt_duplicate_completed": 0,
+    "receipt_duplicate_unfinished": 0,
+    "receipt_duplicate_row_missing": 0,
+    "receipt_attempt_budget_exhausted": 0,
+    "consume_failed_claim_released": 0,
+    "receipt_recovered": 0,
+}
+_COUNTERS_LOCK = threading.Lock()
+
+
+def _count(name: str, n: int = 1) -> None:
+    with _COUNTERS_LOCK:
+        _COUNTERS[name] = _COUNTERS.get(name, 0) + n
+
+
+def counters() -> dict[str, int]:
+    with _COUNTERS_LOCK:
+        return dict(_COUNTERS)
+
+
 LEASE_S = int(os.environ.get("RECEIPT_LEASE_S", "60"))
 RECEIPT_MAX_ATTEMPTS = int(os.environ.get("RECEIPT_MAX_ATTEMPTS", "10"))
 RECEIPT_RECOVERY_LIMIT = int(os.environ.get("RECEIPT_RECOVERY_LIMIT", "20"))
@@ -191,7 +218,14 @@ def write_receipt(cur, *, event_key, bot_id, chat_id, message_id, update_id,
 
 def claim_receipt(cur, event_key: str) -> dict | None:
     """Exclusive claim. Succeeds only when unclaimed, completed-reset, or the
-    previous lease has expired (stale-worker fencing)."""
+    previous lease has expired (stale-worker fencing).
+
+    REVIEW #1 (retry budget): the attempt budget is enforced HERE, at claim time,
+    and CONSUMED on acquisition. `attempts` therefore counts every claim taken -
+    including one abandoned by a hard crash that never reached fail_receipt - so a
+    receipt cannot be redriven forever by redelivery or lease recovery. Filtering
+    only inside recover_receipts() left every other entry path unbounded.
+    """
     token = uuid.uuid4().hex
     cur.execute(
         """
@@ -199,21 +233,49 @@ def claim_receipt(cur, event_key: str) -> dict | None:
            SET status = 'processing',
                claim_token = %s,
                claimed_by = %s,
-               lease_expires_at = now() + make_interval(secs => %s)
+               lease_expires_at = now() + make_interval(secs => %s),
+               attempts = attempts + 1
          WHERE event_key = %s
            AND status <> 'completed'
+           AND attempts < %s
            AND (claim_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < now())
         RETURNING claim_token, chat_id, message_id, bot_id, content_digest, status
         """,
-        (token, _process_owner, LEASE_S, event_key),
+        (token, _process_owner, LEASE_S, event_key, RECEIPT_MAX_ATTEMPTS),
     )
     row = cur.fetchone()
-    if not row:
-        return None
-    return {
-        "claim_token": row[0], "chat_id": row[1], "message_id": row[2],
-        "bot_id": row[3], "content_digest": row[4],
-    }
+    if row:
+        return {
+            "claim_token": row["claim_token"], "chat_id": row["chat_id"],
+            "message_id": row["message_id"], "bot_id": row["bot_id"],
+            "content_digest": row["content_digest"],
+        }
+
+    # Claim denied. Distinguish "budget exhausted" from "another worker holds it",
+    # and make the exhausted condition OPERATOR-VISIBLE (status becomes 'exhausted')
+    # instead of an invisible no-op that silently drops the update.
+    cur.execute(
+        """
+        UPDATE telegram_receipts
+           SET status = 'exhausted',
+               claim_token = NULL,
+               claimed_by = NULL,
+               lease_expires_at = NULL,
+               last_error = COALESCE(NULLIF(last_error, ''), '') ||
+                            CASE WHEN COALESCE(last_error, '') = '' THEN '' ELSE ' | ' END ||
+                            'attempt budget exhausted at ' || attempts || ' claims'
+         WHERE event_key = %s
+           AND status <> 'completed'
+           AND attempts >= %s
+           AND (claim_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < now())
+        RETURNING attempts
+        """,
+        (event_key, RECEIPT_MAX_ATTEMPTS),
+    )
+    if cur.fetchone() is not None:
+        _count("receipt_attempt_budget_exhausted")
+        log("receipt_attempt_budget_exhausted", event_key=event_key)
+    return None
 
 
 def fail_receipt(cur, event_key: str, claim_token: str, error: str) -> bool:
@@ -231,7 +293,6 @@ def fail_receipt(cur, event_key: str, claim_token: str, error: str) -> bool:
                claim_token = NULL,
                claimed_by = NULL,
                lease_expires_at = NULL,
-               attempts = attempts + 1,
                last_error = %s
          WHERE event_key = %s AND claim_token = %s
         """,
@@ -512,7 +573,7 @@ def process_update(*, event_key, bot_id, chat_id, message_id, text, update_id,
     """
     conn = _conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             claim = claim_receipt(cur, event_key)
             if claim is None:
                 # Completed under us, or another worker holds the (unexpired) lease.
@@ -543,6 +604,7 @@ def process_update(*, event_key, bot_id, chat_id, message_id, text, update_id,
             # in 'processing' until the lease expires.
             with conn, conn.cursor() as cur:
                 released = fail_receipt(cur, event_key, claim["claim_token"], repr(exc))
+            _count("consume_failed_claim_released")
             log("consume_failed_claim_released", event_key=event_key,
                 released=released, error=repr(exc))
             return
@@ -593,7 +655,7 @@ def recover_receipts(*, limit: int | None = None) -> dict:
     finally:
         conn.close()
 
-    counts = {"redriven": 0, "claim_denied": 0, "failed": 0}
+    counts = {"redriven": 0, "claim_denied": 0, "failed": 0, "exhausted": 0}
     for r in rows:
         try:
             process_update(
@@ -607,15 +669,47 @@ def recover_receipts(*, limit: int | None = None) -> dict:
         except Exception as exc:  # pragma: no cover - surfaced in the log
             counts["failed"] += 1
             log("receipt_recovery_error", event_key=r["event_key"], error=repr(exc))
-    if rows:
+
+    # REVIEW #1: a receipt at or over the retry budget is EXCLUDED by the scan's
+    # `attempts < cap` filter, so without this sweep it silently stalls in 'received'
+    # forever - neither redriven nor reported. Mark it operator-visible instead.
+    conn2 = _conn()
+    try:
+        with conn2, conn2.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE telegram_receipts
+                   SET status = 'exhausted',
+                       claim_token = NULL,
+                       claimed_by = NULL,
+                       lease_expires_at = NULL,
+                       last_error = COALESCE(NULLIF(last_error, ''), '') ||
+                           CASE WHEN COALESCE(last_error, '') = '' THEN '' ELSE ' | ' END ||
+                           'attempt budget exhausted after ' || attempts || ' claims'
+                 WHERE status NOT IN ('completed', 'exhausted')
+                   AND attempts >= %s
+                RETURNING event_key, attempts
+                """,
+                (RECEIPT_MAX_ATTEMPTS,),
+            )
+            newly = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn2.close()
+    if newly:
+        counts["exhausted"] = len(newly)
+        _count("receipt_attempt_budget_exhausted", len(newly))
+        log("receipts_marked_exhausted",
+            receipts=[r["event_key"] for r in newly])
+    if rows or newly:
         log("receipt_recovery_pass", **counts)
     return counts
 
 
 def consume_once(bot_id: str) -> int:
     """One poll/process cycle. Exactly one consumer performs this."""
+    offset = read_offset()
     try:
-        updates = _api("getUpdates")["result"]
+        updates = _api("getUpdates", {"offset": offset, "timeout": 0})["result"]
     except Exception as exc:
         log("poll_failed", error=repr(exc))
         return 0
@@ -623,11 +717,11 @@ def consume_once(bot_id: str) -> int:
         return 0
 
     processed = 0
+    highest = None
     for update in updates:
         msg = update.get("message") or update.get("edited_message")
-        acked = [update["update_id"]]
+        highest = update["update_id"] if highest is None else max(highest, update["update_id"])
         if not msg:
-            _safe_ack(acked)
             continue
 
         chat_id = str(msg["chat"]["id"])
@@ -641,7 +735,12 @@ def consume_once(bot_id: str) -> int:
         stored = None
         created = False
         try:
-            with conn, conn.cursor() as cur:
+            # RealDictCursor for NAMED row access. psycopg2's cursor.execute()
+            # returns None, so a chained `cur.execute(...).fetchone()` raises
+            # AttributeError before any status is inspected - and positional
+            # indexing into a mis-listed column order silently reads the wrong
+            # field or runs off the end. Named access removes both failure modes.
+            with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 created = write_receipt(
                     cur, event_key=event_key, bot_id=bot_id, chat_id=chat_id,
                     message_id=message_id, update_id=update["update_id"],
@@ -650,26 +749,50 @@ def consume_once(bot_id: str) -> int:
                 if created:
                     log("receipt_durable", event_key=event_key)
                 else:
-                    row = cur.execute(
+                    cur.execute(
                         "SELECT status, raw_text, bot_id, chat_id, message_id, "
-                        "update_id, content_digest, kind FROM telegram_receipts "
-                        "WHERE event_key=%s", (event_key,),
-                    ).fetchone()
-                    status = row[0]
+                        "update_id, content_digest, kind, attempts "
+                        "FROM telegram_receipts WHERE event_key=%s",
+                        (event_key,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        # Unreachable in practice (the INSERT conflicted), but never
+                        # silently continue on a missing row.
+                        _count("receipt_duplicate_row_missing")
+                        log("receipt_duplicate_row_missing", event_key=event_key)
+                        process_update(event_key=event_key, bot_id=bot_id,
+                                       chat_id=chat_id, message_id=message_id,
+                                       text=text, update_id=update["update_id"],
+                                       digest=digest, kind=kind)
+                        processed += 1
+                        continue
+
+                    status = row["status"]
                     if status == "completed":
                         # Replay: this event already fully processed. Inert.
+                        _count("receipt_duplicate_completed")
                         log("receipt_duplicate_completed", event_key=event_key)
-                        _safe_ack(acked)
+                        processed += 1
+                        continue
+                    if status == "exhausted":
+                        # Retry budget spent. Operator-visible; do not spin.
+                        log("receipt_duplicate_exhausted", event_key=event_key,
+                            attempts=row["attempts"])
+                        processed += 1
                         continue
                     # UNFINISHED work from a previous crash/failure. Re-drive it from
                     # the STORED payload - do not discard it just because the receipt
-                    # already exists (review #1).
+                    # already exists (review #1). NOTE: the STORED text, not the
+                    # newly delivered text, is authoritative.
+                    _count("receipt_duplicate_unfinished")
                     log("receipt_duplicate_unfinished_redriven", event_key=event_key,
                         status=status)
                     stored = {
-                        "bot_id": row[2], "chat_id": row[3], "message_id": row[4],
-                        "update_id": row[5], "digest": row[6], "text": row[7],
-                        "kind": row[8],
+                        "bot_id": row["bot_id"], "chat_id": row["chat_id"],
+                        "message_id": row["message_id"], "update_id": row["update_id"],
+                        "digest": row["content_digest"], "text": row["raw_text"],
+                        "kind": row["kind"],
                     }
         finally:
             conn.close()
@@ -685,17 +808,67 @@ def consume_once(bot_id: str) -> int:
                            digest=stored["digest"], text=stored["text"],
                            kind=stored["kind"])
 
-        _safe_ack(acked)
         processed += 1
+
+    # Confirm everything we just fetched, once, after processing.
+    if highest is not None:
+        commit_offset(highest + 1)
 
     return processed
 
 
-def _safe_ack(update_ids: list[int]):
+# --------------------------------------------------------------------------- #
+# durable polling offset (review #7 item 7: real polling-offset contract)
+# --------------------------------------------------------------------------- #
+# Acknowledgement is NOT a separate endpoint call. The Bot API confirms updates by
+# OFFSET: `getUpdates(offset=N)` discards everything below N and returns N onwards.
+# The previous code posted to a bespoke `/ack` route that no longer exists, so acks
+# silently failed and the same updates were re-served forever. The offset is now
+# DURABLE in PostgreSQL, so a restart resumes rather than replaying the queue.
+#
+# The offset is written AFTER processing, deliberately: a crash re-fetches the
+# unconfirmed updates instead of skipping them. Re-processing is safe because the
+# durable receipt (unique per bot/chat/message) makes it idempotent - the offset is
+# an efficiency measure, never the correctness boundary.
+CONSUMER = "telegram"
+
+
+def read_offset() -> int:
+    """Next offset to request (i.e. highest confirmed update_id + 1)."""
+    conn = _conn()
     try:
-        _api("ack", {"update_ids": update_ids})
-    except Exception:
-        pass
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT last_update_id FROM telegram_consumer_offset WHERE consumer = %s",
+                (CONSUMER,),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def commit_offset(next_offset: int) -> None:
+    """Confirm every update below `next_offset` (monotonic; never moves backwards)."""
+    conn = _conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO telegram_consumer_offset
+                    (consumer, last_update_id, owner_id, lease_expires_at)
+                VALUES (%s, %s, %s, now() + make_interval(secs => %s))
+                ON CONFLICT (consumer) DO UPDATE
+                   SET last_update_id = GREATEST(
+                           telegram_consumer_offset.last_update_id,
+                           EXCLUDED.last_update_id),
+                       owner_id = EXCLUDED.owner_id,
+                       lease_expires_at = EXCLUDED.lease_expires_at
+                """,
+                (CONSUMER, next_offset, _process_owner, LEASE_S),
+            )
+    finally:
+        conn.close()
 
 
 
@@ -734,7 +907,7 @@ def _authenticate(header: str | None) -> str | None:
 
 def resolve_reply(*, operation_id: str, principal: str, action: str,
                   claim_chat_id: str, note: str | None = None,
-                  duplicate_risk_ack: bool = False) -> dict:
+                  duplicate_risk_ack: object = None) -> dict:
     """Resolve an `unknown`/`failed` reply intent. Administrator-only, audited.
 
     `principal` is the AUTHENTICATED administrator (from the token, review #3), never
@@ -753,8 +926,14 @@ def resolve_reply(*, operation_id: str, principal: str, action: str,
     """
     if action not in ("acknowledge", "resend"):
         raise ResolutionError("unknown_action")
-    if action == "resend" and not duplicate_risk_ack:
-        raise ResolutionError("duplicate_risk_not_acknowledged")
+    # REVIEW #4 (strict confirmation): a resend requires the LITERAL JSON boolean
+    # true. `is not True` rejects false, null, missing, numbers, and strings - the
+    # string "false" is truthy, so a falsy coercion check would accept a refusal.
+    if action == "resend" and duplicate_risk_ack is not True:
+        raise ResolutionError(
+            "duplicate_risk_not_acknowledged",
+            detail="duplicate_risk_ack must be the JSON boolean true",
+        )
 
     conn = _conn()
     try:
@@ -763,9 +942,13 @@ def resolve_reply(*, operation_id: str, principal: str, action: str,
                 cur.execute(
                     """
                     SELECT o.operation_id, o.chat_id, o.body, o.reply_state, o.attempts,
-                           (SELECT count(*) FROM reply_audit a
+                           -- REVIEW #4: count DISTINCT attempt ids, not audit ROWS.
+                           -- Each attempt writes a start row and a completion row, so
+                           -- count(*) double-counted every resend.
+                           (SELECT count(DISTINCT a.attempt_id) FROM reply_audit a
                              WHERE a.operation_id = o.operation_id
-                               AND a.action = 'resend') AS resends
+                               AND a.action = 'resend'
+                               AND a.attempt_id IS NOT NULL) AS resends
                       FROM reply_outbox o
                      WHERE o.operation_id = %s
                      FOR UPDATE
@@ -844,10 +1027,12 @@ def resolve_reply(*, operation_id: str, principal: str, action: str,
                 cur.execute(
                     """
                     INSERT INTO reply_audit (operation_id, actor, action, from_state,
-                                             to_state, delivery_attempt, detail)
-                    VALUES (%s, %s, 'resend', %s, 'in_flight', %s, %s)
+                                             to_state, delivery_attempt, attempt_id,
+                                             applied, detail)
+                    VALUES (%s, %s, 'resend', %s, 'in_flight', %s, %s, true, %s)
                     """,
                     (str(operation_id), principal, from_state, attempt_no + 1,
+                     resend_attempt_id,
                      note or "explicit resend after ambiguous delivery; "
                              "delivery may already have occurred"),
                 )
@@ -871,8 +1056,11 @@ def resolve_reply(*, operation_id: str, principal: str, action: str,
         conn2 = _conn()
         try:
             with conn2:
-                with conn2.cursor() as cur:
-                    # Fenced: only applies while this resend attempt is still current.
+                # REVIEW #4: the fenced UPDATE can legitimately affect ZERO rows when a
+                # newer attempt has taken over (current_attempt_id has moved on). The
+                # outcome is still an OBSERVATION worth recording, but it is NOT an
+                # applied state transition, and it must not be reported as one.
+                with conn2.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(
                         """
                         UPDATE reply_outbox
@@ -884,22 +1072,60 @@ def resolve_reply(*, operation_id: str, principal: str, action: str,
                         (to_state, terminal_error, principal,
                          str(operation_id), resend_attempt_id),
                     )
+                    applied = cur.rowcount == 1
+
+                    # Read the TRUTHFUL current state, whether or not this attempt
+                    # applied. Callers must not infer the row's state from our result.
+                    cur.execute(
+                        "SELECT reply_state, current_attempt_id FROM reply_outbox "
+                        "WHERE operation_id = %s",
+                        (str(operation_id),),
+                    )
+                    now_row = cur.fetchone() or {}
+                    current_state = now_row.get("reply_state")
+                    current_attempt = now_row.get("current_attempt_id")
+
+                    # Immutable record of WHAT was observed and whether it changed
+                    # state. `applied=false` marks a stale observation so the audit
+                    # trail cannot be read as a transition that never happened.
                     cur.execute(
                         """
                         INSERT INTO reply_audit (operation_id, actor, action, from_state,
-                                                 to_state, delivery_attempt, detail)
-                        VALUES (%s, %s, 'resend', 'in_flight', %s, %s, %s)
+                                                 to_state, delivery_attempt, attempt_id,
+                                                 applied, detail)
+                        VALUES (%s, %s, 'resend', 'in_flight', %s, %s, %s, %s, %s)
                         """,
-                        (str(operation_id), principal, to_state, attempt_no + 1,
-                         f"resend outcome={outcome} error={terminal_error}"),
+                        (str(operation_id), principal,
+                         to_state if applied else (current_state or to_state),
+                         attempt_no + 1, resend_attempt_id, applied,
+                         (f"resend outcome={outcome} error={terminal_error}"
+                          if applied else
+                          f"STALE observation from attempt {resend_attempt_id}: "
+                          f"outcome={outcome} error={terminal_error}; superseded by "
+                          f"attempt {current_attempt}; state unchanged")),
                     )
         finally:
             conn2.close()
 
         log("reply_resolved", operation_id=str(operation_id), actor=principal,
-            action=action, outcome=outcome, delivery_attempt=attempt_no + 1)
-        return {"ok": True, "action": action, "outcome": outcome, "to_state": to_state,
-                "delivery_attempt": attempt_no + 1, "consumption_untouched": True}
+            action=action, outcome=outcome, delivery_attempt=attempt_no + 1,
+            applied=applied)
+
+        result = {"ok": True, "action": action, "outcome": outcome, "applied": applied,
+                  "delivery_attempt": attempt_no + 1, "attempt_id": resend_attempt_id,
+                  "consumption_untouched": True}
+        if applied:
+            result["to_state"] = to_state
+        else:
+            # Honest reporting: this attempt did NOT change the state. The observed
+            # delivery result is recorded, but the row's state is the newer one.
+            result["stale"] = True
+            result["to_state"] = current_state
+            result["current_state"] = current_state
+            result["current_attempt_id"] = current_attempt
+            result["detail"] = ("delivery was observed but this attempt was superseded; "
+                               "state unchanged")
+        return result
     finally:
         conn.close()
 
@@ -934,19 +1160,27 @@ class AdminHandler(BaseHTTPRequestHandler):
             return self._json({"ok": False, "error": "unauthorised"}, 401)
 
         if self.path == "/admin/recover":
-            return self._json({"ok": True, "counts": recover()})
+            # BOTH recovery paths, so a test (or an operator) can drive them
+            # deterministically instead of waiting for the periodic interval.
+            # Reply recovery: pending/failed are re-sent, abandoned in_flight -> unknown.
+            reply_counts = recover()
+            receipt_counts = recover_receipts()
+            return self._json({"ok": True, "counts": reply_counts,
+                               "receipt_counts": receipt_counts})
         if self.path == "/admin/status":
             conn = _conn()
             try:
                 with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute("SELECT event_key, status, operation_id FROM telegram_receipts ORDER BY id")
                     receipts = [dict(r) for r in cur.fetchall()]
-                    cur.execute("SELECT operation_id, reply_state, attempts, last_error FROM reply_outbox ORDER BY created_at")
+                    cur.execute("SELECT operation_id, reply_state, attempts, last_error, "
+                                "current_attempt_id FROM reply_outbox ORDER BY created_at")
                     outbox = [dict(r) for r in cur.fetchall()]
                     cur.execute("SELECT count(*) AS n FROM consumption_operations")
                     ops = cur.fetchone()["n"]
                 return self._json({"ok": True, "receipts": receipts, "outbox": outbox,
                                    "consumption_operations": ops,
+                                   "counters": counters(),
                                    "owner": _process_owner})
             finally:
                 conn.close()
@@ -957,7 +1191,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                     cur.execute(
                         """
                         SELECT id, operation_id, actor, action, from_state, to_state,
-                               delivery_attempt, detail, created_at
+                               delivery_attempt, attempt_id, applied, detail, created_at
                           FROM reply_audit ORDER BY id
                         """
                     )
@@ -1016,7 +1250,11 @@ class AdminHandler(BaseHTTPRequestHandler):
                 action=payload.get("action", ""),
                 claim_chat_id=str(payload.get("claim_chat_id", "")),
                 note=payload.get("note"),
-                duplicate_risk_ack=bool(payload.get("duplicate_risk_ack", False)),
+                # REVIEW #4 (strict confirmation): pass the RAW value and let
+                # resolve_reply require the literal JSON boolean true. Coercing with
+                # bool() accepts non-boolean truthy values - the string "false" is
+                # truthy - which would let a resend proceed without real consent.
+                duplicate_risk_ack=payload.get("duplicate_risk_ack", None),
             )
         except ResolutionError as exc:
             body = {"ok": False, "error": exc.code, **exc.extra}
@@ -1089,6 +1327,7 @@ def main():
         try:
             consume_once(bot_id)
         except Exception as exc:
+            _count("consume_error")
             log("consume_error", error=repr(exc))
 
         # Periodic recovery: reply delivery state AND unfinished receipts.
