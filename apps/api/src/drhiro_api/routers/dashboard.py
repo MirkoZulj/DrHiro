@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.orm import Session, selectinload
 
 from drhiro_api.db import get_db
@@ -28,14 +29,29 @@ from drhiro_schema.metrics import MetricType
 router = APIRouter(tags=["dashboard"])
 
 
+def _ledger_soft_delete_available(db: Session) -> bool:
+    """True only when the ledger soft-delete migration has been applied.
+
+    On a schema without `measurements.deleted_at` (production today) the filter is
+    omitted entirely rather than referencing a column that does not exist.
+    """
+    try:
+        from drhiro_api.services.log_intents import schema_capabilities
+        return bool(schema_capabilities(db)["ledger_deleted_at"])
+    except Exception:
+        return False
+
+
 def _measurements_since(db: Session, user_id: uuid.UUID, days: int) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = (
-        db.query(Measurement)
-        .filter(Measurement.user_id == user_id, Measurement.start_at >= cutoff)
-        .order_by(Measurement.start_at.asc())
-        .all()
-    )
+    q = db.query(Measurement).filter(
+        Measurement.user_id == user_id, Measurement.start_at >= cutoff)
+    if _ledger_soft_delete_available(db):
+        # A soft-deleted liquid must not appear in any daily total. Expressed as
+        # guarded raw SQL because the column is not ORM-mapped (a schema without
+        # it must never see it referenced).
+        q = q.filter(text("measurements.deleted_at IS NULL"))
+    rows = q.order_by(Measurement.start_at.asc()).all()
     return [
         {
             "id": str(m.id),
@@ -230,14 +246,20 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
     )
     # Liquid breakdown by category (value_json may carry a "category" key;
     # missing -> "water" for backward compat with old rows).
-    liquid_cats = ["water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol"]
+    # Canonical drink categories. The previous list was legacy
+    # (water/non_alcoholic/beer/wine/spirits/other_alcohol), so EVERY modern
+    # category -- juice, coffee, tea, soda, milk -- fell through to "water" and a
+    # 300 ml orange juice was reported as water. Unknown values now land in
+    # "other" rather than being silently relabelled as water.
+    liquid_cats = ["water", "coffee", "tea", "juice", "soda", "milk", "alcohol",
+                   "smoothie", "broth", "other"]
     liquid_today: dict[str, int] = {c: 0 for c in liquid_cats}
     for m in measurements:
         if m["metric_type"] != MetricType.WATER or m["start_at"] < today_start:
             continue
         cat = (m["value_json"].get("category") or "water")
         if cat not in liquid_today:
-            cat = "water"
+            cat = "other"
         liquid_today[cat] += m["value_json"].get("amount_ml", 0)
     liquids_today = {"total_ml": sum(liquid_today.values()), **liquid_today}
     # Last water measurement ANY day (for "last log" display)
@@ -259,6 +281,22 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
         max((m.eaten_at for m in meals_today_rows), default=None).astimezone(ZoneInfo(user.timezone)).isoformat()
         if meals_today_rows else None
     )
+    # Activity burn for today (the daily summary previously omitted it entirely).
+    activity_kcal_today = None
+    try:
+        from drhiro_api.models import Activity
+        # `today_start` is tz-aware UTC, so .date() would yield the UTC date and
+        # miss the local day entirely. Compare the owner's LOCAL date.
+        local_today = datetime.now(ZoneInfo(user.timezone)).date()
+        aq = db.query(Activity).filter(Activity.user_id == user.id,
+                                       Activity.activity_date == local_today)
+        if _ledger_soft_delete_available(db):
+            aq = aq.filter(text("activities.deleted_at IS NULL"))
+        activity_kcal_today = round(
+            sum(float(a.calories_burned or 0) for a in aq.all()), 1)
+    except Exception:
+        activity_kcal_today = None
+
     sleep_last = None
     sleep_rows = [m for m in measurements if m["metric_type"] == MetricType.SLEEP]
     if sleep_rows:
@@ -311,6 +349,7 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
         "calories_kcal_today": round(calories_kcal_today, 1),
         "calories_measured_at": calories_measured_at,
         "calories_is_stale": False,
+        "activity_kcal_today": activity_kcal_today,
         "last_sleep": sleep_last,
         "missing_data_note": "Absence of wearable data is reported as missing, never as zero.",
     }

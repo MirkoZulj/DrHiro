@@ -41,6 +41,9 @@ class MealItemIn(BaseModel):
     quantity: float = Field(default=1.0, ge=0)
     unit: str | None = None
     grams: float | None = Field(default=None, ge=0)
+    # A millilitre figure is a VOLUME. It must never be copied into grams.
+    volume_ml: float | None = Field(default=None, ge=0)
+    beverage_category: str | None = None
 
 
 class MealCreateRequest(BaseModel):
@@ -395,6 +398,8 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
             quantity=item.quantity,
             unit=item.unit,
             grams=item.grams,
+            volume_ml=item.volume_ml,
+            beverage_category=item.beverage_category,
             nutrients_json=nutrients,
             source=source or "manual",
             confidence=conf,

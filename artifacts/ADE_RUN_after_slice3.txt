@@ -1,0 +1,112 @@
+# Suites A-E after Slice 3
+Date: 2026-09-11T16:13:24Z
+Live path: POST /api/v1/tools/create_meal_from_text -> parse_log_text -> commit_intents (one transaction)
+Disposable alembic_version: 9a1b2c3d4e5f
+
+NIT 1 - duration_min: the activities table has NO duration column
+  columns: id, user_id, activity_date, title, description, calories_burned,
+           created_at, updated_at. Duration is parsed (40 min) but NOT persisted -
+  persisting it needs a migration, which is out of this slice's scope.
+
+NIT 2 - daily summary will group liquids by value_json.category (the field that
+  already carries water/tea/juice/...), NOT by metric_type (all liquids are
+  metric_type=water today).
+
+--- A1 'eggs and toast' ---
+  meals=1 liquids=0 activities=0 items=2
+    meal slot=snack status=needs_review
+    item 'eggs' grams=50.0 ml=None bev=None kcal=None
+    item 'toast' grams=28.0 ml=None bev=None kcal=None
+--- A2 'breakfast scrambled eggs' ---
+  meals=1 liquids=0 activities=0 items=1
+    meal slot=breakfast status=needs_review
+    item 'scrambled eggs' grams=50.0 ml=None bev=None kcal=None
+--- A3 'lunch grilled chicken 200g' ---
+  meals=1 liquids=0 activities=0 items=1
+    meal slot=lunch status=needs_review
+    item 'grilled chicken' grams=200.0 ml=None bev=None kcal=None
+--- A4 'dinner salmon and rice' ---
+  meals=1 liquids=0 activities=0 items=2
+    meal slot=dinner status=needs_review
+    item 'salmon' grams=100.0 ml=None bev=None kcal=None
+    item 'rice' grams=100.0 ml=None bev=None kcal=None
+--- A5 'snack banana' ---
+  meals=1 liquids=0 activities=0 items=1
+    meal slot=snack status=needs_review
+    item 'banana' grams=118.0 ml=None bev=None kcal=None
+--- A6 'I ate a banana' ---
+  meals=1 liquids=0 activities=0 items=1
+    meal slot=snack status=needs_review
+    item 'banana' grams=118.0 ml=None bev=None kcal=None
+--- B1 'water 500ml' ---
+  meals=0 liquids=1 activities=0 items=0
+    liquid water {'amount_ml': 500.0, 'category': 'water', 'needs_review': False}
+--- B2 'sparkling water 300 ml' ---
+  meals=0 liquids=1 activities=0 items=0
+    liquid water {'amount_ml': 300.0, 'category': 'water', 'needs_review': False}
+--- B3 'tea 250ml' ---
+  meals=0 liquids=1 activities=0 items=0
+    liquid water {'amount_ml': 250.0, 'category': 'tea', 'needs_review': False}
+--- B4 'black coffee 200ml' ---
+  meals=0 liquids=1 activities=0 items=0
+    liquid water {'amount_ml': 200.0, 'category': 'coffee', 'needs_review': False}
+--- C1 '300ml orange juice' ---
+  meals=1 liquids=1 activities=0 items=1
+    meal slot=snack status=needs_review
+    item 'orange juice' grams=None ml=300.0 bev=juice kcal=None
+    liquid water {'amount_ml': 300.0, 'category': 'juice', 'needs_review': False}
+--- C2 'breakfast latte 250ml' ---
+  meals=1 liquids=1 activities=0 items=1
+    meal slot=breakfast status=needs_review
+    item 'latte' grams=None ml=250.0 bev=coffee kcal=None
+    liquid water {'amount_ml': 250.0, 'category': 'coffee', 'needs_review': False}
+--- C3 'beer 500ml' ---
+  meals=1 liquids=1 activities=0 items=1
+    meal slot=snack status=needs_review
+    item 'beer' grams=None ml=500.0 bev=alcohol kcal=None
+    liquid water {'amount_ml': 500.0, 'category': 'alcohol', 'needs_review': False}
+--- C4 'coke 330ml' ---
+  meals=1 liquids=1 activities=0 items=1
+    meal slot=snack status=needs_review
+    item 'coke' grams=None ml=330.0 bev=soda kcal=None
+    liquid water {'amount_ml': 330.0, 'category': 'soda', 'needs_review': False}
+--- C5 'glass of milk' ---
+  meals=1 liquids=1 activities=0 items=1
+    meal slot=snack status=needs_review
+    item 'milk' grams=None ml=250.0 bev=milk kcal=None
+    liquid water {'amount_ml': 250.0, 'category': 'milk', 'needs_review': False}
+--- C6 'orange juice' (no volume) ---
+  meals=1 liquids=1 activities=0 items=1
+    meal slot=snack status=needs_review
+    item 'orange juice' grams=None ml=None bev=juice kcal=None
+    liquid water {'amount_ml': None, 'category': 'juice', 'needs_review': True}
+--- D1 'walk 180 kcal' ---
+  meals=0 liquids=0 activities=1 items=0
+    activity 'walk' kcal=180.0
+--- D2 'gym 400' ---
+  meals=0 liquids=0 activities=1 items=0
+    activity 'gym' kcal=400.0
+--- D3 'yoga 30 min 120 kcal' ---
+  meals=0 liquids=0 activities=1 items=0
+    activity 'yoga' kcal=120.0
+--- C1 txn-atomic (liquid write injected failure) ---
+  meals=0 liquids=0 activities=0 items=0
+--- E1 'lunch: grilled chicken 200g, 300ml orange juice, walk 40 min 180 kcal' ---
+  meals=1 liquids=1 activities=1 items=2
+    meal slot=lunch status=needs_review
+    item 'grilled chicken' grams=200.0 ml=None bev=None kcal=None
+    item 'orange juice' grams=None ml=300.0 bev=juice kcal=None
+    liquid water {'amount_ml': 300.0, 'category': 'juice', 'needs_review': False}
+    activity 'walk' kcal=180.0
+--- E2 'water 400ml and a banana' ---
+  meals=1 liquids=1 activities=0 items=1
+    meal slot=snack status=needs_review
+    item 'banana' grams=118.0 ml=None bev=None kcal=None
+    liquid water {'amount_ml': 400.0, 'category': 'water', 'needs_review': False}
+--- E3 'lunch water 300ml' ---
+  meals=0 liquids=1 activities=0 items=0
+    liquid water {'amount_ml': 300.0, 'category': 'water', 'needs_review': False}
+--- E4 'snack walk 100 kcal' ---
+  meals=0 liquids=0 activities=1 items=0
+    activity 'walk' kcal=100.0
+24 passed, 50 warnings in 2.09s

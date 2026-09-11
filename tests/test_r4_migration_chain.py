@@ -43,18 +43,23 @@ class TestR4MigrationChain:
         """Exactly one head: the chain must be linear (no forks)."""
         heads = _script().get_heads()
         assert len(heads) == 1, f"expected single head, got {heads}"
-        assert heads[0] == "b7c8d9e0f1a2"
+        assert heads[0] == "c4e5f6a7b8c9"
 
-    def test_activities_migration_is_at_head_after_orm_column_gaps(self):
-        """activities is created/adopted at HEAD, NOT inserted after 3c003.
+    def test_activities_adoption_revision_is_deferred(self):
+        """b7c8d9e0f1a2 (the `activities` adoption) is DEFERRED, not in the chain.
 
-        Production has already applied up to d5e6f7a8b9c0, so a revision inserted
-        mid-chain would rewrite applied history; it must come after the last
-        pre-existing revision.
+        It is not imported by Alembic at all, so no `alembic upgrade` variant --
+        `head` or `heads` -- can ever apply it. It previously sat at HEAD and a
+        second head had to be kept disjoint from it; moving it out makes that
+        structural rather than a matter of care.
         """
-        script = _script()
-        rev = script.get_revision("b7c8d9e0f1a2")
-        assert rev.down_revision == "9a1b2c3d4e5f"
+        assert "b7c8d9e0f1a2" not in {r.revision for r in _script().walk_revisions()}
+
+    def test_forbidden_revision_is_not_a_live_migration(self):
+        """ONE LINE: b7c8d9e0f1a2 must not be under alembic/versions/."""
+        assert not os.path.exists(
+            os.path.join(ALEMBIC_DIR, "versions",
+                         "b7c8d9e0f1a2_activities_table.py"))
 
     def test_food_baseline_is_chain_root(self):
         """The food-domain baseline (b2f3c4d5e6f7) is the new base (down_revision None)."""

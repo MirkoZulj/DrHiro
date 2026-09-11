@@ -97,6 +97,7 @@ class Activity(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     calories_burned: Mapped[float] = mapped_column(nullable=False)
+    # NOTE: `deleted_at` is NOT mapped -- see Measurement.deleted_at above.
 
     user: Mapped["User"] = relationship()
 
@@ -124,6 +125,12 @@ class Measurement(Base, TimestampMixin):
     source_operation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     source_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     meal_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # NOTE: `deleted_at` (liquid soft delete) is deliberately NOT mapped here.
+    # A mapped column is emitted in INSERT/SELECT/RETURNING, which would break
+    # every read and write on a schema that has not had the logging-idempotency
+    # migration applied -- production at d5e6f7a8b9c0. It is referenced only
+    # through guarded raw SQL when schema_capabilities() reports the column
+    # exists. See services/log_intents.py.
 
 
 class DailyAggregate(Base, TimestampMixin):

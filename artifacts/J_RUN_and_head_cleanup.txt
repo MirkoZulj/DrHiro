@@ -1,0 +1,32 @@
+# Suite J + head cleanup (slice J)
+Date: 2026-09-11T17:47:19Z
+
+## Alembic heads (must be exactly one)
+alembic heads = ['c4e5f6a7b8c9']
+b7c8d9e0f1a2 in live chain: False
+b7c8d9e0f1a2 under alembic/versions/: False
+deferred location exists: True
+
+## Suite J - real daily-summary endpoint (GET /api/v1/tools/get_my_today_summary)
+Day: breakfast scrambled eggs + 300ml orange juice + water 500ml + walk 180 kcal
+--- J daily summary ---
+  meals_logged_today : 2
+  calories_kcal_today: 0.0
+  water_ml_today     : 800.0
+  liquids_today      : {'total_ml': 800.0, 'water': 500.0, 'coffee': 0, 'tea': 0, 'juice': 300.0, 'soda': 0, 'milk': 0, 'alcohol': 0, 'smoothie': 0, 'broth': 0, 'other': 0}
+  activity_kcal_today: 180.0
+.
+Day 2: after soft-deleting the water and the walk
+--- J soft-delete exclusion ---
+  before: {'total_ml': 500.0, 'water': 500.0, 'coffee': 0, 'tea': 0, 'juice': 0, 'soda': 0, 'milk': 0, 'alcohol': 0, 'smoothie': 0, 'broth': 0, 'other': 0} 180.0
+  after : {'total_ml': 0, 'water': 0, 'coffee': 0, 'tea': 0, 'juice': 0, 'soda': 0, 'milk': 0, 'alcohol': 0, 'smoothie': 0, 'broth': 0, 'other': 0} 0
+.
+## H4 echo
+--- H4 echo: meal item volume_ml after 300 -> 200 ---
+  meals=1 liquids=1 activities=0 items=1
+    meal slot=snack status=needs_review
+    item 'orange juice' grams=None ml=200.0 bev=juice kcal=None
+    liquid water {'amount_ml': 200.0, 'category': 'juice', 'needs_review': False}
+.
+## Suite totals
+43 passed, 88 warnings in 3.39s

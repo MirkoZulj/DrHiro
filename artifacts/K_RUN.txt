@@ -1,0 +1,34 @@
+# Suite K — deploy smokes + production-shaped schema guard
+Date: 2026-09-11T18:52:32Z
+No VPS access. No production connection. No image build.
+
+PART 1 — disposable (drhiro_logtest, alembic c4e5f6a7b8c9)
+schema: consumption_operations=present, deleted_at columns=2
+K3: PASS  status=200 slots=['snack']
+K1: PASS  GET /health -> 200
+K2: PASS  POST /api/v1/ingest/telegram/event -> 503 {"detail":"ingress_secret_not_configured"}
+K4: PASS  alembic current on disposable = c4e5f6a7b8c9
+schema: consumption_operations=ABSENT, deleted_at columns=0
+
+PART 2 — production-shaped scratch DB (drhiro_prodshape)
+  Built to mirror production: 27 tables (production has 27), NO consumption_operations,
+  NO deleted_at columns. This is the schema Shape A must survive.
+schema: consumption_operations=ABSENT, deleted_at columns=0
+K6: PASS  API start did not create consumption_operations (health=200, to_regclass=None)
+K7: PASS  status=200 meals=1 liquids=1
+K8: PASS  no 5xx and no 'deleted_at' in the response (200)
+K9: PASS  idempotency_disabled_missing_schema logged 1x
+K10: PASS  EXPECTED duplicate when the schema is absent: status=200 meals=2 liquids=2 (de-dup unavailable without the identity table)
+K3: PASS  status=200 slots=['snack', 'snack', 'snack']
+
+K5 — no implicit migration in the production image path
+```
+$ grep -rnE 'alembic upgrade' infra/ docker-compose.yml apps/api/Dockerfile 2>/dev/null
+(zero matches in infra/ and docker-compose.yml)
+$ grep -n '^CMD' infra/docker/Dockerfile.api
+25:CMD ["uvicorn", "drhiro_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+Regression after the guards:
+  logging suites A-J : 43 passed / 0 failed
+  repo default suite : 364 passed, 140 skipped, 0 failed
+  alembic heads      : ['c4e5f6a7b8c9'] (b7c8d9e0f1a2 deferred, not in versions/)
