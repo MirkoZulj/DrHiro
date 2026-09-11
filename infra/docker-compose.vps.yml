@@ -1,4 +1,4 @@
-# drHiro production stack for the VPS (144.91.107.8)
+# drHiro production stack for the VPS (<vps-host>)
 # Extends docker-compose.yml. Caddy is NOT used — nginx on the VPS
 # already terminates TLS with a Let's Encrypt cert. The API is exposed
 # on 127.0.0.1:8010 only; nginx proxies /drhiro/ -> it.

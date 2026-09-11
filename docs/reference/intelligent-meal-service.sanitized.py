@@ -39,8 +39,8 @@ SERVICE_TOKEN = os.environ.get("DRHIRO_SERVICE_TOKEN", "")
 TELEGRAM_ID = os.environ.get("DRHIRO_TELEGRAM_ID", "<TELEGRAM_ID>")
 
 # Camoufox / Pi SSH config
-PI_HOST = os.environ.get("PI_HOST", "100.75.194.51")
-PI_USER = os.environ.get("PI_USER", "mirko")
+PI_HOST = os.environ.get("PI_HOST", "<pi-tailnet-ip>")
+PI_USER = os.environ.get("PI_USER", "<pi-user>")
 PI_PASS = os.environ.get("PI_PASS", "<PI_PASS>")
 CAMOUFOX_SCRIPT = "/home/mirko/camoufox_nutrition.py"
 
