@@ -1,0 +1,48 @@
+# drHiro production stack for the VPS (144.91.107.8)
+# Extends docker-compose.yml. Caddy is NOT used — nginx on the VPS
+# already terminates TLS with a Let's Encrypt cert. The API is exposed
+# on 127.0.0.1:8010 only; nginx proxies /drhiro/ -> it.
+#
+# Usage:
+#   docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.yml up -d
+#   docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.yml exec api alembic upgrade head
+
+name: drhiro
+
+services:
+  api:
+    ports:
+      - "127.0.0.1:8010:8000"
+    # No build needed in prod after images are built; keep build for first deploy.
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.api
+
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.worker
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.worker
+
+  # OpenClaw gateway deferred until a real bot token + WhatsApp adapter
+  # decision are in place. The openclaw-gateway service in the base file
+  # stays disabled here (override down).
+  openclaw-gateway:
+    profiles: ["openclaw"]
+
+  web:
+    profiles: ["web"]
+    build:
+      context: ../apps/web
+      args:
+        VITE_API_BASE: /drhiro/api/v1
+        VITE_BASE_PATH: /drhiro-app/
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  reverse-proxy:
+    profiles: ["disabled"]

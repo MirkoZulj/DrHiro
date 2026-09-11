@@ -1,0 +1,192 @@
+name: drhiro
+services:
+  reverse-proxy:
+    image: caddy:2.10
+    restart: unless-stopped
+    ports:
+    - 80:80
+    - 443:443
+    volumes:
+    - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    - caddy_data:/data
+    - caddy_config:/config
+    depends_on:
+    - api
+    - web
+    networks:
+    - drhiro-net
+  api:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.api
+    image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-api:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DRHIRO_REDIS_URL: redis://redis:6379/0
+    expose:
+    - '8000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request;urllib.request.urlopen('http://localhost:8000/health')
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+    - drhiro-net
+    ports:
+    - 8010:8000
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.worker
+    image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-worker:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DRHIRO_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+    - drhiro-net
+  scheduler:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile.worker
+    image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-scheduler:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    command:
+    - python
+    - -m
+    - drhiro_worker.scheduler
+    env_file: .env
+    environment:
+      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DRHIRO_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+    - drhiro-net
+  web:
+    build:
+      context: ../apps/web
+      args:
+        VITE_API_BASE: /drhiro/api/v1
+        VITE_BASE_PATH: /drhiro-app/
+    image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-web:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    expose:
+    - '3000'
+    networks:
+    - drhiro-net
+    ports:
+    - 3000:3000
+  openclaw-gateway:
+    image: ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION:-2026.7.1-2}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      OPENCLAW_SKIP_ONBOARDING: '1'
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OPENCLAW_MODEL: ${OPENCLAW_MODEL}
+      NOUS_API_KEY: ${NOUS_API_KEY:-}
+      OPENCLAW_DRHIRO_API: http://api:8000/api/v1
+      DRHIRO_OPENCLAW_SERVICE_TOKEN: ${DRHIRO_OPENCLAW_SERVICE_TOKEN}
+    volumes:
+    - ../openclaw/openclaw.json:/seed/openclaw.json:ro
+    - ../openclaw/skills:/seed/skills:ro
+    - ../openclaw/workspace:/seed/workspace:ro
+    - ../openclaw/mcp:/seed/mcp:ro
+    - openclaw_state:/home/node/.openclaw
+    command:
+    - sh
+    - -lc
+    - mkdir -p /home/node/.openclaw/skills /home/node/.openclaw/workspace/drhiro /home/node/.openclaw/mcp
+      && cp -n /seed/openclaw.json /home/node/.openclaw/openclaw.json 2>/dev/null
+      || true; cp -rn /seed/skills/. /home/node/.openclaw/skills/ 2>/dev/null || true;
+      cp -rn /seed/mcp/. /home/node/.openclaw/mcp/ 2>/dev/null || true; chmod +x /home/node/.openclaw/mcp/*.js
+      2>/dev/null || true; for f in /seed/workspace/drhiro/*.md; do t=/home/node/.openclaw/workspace/drhiro/$$(basename
+      "$$f"); [ -s "$$t" ] || cp "$$f" "$$t" 2>/dev/null || true; done; exec node
+      openclaw.mjs gateway --allow-unconfigured
+    expose:
+    - '8080'
+    depends_on:
+    - api
+    networks:
+    - drhiro-net
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-drhiro}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a strong password}
+      POSTGRES_DB: ${POSTGRES_DB:-drhiro}
+    volumes:
+    - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U ${POSTGRES_USER:-drhiro}
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+    - drhiro-net
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+    - redis-server
+    - --appendonly
+    - 'yes'
+    volumes:
+    - redisdata:/data
+    healthcheck:
+      test:
+      - CMD
+      - redis-cli
+      - ping
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+    - drhiro-net
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-drhiro}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set a strong password}
+    volumes:
+    - miniodata:/data
+    expose:
+    - '9000'
+    - '9001'
+    networks:
+    - drhiro-net
+volumes:
+  pgdata: null
+  redisdata: null
+  miniodata: null
+  caddy_data: null
+  caddy_config: null
+  openclaw_state: null
+networks:
+  drhiro-net:
+    driver: bridge

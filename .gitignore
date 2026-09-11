@@ -59,3 +59,8 @@ docs/deliverables/meal-liquid-idempotency/review_bundle/review10/
 docs/deliverables/meal-liquid-idempotency/review_bundle/review10_focused_bundle.tar.gz
 docs/deliverables/meal-liquid-idempotency/review_bundle/review11/
 docs/deliverables/meal-liquid-idempotency/review_bundle/review11_focused_bundle.tar.gz
+
+# --- Loose Android APK binaries ---
+# Signed builds live on the VPS / Telegram (installed at runtime); never in git.
+# (The apk/ directory rule above covers the sidecar; this covers loose files.)
+*.apk
