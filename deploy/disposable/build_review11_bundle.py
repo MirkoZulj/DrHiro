@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build the FOCUSED incremental review bundle for the review-round-9 corrections.
+"""Build the FOCUSED incremental review bundle for the review-round-11 corrections.
 
 NOT a release candidate. Contents:
-  * the functional diff (base = the reviewed round-8 functional head), exact commit ids;
+  * the functional diff (base = the fully-reviewed round-10 state), exact commit ids;
   * the changed source files and regression tests;
   * documentation/evidence, identified separately;
   * evidence/review10_test_results.txt;
@@ -25,10 +25,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 BUNDLE = REPO / "docs/deliverables/meal-liquid-idempotency/review_bundle"
-BUILD = BUNDLE / "review10"
-DIST = BUNDLE / "review10_focused_bundle.tar.gz"
+BUILD = BUNDLE / "review11"
+DIST = BUNDLE / "review11_focused_bundle.tar.gz"
 
-FUNC_BASE = "afa410366c10da0c02b39a97d9a8738539832579"   # fully-reviewed round-9 state (docs head)
+FUNC_BASE = "74ca71f8dec9368c3274b2166a5d9b19d3b94a2b"   # fully-reviewed round-10 state (docs head)
 FUNC_HEAD = ""                                            # filled from git log
 
 FROZEN_CANDIDATE = "7e2cf6915dbd7478e8a558817d4d51aa63879e60"
@@ -43,6 +43,7 @@ FORBIDDEN_PATH_PARTS = (
     "review_bundle/review8",
     "review_bundle/review9",
     "review_bundle/review10",
+    "review_bundle/review11",
     "drhiro_meal_liquid_review_bundle_FINAL",
 )
 
@@ -66,15 +67,15 @@ def main() -> int:
             print("ABORT: frozen archive changed")
             return 1
 
-    # The functional head is the fix(review10) commit; the docs head is HEAD.
+    # The functional head is the fix(review11) commit; the docs head is HEAD.
     heads = run("git", "log", "--format=%H", "-10").splitlines()
     FUNC_HEAD = ""
     for h in heads:
-        if "fix(review10)" in run("git", "log", "-1", "--format=%s", h):
+        if "fix(review11)" in run("git", "log", "-1", "--format=%s", h):
             FUNC_HEAD = h
             break
     if not FUNC_HEAD:
-        print("ABORT: fix(review10) commit not found")
+        print("ABORT: fix(review11) commit not found")
         return 1
     docs_head = run("git", "rev-parse", "HEAD")
 
@@ -82,7 +83,8 @@ def main() -> int:
         shutil.rmtree(BUILD)
     BUILD.mkdir(parents=True)
 
-    func_files = sorted(set(run("git", "diff", "--name-only", FUNC_BASE, FUNC_HEAD).splitlines()))
+    func_files = sorted(set(run("git", "diff", "--diff-filter=d", "--name-only",
+                            FUNC_BASE, FUNC_HEAD).splitlines()))
     assert func_files, "functional diff is empty"
 
     patch_dir = BUILD / "patch"
@@ -128,7 +130,8 @@ def main() -> int:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 
-    docs_files = sorted(set(run("git", "diff", "--name-only", FUNC_HEAD, docs_head).splitlines()))
+    docs_files = sorted(set(run("git", "diff", "--diff-filter=d", "--name-only",
+                            FUNC_HEAD, docs_head).splitlines()))
     for rel in docs_files:
         src = REPO / rel
         if not src.exists():
@@ -140,9 +143,9 @@ def main() -> int:
 
     (BUILD / "BASE_AND_HEAD.md").write_text(f"""# Base and head
 
-## Functional diff (review round 9)
+## Functional diff (review round 11)
 
-- **base:** `{FUNC_BASE}` (the fully-reviewed round-8 state, docs head)
+- **base:** `{FUNC_BASE}` (the fully-reviewed round-10 state, docs head)
 - **head:** `{FUNC_HEAD}`
 
 Combined patch: `patch/functional_{FUNC_BASE[:7]}_to_{FUNC_HEAD[:7]}.patch`; the
