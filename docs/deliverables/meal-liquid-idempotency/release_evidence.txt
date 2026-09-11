@@ -1,0 +1,61 @@
+# Release verification evidence — 2026-09-11T13:46:23Z
+
+release commit (functional): 50bec02db48358ae9ef32f1640e23e347b8e9057
+base of increment          : 74ca71f8dec9368c3274b2166a5d9b19d3b94a2b
+frozen candidate           : 7e2cf6915dbd7478e8a558817d4d51aa63879e60
+frozen archive sha256      : 4d2bf6851c869670308ad28961d32626a12cf2b2a2af389fc3e1f6c8fe59668d
+
+## 1. No auto-migration in the production image path
+```
+$ grep -rnE 'alembic upgrade' infra/ docker-compose.yml services/
+(zero matches)
+$ Dockerfile.api CMD: CMD ["uvicorn", "drhiro_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+## 2. Production compose has no reference to the new ingestion
+```
+$ grep -cE 'ingress|telegram_receipt|trusted-spool|fake_telegram|consumer_offset|disposable' docker-compose.yml
+0
+```
+
+## 3. No startup hook in the production app
+```
+$ grep -nE 'on_event|startup|lifespan|create_all' apps/api/src/drhiro_api/main.py
+(zero matches)
+```
+
+## 4. EMPIRICAL: fail-closed with PRODUCTION defaults (in-process)
+```
+telegram_ingress_secret set: False
+telegram_bot_id set      : False
+telegram_ingress_enabled : False
+legacy_writers_enabled   : True
+POST /api/v1/ingest/telegram/event -> 503 {"detail":"ingress_secret_not_configured"}
+legacy writer gate -> ALLOWED (unchanged)
+```
+
+## 5. Ingress + writer-gate regression tests
+```
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+27 passed, 10 skipped, 48 warnings in 2.29s
+```
+
+## 6. Round-12 creation-namespace before/after (native vs helper)
+```
+$ creation_namespace_probe.py <round-11 tree>
+STATE: objects in second = 0
+DIVERGE: native='ERROR: (psycopg2.errors.InsufficientPrivilege) permission denied for schema first' helper="ERROR(MissingUsersRelation): refusing to create second.activities: that schema has no `users` relation, and the same-schema policy forbids referencing another schema's users"
+
+$ creation_namespace_probe.py <release tree>
+STATE: objects in second = 0
+AGREE: native and helper both target/refuse `first`
+```
+
+## 7. Suites at the release commit
+```
+-- R4 (migration)
+39 passed in 3.24s
+-- default
+363 passed, 140 skipped, 55 warnings in 41.05s
+-- stack suite: NOT run in this checkpoint (ingress.py unchanged; see sheet)
+```
