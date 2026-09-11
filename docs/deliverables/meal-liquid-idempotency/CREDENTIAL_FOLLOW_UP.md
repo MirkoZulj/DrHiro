@@ -1,3 +1,19 @@
+## CORRECTION (2026-09-12) - the "zero hits" verification below was WRONG
+
+The claim *"Grep for the Pi password in repo: zero hits (never in repo)"* was false.
+The literal was present in this branch in 9 files (13 occurrences), including
+this document and `G_dry_run_historical_repair.md`, and it was published on a
+public repository before anyone checked.
+
+Remediation: the literal was replaced with `<redacted-secret>` throughout, and
+the branch history was rewritten so it no longer appears in any commit. The
+credentials themselves were rotated - removal alone does not un-publish a
+credential.
+
+Treat every "zero hits" assertion in this document as UNVERIFIED. A verification
+claim is only worth what its command actually covered, and this one appears to
+have been written without being run.
+
 # Credential & Auth Refactor — Follow-Up Backlog
 
 This document lists remaining hard-coded / derived credential issues OUTSIDE the
@@ -77,7 +93,7 @@ This endpoint does NOT mint JWTs or use hard-coded credentials. It uses the stan
 - Grep for `0bfad360-9938-4216-8abd-b44d69e2003f` in sse_server.py: only a
   historical comment remains (line ~1608, documenting the removed block).
 - Grep for `172.20.0.1` in sse_server.py: zero hits.
-- Grep for `<redacted-secret>` in repo: zero hits (never in repo).
+- ~~Grep for the Pi password in repo: zero hits~~ **FALSE - see CORRECTION above.**
 - Grep for `change-me-in-production`: zero hits.
 - Grep for `drhiro:drhiro@`: only in test DB URL defaults (low severity).
 

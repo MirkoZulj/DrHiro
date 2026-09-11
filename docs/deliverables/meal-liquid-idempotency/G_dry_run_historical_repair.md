@@ -2,7 +2,7 @@
 
 **Branch**: `feature/meal-liquid-idempotency`
 **Date**: 2026-09-09
-**Source**: Production DB read-only via `sshpass -p '<redacted-secret>' ssh root@144.91.107.8` → `docker exec drhiro-postgres-1 psql -U drhiro -d drhiro`
+**Source**: Production DB read-only via `sshpass -e ssh root@144.91.107.8` → `docker exec drhiro-postgres-1 psql -U drhiro -d drhiro`
 
 **⚠️ ANALYSIS ONLY — NO DATA MODIFIED**
 
