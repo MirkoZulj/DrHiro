@@ -1159,6 +1159,12 @@ async def confirm_meal(
     meal_type = draft.get("meal_type") or "snack"
     notes = draft.get("text", "")
 
+    # Stable idempotency key: the draft id the caller re-sends on retry (see
+    # packages/drhiro-mcp/.../sse_server.py). Stamping the meal with it and the
+    # UNIQUE (user_id, source_operation_id) index makes the claim atomic: two
+    # concurrent confirms of the same draft produce exactly ONE row.
+    source_op_id = str(uuid.UUID(req.draft_id))
+
     dup = db.execute(
         text("SELECT id FROM meals WHERE user_id = :uid AND notes = :notes AND created_at > NOW() - INTERVAL '2 minutes' LIMIT 1"),
         {"uid": user["id"], "notes": notes},
@@ -1181,13 +1187,38 @@ async def confirm_meal(
                 "message": "Already logged moments ago — no duplicate created.",
             },
         }
-    db.execute(
+    # Atomic claim: INSERT ... ON CONFLICT DO NOTHING RETURNING. If the
+    # (user_id, source_operation_id) slot is already taken by a concurrent
+    # confirm, RETURNING yields nothing and we fall through to return the
+    # existing meal instead of creating a duplicate.
+    inserted = db.execute(
         text("""
-                INSERT INTO meals (id, user_id, eaten_at, meal_type, status, input_method, notes, totals_json, confidence, created_at, updated_at)
-            VALUES (:id, :user_id, CAST(:eaten_at AS timestamp with time zone), :meal_type, 'confirmed', 'text_intelligent', :notes, :totals_json, 0.8, NOW(), NOW())
+                INSERT INTO meals (id, user_id, eaten_at, meal_type, status, input_method, notes, totals_json, confidence, source_operation_id, created_at, updated_at)
+            VALUES (:id, :user_id, CAST(:eaten_at AS timestamp with time zone), :meal_type, 'confirmed', 'text_intelligent', :notes, :totals_json, 0.8, :source_operation_id, NOW(), NOW())
+            ON CONFLICT (user_id, source_operation_id) DO NOTHING
+            RETURNING id
         """),
-        {"id": meal_id, "user_id": user["id"], "eaten_at": eaten_at, "meal_type": meal_type, "notes": notes, "totals_json": json.dumps({"kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0, "sodium_mg": 0})},
-    )
+        {"id": meal_id, "user_id": user["id"], "eaten_at": eaten_at, "meal_type": meal_type, "notes": notes, "totals_json": json.dumps({"kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0, "sodium_mg": 0}), "source_operation_id": source_op_id},
+    ).fetchone()
+
+    if not inserted:
+        # Lost the race: another confirm for the same draft already committed.
+        # Return the existing meal instead of creating a duplicate.
+        existing = db.execute(
+            text("SELECT id, totals_json FROM meals WHERE user_id = :uid AND source_operation_id = :sid"),
+            {"uid": user["id"], "sid": source_op_id},
+        ).fetchone()
+        totals = existing[1] if existing else {}
+        return {
+            "ok": True,
+            "duplicate": True,
+            "data": {
+                "meal_id": str(existing[0]) if existing else meal_id,
+                "status": "confirmed",
+                "totals": totals,
+                "message": "Already logged moments ago — no duplicate created.",
+            },
+        }
 
     # Create meal items
     totals = {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "fiber_g": 0.0, "sodium_mg": 0.0}
