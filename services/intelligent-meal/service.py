@@ -1152,8 +1152,8 @@ async def confirm_meal(
     notes = draft.get("text", "")
 
     dup = db.execute(
-        text("SELECT id FROM meals WHERE notes = :notes AND created_at > NOW() - INTERVAL '2 minutes' LIMIT 1"),
-        {"notes": notes},
+        text("SELECT id FROM meals WHERE user_id = :uid AND notes = :notes AND created_at > NOW() - INTERVAL '2 minutes' LIMIT 1"),
+        {"uid": user["id"], "notes": notes},
     ).fetchone()
     if dup:
         # Idempotent success: the meal IS in the database. Returning ok:false made
@@ -1216,8 +1216,14 @@ async def confirm_meal(
                         log.info("[confirm] DDG fallback rescued: %r conf=%.3f", fragment, best_conf)
             except Exception as e:
                 log.warning("[confirm] DDG fallback error: %r", e)
-            if not candidates:
-                candidates = []
+            # If candidates is still the original low-confidence list (DDG found
+            # nothing or only low-confidence matches), clear it so we don't
+            # silently log a rejected auto-match. This prevents the later branch
+            # from selecting candidate 0 of a below-threshold list.
+            if auto_confirmed and candidates:
+                top_conf_after = (candidates[0].get("confidence") or 0.0) if candidates else 0.0
+                if top_conf_after < MIN_CONFIDENCE:
+                    candidates = []
 
         if candidates and sel_idx < len(candidates):
             c = candidates[sel_idx]
@@ -1337,12 +1343,15 @@ async def delete_meal_by_id(
     user: dict = Depends(get_user_from_service_or_bearer),
     db: Session = Depends(get_db),
 ):
-    """Delete a whole meal and its items by id."""
-    meal = db.execute(text("SELECT id FROM meals WHERE id = :mid"), {"mid": meal_id}).fetchone()
+    """Delete a whole meal and its items by id. Only the meal owner may delete."""
+    meal = db.execute(
+        text("SELECT id FROM meals WHERE id = :mid AND user_id = :uid"),
+        {"mid": meal_id, "uid": user["id"]}
+    ).fetchone()
     if not meal:
         return {"ok": False, "error": "meal_not_found"}
     db.execute(text("DELETE FROM meal_items WHERE meal_id = :mid"), {"mid": meal_id})
-    db.execute(text("DELETE FROM meals WHERE id = :mid"), {"mid": meal_id})
+    db.execute(text("DELETE FROM meals WHERE id = :mid AND user_id = :uid"), {"mid": meal_id, "uid": user["id"]})
     db.commit()
     return {"ok": True, "deleted": meal_id}
 
@@ -1385,18 +1394,18 @@ async def delete_meal_by_fragment(
     match_all = bool(req.match_all)
     if match_all:
         rows = db.execute(text(
-            "SELECT id, notes FROM meals WHERE notes ILIKE :pat ORDER BY created_at DESC"
-        ), {"pat": f"%{frag}%"}).fetchall()
+            "SELECT id, notes FROM meals WHERE user_id = :uid AND notes ILIKE :pat ORDER BY created_at DESC"
+        ), {"uid": user["id"], "pat": f"%{frag}%"}).fetchall()
     else:
         rows = db.execute(text(
-            "SELECT id, notes FROM meals WHERE notes ILIKE :pat ORDER BY created_at DESC LIMIT 1"
-        ), {"pat": f"%{frag}%"}).fetchall()
+            "SELECT id, notes FROM meals WHERE user_id = :uid AND notes ILIKE :pat ORDER BY created_at DESC LIMIT 1"
+        ), {"uid": user["id"], "pat": f"%{frag}%"}).fetchall()
     if not rows:
         return {"ok": False, "error": "no_match"}
     deleted = []
     for row in rows:
         db.execute(text("DELETE FROM meal_items WHERE meal_id = :mid"), {"mid": row[0]})
-        db.execute(text("DELETE FROM meals WHERE id = :mid"), {"mid": row[0]})
+        db.execute(text("DELETE FROM meals WHERE id = :mid AND user_id = :uid"), {"mid": row[0], "uid": user["id"]})
         deleted.append(row[0])
     db.commit()
     return {"ok": True, "deleted_count": len(deleted), "deleted_ids": deleted, "matched_notes": [r[1][:80] for r in rows]}
@@ -1408,7 +1417,10 @@ async def latest_meal(
     db: Session = Depends(get_db),
 ):
     """Most recent meal id + items, for correction flows (raw SQL)."""
-    meal = db.execute(text("SELECT id FROM meals ORDER BY created_at DESC LIMIT 1")).fetchone()
+    meal = db.execute(
+        text("SELECT id FROM meals WHERE user_id = :uid ORDER BY created_at DESC LIMIT 1"),
+        {"uid": user["id"]}
+    ).fetchone()
     if not meal:
         return {"ok": False, "error": "no_meals"}
     mid = meal[0]
@@ -1427,7 +1439,10 @@ async def correct_meal_item(
     body: {text: '<wrong food fragment>', meal_type: '<right food name>'}"""
     wrong = (req.text or "").strip().lower()
     right = (req.meal_type or "").strip()
-    meal = db.execute(text("SELECT id FROM meals WHERE id = :mid"), {"mid": meal_id}).fetchone()
+    meal = db.execute(
+        text("SELECT id FROM meals WHERE id = :mid AND user_id = :uid"),
+        {"mid": meal_id, "uid": user["id"]}
+    ).fetchone()
     if not meal:
         return {"ok": False, "error": "meal_not_found"}
     items = db.execute(text("SELECT id, display_name, grams, nutrients_json FROM meal_items WHERE meal_id = :mid"), {"mid": meal_id}).fetchall()

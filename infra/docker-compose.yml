@@ -45,6 +45,26 @@ services:
     - drhiro-net
     ports:
     - 8010:8000
+  intelligent-meal:
+    build:
+      context: ./services/intelligent-meal
+    image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-intelligent-meal:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    expose: ['8090']
+    environment:
+      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8090/health")']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [drhiro-net]
   worker:
     build:
       context: ..

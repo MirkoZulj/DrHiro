@@ -43,8 +43,11 @@ depends_on: Union[str, None] = None
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
+    existing_tables = set(inspector.get_table_names())
 
     for table in ("measurements", "activities"):
+        if table not in existing_tables:
+            continue  # Skip optional tables not present in this schema chain
         cols = {c["name"] for c in inspector.get_columns(table)}
         if "deleted_at" not in cols:
             op.add_column(
@@ -63,12 +66,19 @@ def upgrade() -> None:
     # constraint on the table also includes source_bot_id, which is NULL for
     # messages that arrive without a verified bot id -- and NULLs are distinct in
     # PostgreSQL, so that constraint alone does not enforce the key we use.
+    # 
+    # Create a UNIQUE index on (user_id, source_bot_id, source_chat_id, source_message_id).
+    # We normalize NULL bot_id to '' on INSERT, so this enforces the actual
+    # lookup key we use (per-user, per-bot, per-message) without allowing concurrent
+    # retries to duplicate.
+    op.execute("UPDATE consumption_operations SET source_bot_id = '' WHERE source_bot_id IS NULL")
     index_names = {i["name"] for i in inspector.get_indexes("consumption_operations")}
     if "ix_consumption_ops_source_identity" not in index_names:
         op.create_index(
             "ix_consumption_ops_source_identity",
             "consumption_operations",
-            ["source", "source_chat_id", "source_message_id"],
+            ["user_id", "source_bot_id", "source_chat_id", "source_message_id"],
+            unique=True,
         )
 
 

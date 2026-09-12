@@ -215,6 +215,30 @@ async def bind_event(event_id: str, *, input_digest: str, issued_at: int,
     await r.set(f"tfshim:event:{event_id}", payload, ex=EVENT_RECORD_TTL)
 
 
+async def _store_result(event_id: str, result: dict) -> None:
+    """Persist a completed model turn result keyed by event_id.
+
+    A later authenticated retry of the same event (e.g. due to a network
+    timeout) can replay this stored result instead of re-running the model
+    turn, avoiding duplicate side-effects.
+    """
+    r = await redis_conn()
+    payload = json.dumps(result)
+    await r.set(f"tfshim:result:{event_id}", payload, ex=EVENT_RECORD_TTL)
+
+
+async def _get_stored_result(event_id: str) -> dict | None:
+    """Return a previously stored model turn result, or None if not present."""
+    r = await redis_conn()
+    raw = await r.get(f"tfshim:result:{event_id}")
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 async def run_turn(session_id: str, text: str) -> str:
     """POST a turn and accumulate the streamed assistant reply."""
     await stash_user_text(text)
@@ -421,6 +445,16 @@ async def chat_completions(request: Request):
             status_code=503,
         )
 
+    # Dedup: if we already completed this event, return the cached result.
+    # This prevents a retry (after a timeout, for example) from re-running
+    # the model turn and possibly causing duplicate side-effects.
+    cached = await _get_stored_result(bound.event_id)
+    if cached is not None:
+        if not body.get("stream"):
+            return JSONResponse(cached)
+        # Streaming replay would be complex; just return non-stream for cached
+        return JSONResponse(cached)
+
     try:
         session_id = await get_or_create_session(key)
         reply = await run_turn(session_id, text)
@@ -431,6 +465,9 @@ async def chat_completions(request: Request):
         )
 
     envelope = completion_envelope(reply, model)
+
+    # Store the completed result so a retry can replay it.
+    await _store_result(bound.event_id, envelope)
 
     if not body.get("stream"):
         return JSONResponse(envelope)

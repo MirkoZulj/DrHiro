@@ -199,8 +199,14 @@ def request_deletion(req: DeletionRequest, user: User = Depends(get_current_user
         audit(db, "user", str(user.id), user.id, "privacy.deletion_requested", "user", str(user.id))
         db.commit()
         return {"ok": True, "message": "Deletion requested. Confirm to purge."}
-    # Purge tenant data (measurements, meals, reminders, goals, grants, audit)
-    for model in (Measurement, Meal, Reminder, ReminderOccurrence, Goal, ConsentGrant):
+    # Purge tenant data (measurements, meals, reminders, goals, grants, audit).
+    # ReminderOccurrence has no user_id column -- delete via join to Reminder.
+    db.query(ReminderOccurrence).filter(
+        ReminderOccurrence.reminder_id.in_(
+            db.query(Reminder.id).filter(Reminder.user_id == user.id)
+        )
+    ).delete(synchronize_session=False)
+    for model in (Measurement, Meal, Reminder, Goal, ConsentGrant):
         db.query(model).filter(
             model.user_id == user.id
         ).delete(synchronize_session=False)

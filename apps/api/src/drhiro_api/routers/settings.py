@@ -49,15 +49,18 @@ class SettingsUpdate(BaseModel):
 def _authorized(db: Session, user: User) -> bool:
     """A user may manage settings if they are the configured authorized user.
 
-    Authorized = has a linked Telegram identity whose subject equals
-    ``telegram_allowed_username``. When no username is configured yet (fresh
-    install, nothing paired), any authenticated user is allowed so the first
-    admin can set things up.
+    Authorized = has a linked Telegram identity whose subject (the numeric
+    Telegram user ID stored as ``provider_subject``) equals the configured
+    ``telegram_allowed_username`` value, provided that value is a numeric
+    Telegram user ID (Telegram user IDs are always numeric strings).
+
+    When no admin is configured yet (fresh install), any authenticated user
+    is allowed so the first admin can set things up.
     """
     row = get_row(db)
-    allowed = row.telegram_allowed_username or ""
+    allowed = (row.telegram_allowed_username or "").strip()
+    # Nothing configured yet -> first authenticated user is the admin.
     if not allowed:
-        # Nothing configured yet -> first authenticated user is the admin.
         return True
     identity = (
         db.query(ExternalIdentity)
@@ -69,8 +72,6 @@ def _authorized(db: Session, user: User) -> bool:
     )
     if identity and identity.provider_subject == allowed:
         return True
-    # Also accept a telegram identity whose subject matches the allowed
-    # username even if recorded against the user in another form.
     return False
 
 

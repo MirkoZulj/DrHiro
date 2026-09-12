@@ -55,7 +55,7 @@ object DeviceLinker {
             ExchangeRequest(installation_id = installationId, device_code = deviceCode),
         )
         val request = Request.Builder()
-            .url("$baseUrl/auth/android/exchange")
+            .url("${ApiClient.normalizedBaseUrl()}/api/v1/auth/android/exchange")
             .addHeader("Content-Type", JSON)
             .post(body.toRequestBody(JSON.toMediaType()))
             .build()

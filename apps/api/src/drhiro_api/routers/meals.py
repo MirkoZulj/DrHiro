@@ -691,6 +691,9 @@ def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_curren
     bev_category = _classify_beverage(req.display_name)
     is_beverage = bev_category is not None
 
+    # For beverages, use the separately supplied volume_ml; only derive
+    # volume from grams when no explicit ml value is supplied.
+    effective_volume = req.volume_ml if req.volume_ml else (req.grams if is_beverage else None)
     mi = MealItem(
         meal_id=meal.id,
         food_catalog_item_id=req.food_catalog_item_id,
@@ -702,14 +705,14 @@ def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_curren
         source=source or "manual",
         confidence=conf,
         beverage_category=bev_category,
-        volume_ml=req.grams if (is_beverage and req.grams) else None,
+        volume_ml=effective_volume,
     )
     db.add(mi)
     db.flush()
 
     # For beverages, create the linked liquid projection via shared domain
-    if is_beverage and req.grams and req.grams > 0:
-        create_beverage_projection(db, user.id, mi, float(req.grams), bev_category, meal.eaten_at)
+    if is_beverage and effective_volume and effective_volume > 0:
+        create_beverage_projection(db, user.id, mi, float(effective_volume), bev_category, meal.eaten_at)
 
     _sync_totals(db, meal)
     audit(db, "user", str(user.id), user.id, "meals.item_add", "meal", str(meal.id), {"display_name": req.display_name})

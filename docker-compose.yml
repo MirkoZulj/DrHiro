@@ -227,6 +227,28 @@ services:
     depends_on: [trueforge, drhiro-tools]
     networks: [drhiro-net]
 
+  # --- intelligent-meal (standalone meal logging service) -----------------
+  # MCP (drhiro-tools) routes /meals/from-text-intelligent etc. here.
+  # hostname = service name = intelligent-meal (matches INTELLIGENT_MEAL_URL default).
+  intelligent-meal:
+    build:
+      context: ./services/intelligent-meal
+    image: drhiro-intelligent-meal:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    expose: ["8090"]
+    environment:
+      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/2
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [drhiro-net]
+
   # --- OpenClaw model bridge: tf-shim (OpenAI-compatible -> TrueForge) ------
   # OpenClaw reaches the model through this OpenAI-compatible adapter, which maps
   # /v1/chat/completions to a persistent TrueForge agent session. Self-contained:
@@ -258,7 +280,7 @@ services:
       OPENCLAW_SKIP_ONBOARDING: '1'
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      OPENCLAW_MODEL: ${OPENCLAW_MODEL:-${AI_MODEL:-}}
+      OPENCLAW_MODEL: ${OPENCLAW_MODEL:-trueforge-drhiro}
       NOUS_API_KEY: ${NOUS_API_KEY:-}
       OPENCLAW_DRHIRO_API: http://api:8000/api/v1
       DRHIRO_OPENCLAW_SERVICE_TOKEN: ${DRHIRO_OPENCLAW_SERVICE_TOKEN:-}

@@ -26,6 +26,12 @@ object ApiClient {
      *  onboarding); no private default is baked in. */
     var baseUrl: String = ""
 
+    /** Normalize the configured base URL (strip trailing slash). */
+    fun normalizedBaseUrl(): String = baseUrl.trimEnd('/')
+
+    /** The /api/v1 mount prefix for the drHiro Core API. */
+    private const val API_V1_PREFIX = "/api/v1"
+
     @Serializable
     data class UploadResponse(
         val accepted: Int = 0,
@@ -79,7 +85,7 @@ object ApiClient {
         }.toString()
 
         val request = Request.Builder()
-            .url("$baseUrl/ingest/health-connect/batch")
+            .url("${normalizedBaseUrl()}$API_V1_PREFIX/ingest/health-connect/batch")
             .addHeader("Authorization", "Bearer $accessToken")
             .addHeader("Content-Type", JSON)
             .post(body.toRequestBody(JSON.toMediaType()))
@@ -99,7 +105,7 @@ object ApiClient {
             ?: throw IllegalStateException("no refresh token stored")
         val body = buildJsonObject { put("refresh_token", refresh) }.toString()
         val request = Request.Builder()
-            .url("$baseUrl/auth/refresh")
+            .url("${normalizedBaseUrl()}$API_V1_PREFIX/auth/refresh")
             .addHeader("Content-Type", JSON)
             .post(body.toRequestBody(JSON.toMediaType()))
             .build()

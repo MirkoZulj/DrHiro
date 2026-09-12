@@ -336,12 +336,17 @@ class Bridge:
 
         # T1: the trusted worker owns consumption. If it handles the turn we
         # never reach the model, so the model cannot log a second consumption.
+        # If trusted ingress fails (e.g. ambiguous HTTP failure after a possible
+        # commit), we MUST NOT fall through to the model path -- that would
+        # risk writing a duplicate consumption via the model-backed writer.
         if self._ingress is not None:
             try:
                 if self._handle_trusted_ingress(update):
                     return
             except Exception as e:  # noqa: BLE001
-                log.warning("trusted ingress failed, falling back to model: %s", e)
+                log.warning("trusted ingress failed, NOT falling back to model: %s", e)
+                self.tg.send_message(chat_id, "Sorry, your message couldn't be processed right now. Please try again.")
+                return
 
         # Start a typing keepalive in the background for long turns.
         threading.Thread(

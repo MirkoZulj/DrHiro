@@ -54,6 +54,8 @@ def deliver_reminder(occurrence_id: str) -> dict:
             return {"error": "occurrence not found"}
         if occ.status == "sent":
             return {"skipped": "already sent"}
+        if occ.status not in ("pending", "queued"):
+            return {"skipped": f"status is {occ.status}"}
 
         reminder = db.query(Reminder).filter(Reminder.id == occ.reminder_id).first()
         if not reminder or not reminder.enabled:

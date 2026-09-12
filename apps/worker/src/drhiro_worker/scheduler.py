@@ -61,10 +61,11 @@ def run_once() -> dict:
         q = Queue("drhiro", connection=r)
         delivered = 0
         for occ in due:
-            # Enqueue delivery job on the drhiro queue
+            # Mark as 'queued' so deliver_reminder knows to process it, then
+            # enqueue. The delivery job atomically transitions to 'sent' after
+            # successful Telegram send.
+            occ.status = "queued"
             q.enqueue("drhiro_worker.jobs.deliver_reminder", str(occ.id))
-            occ.status = "sent"
-            occ.sent_at = datetime.now(timezone.utc)
             delivered += 1
         db.commit()
         return {"occurrences_created": created, "due_delivered": delivered}
