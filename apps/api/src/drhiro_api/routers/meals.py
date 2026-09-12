@@ -553,6 +553,52 @@ def list_meals(
     return [_meal_to_out(m) for m in meals]
 
 
+# Food-catalog search. Declared BEFORE the generic /{meal_id} route so the
+# literal "foods" segment is not captured as a meal_id (FastAPI matches routes
+# in declaration order; a UUID parse of "foods" would 500).
+@router.get("/foods/search")
+def search_foods(q: str = Query(min_length=1), limit: int = 10, user: User = Depends(get_current_user)):
+    cat = _catalog()
+    try:
+        items = cat.search(q, limit=limit)
+    finally:
+        cat.close()
+    return [
+        {
+            "external_id": i.external_id,
+            "display_name": i.display_name,
+            "source": i.source,
+            "kcal_per_100g": i.kcal_per_100g,
+            "protein_g_per_100g": i.protein_g_per_100g,
+            "carbs_g_per_100g": i.carbs_g_per_100g,
+            "fat_g_per_100g": i.fat_g_per_100g,
+            "barcode": i.barcode,
+        }
+        for i in items
+    ]
+
+
+@router.get("/foods/barcode/{barcode}")
+def food_by_barcode(barcode: str, user: User = Depends(get_current_user)):
+    cat = _catalog()
+    try:
+        item = cat.by_barcode(barcode)
+    finally:
+        cat.close()
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {
+        "external_id": item.external_id,
+        "display_name": item.display_name,
+        "source": item.source,
+        "kcal_per_100g": item.kcal_per_100g,
+        "protein_g_per_100g": item.protein_g_per_100g,
+        "carbs_g_per_100g": item.carbs_g_per_100g,
+        "fat_g_per_100g": item.fat_g_per_100g,
+        "barcode": item.barcode,
+    }
+
+
 @router.get("/{meal_id}", response_model=MealOut)
 def get_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     meal = (
@@ -868,49 +914,6 @@ def delete_meal(meal_id: str, user: User = Depends(get_current_user), db: Sessio
     audit(db, "user", str(user.id), user.id, "meals.delete", "meal", str(meal.id))
     db.commit()
     return {"ok": True}
-
-
-@router.get("/foods/search")
-def search_foods(q: str = Query(min_length=1), limit: int = 10, user: User = Depends(get_current_user)):
-    cat = _catalog()
-    try:
-        items = cat.search(q, limit=limit)
-    finally:
-        cat.close()
-    return [
-        {
-            "external_id": i.external_id,
-            "display_name": i.display_name,
-            "source": i.source,
-            "kcal_per_100g": i.kcal_per_100g,
-            "protein_g_per_100g": i.protein_g_per_100g,
-            "carbs_g_per_100g": i.carbs_g_per_100g,
-            "fat_g_per_100g": i.fat_g_per_100g,
-            "barcode": i.barcode,
-        }
-        for i in items
-    ]
-
-
-@router.get("/foods/barcode/{barcode}")
-def food_by_barcode(barcode: str, user: User = Depends(get_current_user)):
-    cat = _catalog()
-    try:
-        item = cat.by_barcode(barcode)
-    finally:
-        cat.close()
-    if not item:
-        raise HTTPException(status_code=404, detail="Not found")
-    return {
-        "external_id": item.external_id,
-        "display_name": item.display_name,
-        "source": item.source,
-        "kcal_per_100g": item.kcal_per_100g,
-        "protein_g_per_100g": item.protein_g_per_100g,
-        "carbs_g_per_100g": item.carbs_g_per_100g,
-        "fat_g_per_100g": item.fat_g_per_100g,
-        "barcode": item.barcode,
-    }
 
 
 class RecipeRequest(BaseModel):
