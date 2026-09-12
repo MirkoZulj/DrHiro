@@ -242,36 +242,64 @@ async def _store_result(event_id: str, result: dict) -> None:
         print(f"[_store_result] cache store failed for {event_id}: {e!r}", flush=True)
 
 
-async def _try_claim_event(event_id: str) -> bool:
+async def _try_claim_event(event_id: str) -> str | None:
     """Atomically claim the right to run a turn for this event.
 
     Uses SET NX (set-if-not-exists) so that among concurrent deliveries of
     the same event, exactly ONE wins the claim and runs the model/tools.
     The claim has a TTL so a failed owner cannot deadlock the event forever.
 
-    Returns True if THIS call won the claim, False if another delivery holds
-    it (or the cache is unavailable — fail open so we don't block traffic).
+    Returns a unique claim token on success (the caller must present it to
+    release), or None if another delivery holds it (or the cache is
+    unavailable — fail open so we don't block traffic, with an empty token).
     """
     try:
         r = await redis_conn()
+        token = uuid.uuid4().hex
         # SET NX: only sets if key does not exist. Returns True if set, None/False if not.
         ok = await r.set(
             f"tfshim:claim:{event_id}",
-            "1",
+            token,
             nx=True,
             ex=max(60, TURN_TIMEOUT),
         )
-        return bool(ok)
+        if ok:
+            return token
+        return None  # another delivery owns it
     except Exception as e:
         print(f"[_try_claim_event] cache claim failed for {event_id}: {e!r}", flush=True)
-        return True  # fail open: run rather than drop traffic on cache outage
+        # fail open: run rather than drop traffic on cache outage; return a
+        # sentinel so release is a no-op (nothing to compare against)
+        return ""
 
 
-async def _release_claim(event_id: str) -> None:
-    """Release the claim after the turn completes (best-effort)."""
+# Lua script for atomic compare-and-delete: only delete the claim when the
+# stored value matches the presenting owner's token. Returns 1 if deleted,
+# 0 otherwise. Prevents a stale owner from deleting a successor's claim
+# after the original claim's TTL expired and a retry acquired a new one.
+_COWNER_RELEASE_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
+
+
+async def _release_claim(event_id: str, token: str) -> None:
+    """Release the claim after the turn completes (best-effort, ownership-aware).
+
+    Only deletes the claim when the stored value matches OUR token. If the
+    claim's TTL expired and a retry acquired a replacement claim (different
+    token), our release is a no-op — the successor's claim survives, so a
+    later delivery cannot start a new turn. The TTL remains the ultimate
+    safety net.
+    """
+    if not token:
+        return  # fail-open path (cache outage); nothing owned, nothing to release
     try:
         r = await redis_conn()
-        await r.delete(f"tfshim:claim:{event_id}")
+        await r.eval(_COWNER_RELEASE_LUA, 1, f"tfshim:claim:{event_id}", token)
     except Exception as e:
         print(f"[_release_claim] cache release failed for {event_id}: {e!r}", flush=True)
 
@@ -523,7 +551,8 @@ async def chat_completions(request: Request):
     # Atomic claim: ensure only ONE delivery of this event runs the turn/tools.
     # SET NX wins for the first concurrent caller; losers wait briefly then
     # check for the stored result (or replay the in-progress outcome).
-    if not await _try_claim_event(bound.event_id):
+    claim_token = await _try_claim_event(bound.event_id)
+    if claim_token is None:
         # Another delivery is running the turn. Poll briefly for its stored result.
         import asyncio as _aio
         for _ in range(5):
@@ -544,7 +573,7 @@ async def chat_completions(request: Request):
             session_id = await get_or_create_session(key)
             reply = await run_turn(session_id, text, conversation_id=key)
         except Exception as e:  # surface the failure to OpenClaw rather than hanging
-            await _release_claim(bound.event_id)
+            await _release_claim(bound.event_id, claim_token)
             return JSONResponse(
                 {"error": {"message": f"trueforge error: {e}", "type": "server_error"}},
                 status_code=502,
@@ -556,7 +585,7 @@ async def chat_completions(request: Request):
         await _store_result(bound.event_id, envelope)
     finally:
         # Best-effort release; the TTL is the safety net if this fails.
-        await _release_claim(bound.event_id)
+        await _release_claim(bound.event_id, claim_token)
 
     if not body.get("stream"):
         return JSONResponse(envelope)
