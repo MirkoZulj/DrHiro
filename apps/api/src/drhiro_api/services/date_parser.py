@@ -63,7 +63,6 @@ MEAL_WORDS = {
     "dinner": "dinner",
     "diner": "dinner",
     "supper": "dinner",
-    "tea": "dinner",
     "snack": "snack",
     "dessert": "snack",
 }
@@ -107,7 +106,12 @@ def _now_local(tz_name, now=None):
 
 
 def detect_meal_type(text: str):
-    """Return the meal type named in the text, if any."""
+    """Return the meal type NAMED in the text, if any.
+
+    "tea" is deliberately NOT mapped to the dinner slot: in this app "tea 250ml"
+    is a drink, and mapping it to dinner put a beverage in the dinner slot at
+    whatever hour the message arrived.
+    """
     low = (text or "").lower()
     for word, mt in sorted(MEAL_WORDS.items(), key=lambda kv: -len(kv[0])):
         if re.search(rf"\b{re.escape(word)}\b", low):
@@ -257,7 +261,10 @@ def resolve_when(text: str, tz_name: str = DEFAULT_TZ, meal_type=None, now=None)
     if clock:
         hour, minute = clock
     else:
-        hour, minute = MEAL_HOUR.get(mt or "", 12), 0
+        # NO time-of-day default. A slot name must not move the timestamp, and
+        # nothing may be fabricated from a slot's "traditional" hour: that is
+        # what turned "tea 250ml" into a dinner entry at 17:15.
+        hour, minute = now_local.hour, now_local.minute
 
     target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
 

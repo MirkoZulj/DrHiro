@@ -56,6 +56,9 @@ fun BridgeScreen() {
     var error by remember { mutableStateOf("") }
     var lastSync by remember { mutableStateOf(TokenStore.cursor(context)) }
     var hcStatus by remember { mutableStateOf("") }
+    // Restore a saved server URL so every API call works across restarts.
+    ApiClient.loadFromPrefs(context)
+    var serverUrl by remember { mutableStateOf(ApiClient.baseUrl) }
 
     fun updateLastSync() {
         lastSync = TokenStore.cursor(context)
@@ -189,6 +192,13 @@ fun BridgeScreen() {
             Text("drHiro Bridge", style = MaterialTheme.typography.headlineMedium)
 
             if (!linked) {
+                Text("drHiro server URL:", style = MaterialTheme.typography.bodyLarge)
+                OutlinedTextField(
+                    value = serverUrl,
+                    onValueChange = { serverUrl = it.trim() },
+                    label = { Text("Server URL (https://….)") },
+                    singleLine = true,
+                )
                 Text("Enter the device code from drHiro (ask the bot for one):", style = MaterialTheme.typography.bodyLarge)
                 OutlinedTextField(
                     value = code,
@@ -203,6 +213,7 @@ fun BridgeScreen() {
                         error = ""
                         Thread {
                             try {
+                                ApiClient.configure(context, serverUrl)
                                 val result = DeviceLinker.link(code, ApiClient.baseUrl)
                                 TokenStore.saveTokens(
                                     context,

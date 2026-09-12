@@ -21,8 +21,12 @@ id_rsa*
 *.p12
 *.pfx
 
+# --- Reference snapshots with live secrets (keep pristine out of history) ---
+# The raw VPS service copy contains real credentials; only the sanitized
+# version is committed.
+docs/reference/intelligent-meal-service.py
+
 # --- Data & runtime state ---
-data/exports/
 data/state/
 data/pairing/
 *.log
@@ -43,3 +47,28 @@ apk-build/
 .idea/
 .vscode/
 *.swp
+
+# --- Generated review bundles (build outputs, not source) ---
+docs/deliverables/meal-liquid-idempotency/review_bundle/review7/
+docs/deliverables/meal-liquid-idempotency/review_bundle/review7_focused_bundle.tar.gz
+docs/deliverables/meal-liquid-idempotency/review_bundle/review8/
+docs/deliverables/meal-liquid-idempotency/review_bundle/review8_focused_bundle.tar.gz
+docs/deliverables/meal-liquid-idempotency/review_bundle/review9/
+docs/deliverables/meal-liquid-idempotency/review_bundle/review9_focused_bundle.tar.gz
+docs/deliverables/meal-liquid-idempotency/review_bundle/review10/
+docs/deliverables/meal-liquid-idempotency/review_bundle/review10_focused_bundle.tar.gz
+docs/deliverables/meal-liquid-idempotency/review_bundle/review11/
+docs/deliverables/meal-liquid-idempotency/review_bundle/review11_focused_bundle.tar.gz
+
+# Generated review evidence is kept OUT of the repository entirely.
+# These were the vectors that carried private data into a public repo.
+docs/deliverables/
+artifacts/
+*.patch
+*.tar.gz
+__pycache__/
+
+# --- Loose Android APK binaries ---
+# Signed builds live on the VPS / Telegram (installed at runtime); never in git.
+# (The apk/ directory rule above covers the sidecar; this covers loose files.)
+*.apk

@@ -14,7 +14,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload
 
@@ -24,6 +24,7 @@ from drhiro_api.models import Alert, Goal, Meal, Measurement, Reminder, Reminder
 from drhiro_api.routers.auth import mint_web_login_code
 from drhiro_api.routers.dashboard import _measurements_since
 from drhiro_api.security import audit, validate_service_token
+from drhiro_api.routers.telegram_ingress import require_model_writer_allowed
 from drhiro_rules.calculations import weight_trend
 from drhiro_schema.metrics import MetricType
 
@@ -150,17 +151,25 @@ class MealFromTextTool(BaseModel):
     text: str
     eaten_at: datetime | None = None
     meal_type: str | None = None
+    # Telegram identity of the message that produced this line. Present -> the
+    # write is idempotent and editable; absent (manual UI) -> plain insert.
+    telegram_chat_id: str | None = None
+    telegram_message_id: str | None = None
+    # >0 marks an edit of an existing message.
+    edit_date: int | None = None
 
 
-@router.post("/create_meal_from_text", response_model=ToolResponse)
-def tool_meal_from_text(req: MealFromTextTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
-    from drhiro_api.routers.meals import MealCreateRequest, MealItemIn, create_meal
-    from drhiro_api.services.text_meal_parser import parse_meal_text
+@router.post("/create_meal_from_text", response_model=ToolResponse, dependencies=[Depends(require_model_writer_allowed)])
+def tool_meal_from_text(req: MealFromTextTool, request: Request, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Log ONE Telegram line into all three ledgers in ONE transaction.
+
+    The meal-only writer could not satisfy the liquid or activity ledgers, so the
+    line is parsed into intents (meal / liquid / activity) and committed together:
+    a partial write is impossible, and a failure rolls the whole line back.
+    """
+    from drhiro_api.services.log_intents import commit_intents, parse_log_text
     from drhiro_api.services.date_parser import AmbiguousDate, resolve_when, strip_when
 
-    # Resolve any relative date ("yesterday", "on Monday") in the USER's
-    # timezone, server-side. The LLM never does date arithmetic: a wrong date
-    # silently corrupts the record, so only its words are forwarded here.
     food_text = req.text
     resolved_when = None
     resolved_meal_type = None
@@ -179,31 +188,86 @@ def tool_meal_from_text(req: MealFromTextTool, user: User = Depends(_resolve_use
     except Exception:
         pass
 
-    # The raw text is preserved in notes; the parser derives the structured
-    # items so nutrition actually attaches. The LLM upstream only supplies
-    # cleaned free text -- all structure is derived here, deterministically.
-    try:
-        parsed = parse_meal_text(db, food_text)
-    except Exception:
-        parsed = []
-    items = []
-    for entry in parsed:
-        try:
-            items.append(MealItemIn(**entry))
-        except Exception:
-            continue
+    # A named slot wins; otherwise SNACK. None is never a stored slot.
+    slot = req.meal_type or resolved_meal_type or "snack"
 
-    meal_req = MealCreateRequest(
+    try:
+        parsed = parse_log_text(db, food_text, meal_slot=slot)
+    except Exception:
+        parsed = None
+    if parsed is None or not parsed.intents:
+        raise HTTPException(status_code=400, detail="nothing_loggable_in_text")
+
+    chat_id = req.telegram_chat_id or request.headers.get("X-Telegram-Chat-Id")
+    message_id = (req.telegram_message_id
+                  or request.headers.get("X-Telegram-Message-Id"))
+    result = commit_intents(
+        db, user, parsed,
         eaten_at=req.eaten_at or resolved_when or datetime.now(timezone.utc),
-        meal_type=req.meal_type or resolved_meal_type,
-        notes=req.text,
-        items=items,
-        input_method="text",
+        telegram_chat_id=chat_id,
+        telegram_message_id=message_id,
+        raw_text=req.text,
     )
-    meal = create_meal(meal_req, user, db)
-    _tool_audit(db, user, "tools.meal_from_text", "meal", meal.id)
+    _tool_audit(db, user, "tools.log_text", "meal", result.get("meal_id"))
     db.commit()
-    return ToolResponse(ok=True, message="Meal draft created from text.", data={"meal_id": meal.id, "status": meal.status})
+    return ToolResponse(
+        ok=True,
+        message="Logged.",
+        data=result,
+    )
+
+
+class CorrectLogTool(BaseModel):
+    telegram_chat_id: str
+    telegram_message_id: str
+    slot: str | None = None
+    amount_ml: float | None = None
+    drop_item: str | None = None
+
+
+@router.post("/correct_log", response_model=ToolResponse,
+             dependencies=[Depends(require_model_writer_allowed)])
+def tool_correct_log(req: CorrectLogTool, user: User = Depends(_resolve_user),
+                     db: Session = Depends(get_db)):
+    """Correct a previous log line in place. Soft-delete only, never hard DELETE."""
+    from drhiro_api.services.log_intents import correct_log
+
+    patch = {"slot": req.slot, "amount_ml": req.amount_ml,
+             "drop_item": req.drop_item}
+    res = correct_log(db, user, telegram_chat_id=req.telegram_chat_id,
+                      telegram_message_id=req.telegram_message_id, patch=patch)
+    if not res.get("ok"):
+        db.commit()
+        raise HTTPException(status_code=409 if res.get("reason") == "ambiguous_target"
+                            else 404, detail=res)
+    _tool_audit(db, user, "tools.correct_log", "meal", str(req.telegram_message_id))
+    db.commit()
+    return ToolResponse(ok=True, message="Corrected.", data=res)
+
+
+class DeleteLogTool(BaseModel):
+    telegram_chat_id: str
+    telegram_message_id: str
+    item_name: str | None = None
+
+
+@router.post("/delete_log", response_model=ToolResponse,
+             dependencies=[Depends(require_model_writer_allowed)])
+def tool_delete_log(req: DeleteLogTool, user: User = Depends(_resolve_user),
+                    db: Session = Depends(get_db)):
+    """Soft-delete a message's log, or one named item. Ambiguity changes nothing."""
+    from drhiro_api.services.log_intents import delete_log
+
+    res = delete_log(db, user, telegram_chat_id=req.telegram_chat_id,
+                     telegram_message_id=req.telegram_message_id,
+                     item_name=req.item_name)
+    if not res.get("ok"):
+        db.commit()
+        raise HTTPException(status_code=409 if res.get("reason") == "ambiguous_target"
+                            else 404, detail=res)
+    _tool_audit(db, user, "tools.delete_log", "meal", str(req.telegram_message_id))
+    db.commit()
+    return ToolResponse(ok=True, message="Deleted.", data=res)
 
 
 class MealItemPatchTool(BaseModel):
@@ -219,7 +283,7 @@ class UpdateMealItemTool(BaseModel):
     patch: MealItemPatchTool
 
 
-@router.post("/update_meal_item", response_model=ToolResponse)
+@router.post("/update_meal_item", response_model=ToolResponse, dependencies=[Depends(require_model_writer_allowed)])
 def tool_update_meal_item(req: UpdateMealItemTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
     from drhiro_api.routers.meals import MealItemPatch, patch_meal_item
     meal = db.query(Meal).filter(Meal.id == uuid.UUID(req.meal_id), Meal.user_id == user.id).first()
@@ -236,7 +300,7 @@ class ConfirmMealTool(BaseModel):
     meal_id: str
 
 
-@router.post("/confirm_meal", response_model=ToolResponse)
+@router.post("/confirm_meal", response_model=ToolResponse, dependencies=[Depends(require_model_writer_allowed)])
 def tool_confirm_meal(req: ConfirmMealTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
     from drhiro_api.routers.meals import confirm_meal
     meal = db.query(Meal).filter(Meal.id == uuid.UUID(req.meal_id), Meal.user_id == user.id).first()

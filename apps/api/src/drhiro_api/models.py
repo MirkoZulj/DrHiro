@@ -97,6 +97,7 @@ class Activity(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     calories_burned: Mapped[float] = mapped_column(nullable=False)
+    # NOTE: `deleted_at` is NOT mapped -- see Measurement.deleted_at above.
 
     user: Mapped["User"] = relationship()
 
@@ -121,6 +122,15 @@ class Measurement(Base, TimestampMixin):
     recording_method: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    source_operation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    meal_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # NOTE: `deleted_at` (liquid soft delete) is deliberately NOT mapped here.
+    # A mapped column is emitted in INSERT/SELECT/RETURNING, which would break
+    # every read and write on a schema that has not had the logging-idempotency
+    # migration applied -- production at d5e6f7a8b9c0. It is referenced only
+    # through guarded raw SQL when schema_capabilities() reports the column
+    # exists. See services/log_intents.py.
 
 
 class DailyAggregate(Base, TimestampMixin):
@@ -174,6 +184,7 @@ class Meal(Base, TimestampMixin):
     totals_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_operation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     items: Mapped[list["MealItem"]] = relationship(back_populates="meal", cascade="all, delete-orphan")
 
@@ -192,6 +203,10 @@ class MealItem(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     user_corrected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    source_operation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    volume_ml: Mapped[float | None] = mapped_column(nullable=True)
+    beverage_category: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     meal: Mapped[Meal] = relationship(back_populates="items")
 
@@ -313,6 +328,7 @@ class AppSetting(Base):
     ai_api_key: Mapped[str | None] = mapped_column(Text, nullable=True)          # secret
     telegram_bot_token: Mapped[str | None] = mapped_column(Text, nullable=True)  # secret
     telegram_allowed_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    telegram_allowed_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # numeric Telegram ID for settings auth
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
@@ -467,3 +483,99 @@ class FoodIngredient(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     food: Mapped[Food] = relationship(back_populates="ingredients")
+
+
+# ── Consumption idempotency + item identity + beverage linkage ──────────────
+# Added by feature/meal-liquid-idempotency.
+
+
+class ConsumptionOperation(Base, TimestampMixin):
+    """Idempotency + durable result for a consumption-logging event.
+
+    One row per logical "user did this" event. For Telegram, the natural key is
+    (user_id, source_bot_id, source_chat_id, message_id). For non-Telegram
+    entry points, caller supplies an idempotency_key.
+    """
+
+    __tablename__ = "consumption_operations"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "source_bot_id", "source_chat_id", "source_message_id",
+            name="uq_consumption_op_telegram",
+        ),
+        UniqueConstraint(
+            "user_id", "idempotency_key",
+            name="uq_consumption_op_idempotency",
+        ),
+        Index("ix_consumption_ops_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), default="telegram", nullable=False)
+    source_chat_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_bot_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    # Payload hash for detecting conflicting reuse of the same identity key
+    payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ConsumptionItem(Base, TimestampMixin):
+    """Stable item identity under an operation (meal item OR beverage)."""
+
+    __tablename__ = "consumption_items"
+    __table_args__ = (
+        UniqueConstraint("operation_id", "item_key", name="uq_consumption_item_op_key"),
+        Index("ix_consumption_items_user_op", "user_id", "operation_id"),
+        Index("ix_consumption_items_meal_item", "meal_item_id"),
+        Index("ix_consumption_items_measurement", "measurement_id"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    operation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("consumption_operations.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    item_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    item_kind: Mapped[str] = mapped_column(String(16), default="food", nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    quantity: Mapped[float] = mapped_column(default=1.0, nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    grams: Mapped[float | None] = mapped_column(nullable=True)
+    volume_ml: Mapped[float | None] = mapped_column(nullable=True)
+    nutrients_per_100: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    nutrients_scaled: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    beverage_category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    meal_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    meal_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    measurement_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Stage 2: nutrient resolution provenance
+    nutrient_basis: Mapped[str | None] = mapped_column(String(16), nullable=True)  # 'per_100_g' | 'per_100_ml'
+    resolution_source: Mapped[str | None] = mapped_column(String(32), nullable=True)  # 'db' | 'external' | 'unmatched'
+    food_catalog_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("foods.id"), nullable=True
+    )
+    nutrition_complete: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class BeverageMeasurement(Base, TimestampMixin):
+    """1:1 link between a liquid Measurement and its source meal_item."""
+
+    __tablename__ = "beverage_measurements"
+    __table_args__ = (
+        UniqueConstraint("meal_item_id", name="uq_bev_meal_item"),
+        UniqueConstraint("measurement_id", name="uq_bev_measurement"),
+        Index("ix_bev_user", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    meal_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    measurement_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    consumption_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)

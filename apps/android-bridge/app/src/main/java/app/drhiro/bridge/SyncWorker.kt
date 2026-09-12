@@ -18,6 +18,12 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
 
     override suspend fun doWork(): Result {
         val ctx = applicationContext
+        // Restore the persisted server URL FIRST. WorkManager can start this
+        // worker in a fresh process where ApiClient.baseUrl is empty; without
+        // this, requireBaseUrl() throws and the worker retries forever, never
+        // uploading. The fail-loud guard stays for the genuinely-unconfigured
+        // case (no URL ever set).
+        ApiClient.loadFromPrefs(ctx)
         val installationId = TokenStore.installationId(ctx) ?: return Result.failure()
         val accessToken = TokenStore.accessToken(ctx) ?: return Result.failure()
         val cursors = TokenStore.cursors(ctx)

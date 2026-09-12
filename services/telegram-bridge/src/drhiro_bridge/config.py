@@ -30,6 +30,20 @@ class Config:
         self.allow_http_lan: bool = os.environ.get("PAIRING_ALLOW_HTTP_LAN", "true").lower() == "true"
         self.debug: bool = os.environ.get("DRHIRO_DEBUG", "false").lower() == "true"
 
+        # --- T1 trusted ingress ------------------------------------------------
+        # Where the trusted ingestion worker lives (the drHiro API).
+        self.ingress_api_url: str = os.environ.get("DRHIRO_API_URL", "http://drhiro-api:8080")
+        # Shared secret used to sign trusted events. Absent => trusted path off.
+        self.ingress_secret: str = os.environ.get("TELEGRAM_INGRESS_SECRET", "")
+        # When true, the trusted worker owns Telegram consumption writes, and the
+        # bridge routes consumption-eligible turns through it.
+        self.telegram_ingress_enabled: bool = (
+            os.environ.get("TELEGRAM_INGRESS_ENABLED", "false").lower() == "true"
+        )
+        # Verified bot identity (Telegram getMe.id). Resolved at startup when not
+        # configured; provisioning should pin it in trusted configuration.
+        self.telegram_bot_id: str = os.environ.get("TELEGRAM_BOT_ID", "")
+
     def validate(self) -> list[str]:
         """Return a list of missing required settings (empty = valid)."""
         missing: list[str] = []

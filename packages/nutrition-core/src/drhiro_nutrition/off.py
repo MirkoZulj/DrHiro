@@ -38,7 +38,7 @@ class OpenFoodFactsCatalog:
             carbs_g_per_100g=g_per100("carbohydrates"),
             fat_g_per_100g=g_per100("fat"),
             fiber_g_per_100g=g_per100("fiber"),
-            sodium_mg_per_100g=g_per100("sodium"),
+            sodium_mg_per_100g=(g_per100("sodium") or 0.0) * 1000.0,  # OFF returns sodium in grams per 100g; field is mg
             serving_grams=_num(nutriments.get("serving_quantity")),
             serving_unit=nutriments.get("serving_quantity_unit"),
         )

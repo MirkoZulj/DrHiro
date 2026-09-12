@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.orm import Session, selectinload
 
 from drhiro_api.db import get_db
@@ -28,14 +29,29 @@ from drhiro_schema.metrics import MetricType
 router = APIRouter(tags=["dashboard"])
 
 
+def _ledger_soft_delete_available(db: Session) -> bool:
+    """True only when the ledger soft-delete migration has been applied.
+
+    On a schema without `measurements.deleted_at` (production today) the filter is
+    omitted entirely rather than referencing a column that does not exist.
+    """
+    try:
+        from drhiro_api.services.log_intents import schema_capabilities
+        return bool(schema_capabilities(db)["ledger_deleted_at"])
+    except Exception:
+        return False
+
+
 def _measurements_since(db: Session, user_id: uuid.UUID, days: int) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = (
-        db.query(Measurement)
-        .filter(Measurement.user_id == user_id, Measurement.start_at >= cutoff)
-        .order_by(Measurement.start_at.asc())
-        .all()
-    )
+    q = db.query(Measurement).filter(
+        Measurement.user_id == user_id, Measurement.start_at >= cutoff)
+    if _ledger_soft_delete_available(db):
+        # A soft-deleted liquid must not appear in any daily total. Expressed as
+        # guarded raw SQL because the column is not ORM-mapped (a schema without
+        # it must never see it referenced).
+        q = q.filter(text("measurements.deleted_at IS NULL"))
+    rows = q.order_by(Measurement.start_at.asc()).all()
     return [
         {
             "id": str(m.id),
@@ -92,43 +108,47 @@ def _dedup_sleep(records):
 def _dedup_steps(records: list[dict]) -> int:
     """Sum step counts without double-counting overlapping intervals.
 
-    Health Connect returns step records at multiple aggregation levels
-    (30-min summaries containing per-minute + per-second detail records).
-    Summing ALL records double-counts sub-intervals.  The prior heuristic
-    gave every record proportional credit for its uncovered fraction, which
-    HALVED real per-minute data even when there were no summaries (the user's
-    band showed ~6.6k, the tile 3.4k).
+    Health Connect returns the SAME steps at two levels:
+      1. 30-minute AGGREGATE buckets (spans ~1799s / 29:59, matching what the
+         user's band shows), and
+      2. finer per-minute / per-second detail records inside those buckets.
+    Summing both double-counts (observed ~13.5k vs the band's ~7.1k).
 
-    Option B (the defensible fix): granular records (< 30 min) are real,
-    distinct measurements — count them fully.  A coarse record (>= 30 min
-    summary) contributes ONLY for the time NOT already covered by granular
-    records (gap-filling).  Never trim a granular record.
+    The 30-minute aggregate buckets are authoritative — their sum matches the
+    device.  So we count buckets FULLY, and only credit a detail record for
+    time NOT already covered by a bucket (gap-filling).  A detail record that
+    sits entirely inside a bucket contributes nothing.
+
+    A bucket is recognised by its long span: Health Connect 30-min summaries
+    land at ~1799s, just UNDER a naive 1800s (30 min) cutoff — which is exactly
+    why the old code misclassified them as granular and double-counted.  We use
+    a ~28-minute threshold so the real summaries are treated as buckets.
     """
     if not records:
         return 0
 
-    GRANULAR = 30 * 60  # 30-minute summary threshold (seconds)
+    BUCKET_SECS = 28 * 60  # ~30-min Health Connect aggregate summaries
 
-    granular = [
+    detail = [
         r for r in records
-        if (r.get("end_at") or r["start_at"]) - r["start_at"] < timedelta(seconds=GRANULAR)
+        if (r.get("end_at") or r["start_at"]) - r["start_at"] < timedelta(seconds=BUCKET_SECS)
     ]
-    coarse = [
+    buckets = [
         r for r in records
-        if (r.get("end_at") or r["start_at"]) - r["start_at"] >= timedelta(seconds=GRANULAR)
+        if (r.get("end_at") or r["start_at"]) - r["start_at"] >= timedelta(seconds=BUCKET_SECS)
     ]
 
-    # Granular records: fully counted; occupy their intervals.
+    # Buckets are authoritative: count fully, occupy their whole interval.
     occupied: list[tuple[datetime, datetime]] = []
     total = 0
-    for rec in granular:
+    for rec in buckets:
         start = rec["start_at"]
         end = rec.get("end_at") or start
         total += (rec.get("value_json") or {}).get("count", 0)
         occupied.append((start, end))
 
-    # Coarse summaries: only uncovered (gap) time is credited, proportionally.
-    for rec in coarse:
+    # Detail records: only credit the portion NOT covered by any bucket.
+    for rec in detail:
         start = rec["start_at"]
         end = rec.get("end_at") or start
         count = (rec.get("value_json") or {}).get("count", 0)
@@ -147,7 +167,7 @@ def _dedup_steps(records: list[dict]) -> int:
             if not uncovered:
                 break
         if not uncovered:
-            continue  # fully covered by granular records
+            continue  # fully covered by buckets
         unc_sec = sum((e - s).total_seconds() for s, e in uncovered)
         total_sec = (end - start).total_seconds()
         if total_sec > 0 and unc_sec > 0:
@@ -230,16 +250,39 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
     )
     # Liquid breakdown by category (value_json may carry a "category" key;
     # missing -> "water" for backward compat with old rows).
-    liquid_cats = ["water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol"]
-    liquid_today: dict[str, int] = {c: 0 for c in liquid_cats}
+    # SUPERSET of two key sets. This endpoint has two consumers with different
+    # expectations and BOTH must be satisfied:
+    #
+    #  * canonical categories (water/coffee/tea/juice/soda/milk/alcohol/smoothie/
+    #    broth/other) -- what the logging work emits;
+    #  * the LEGACY keys the DEPLOYED web bundle still reads. The water tile
+    #    breakdown in /usr/share/nginx/html/assets/index-*.js is built from fixed
+    #    keys (water, non_alcoholic, beer, wine, spirits, other_alcohol) and drops
+    #    undefined rows with `.filter(M => M.ml > 0)`. Emitting canonical keys
+    #    alone therefore made a logged drink VANISH from the tile even though
+    #    total_ml still counted it.
+    #
+    # Each millilitre is counted exactly ONCE in total_ml (summed over the
+    # canonical buckets only) and additionally surfaced under its legacy key.
+    liquid_cats = LIQUID_CANONICAL_CATS
+    legacy_cats = LIQUID_LEGACY_CATS[1:]  # "water" is already in liquid_cats
+    liquid_today: dict[str, int] = {c: 0 for c in liquid_cats + legacy_cats}
+    # stored value_json.category -> (canonical bucket, legacy bucket or None)
+    liquid_map = LIQUID_CATEGORY_MAP
     for m in measurements:
         if m["metric_type"] != MetricType.WATER or m["start_at"] < today_start:
             continue
-        cat = (m["value_json"].get("category") or "water")
-        if cat not in liquid_today:
-            cat = "water"
-        liquid_today[cat] += m["value_json"].get("amount_ml", 0)
-    liquids_today = {"total_ml": sum(liquid_today.values()), **liquid_today}
+        value = m.get("value_json") or {}
+        cat = value.get("category") or "water"
+        canon, legacy = liquid_map.get(cat, ("other", "non_alcoholic"))
+        ml = value.get("amount_ml", 0) or 0
+        liquid_today[canon] += ml
+        if legacy:
+            liquid_today[legacy] += ml
+    liquids_today = {
+        "total_ml": sum(liquid_today[c] for c in liquid_cats),
+        **liquid_today,
+    }
     # Last water measurement ANY day (for "last log" display)
     water_last = None
     for m in reversed(measurements):
@@ -259,6 +302,22 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
         max((m.eaten_at for m in meals_today_rows), default=None).astimezone(ZoneInfo(user.timezone)).isoformat()
         if meals_today_rows else None
     )
+    # Activity burn for today (the daily summary previously omitted it entirely).
+    activity_kcal_today = None
+    try:
+        from drhiro_api.models import Activity
+        # `today_start` is tz-aware UTC, so .date() would yield the UTC date and
+        # miss the local day entirely. Compare the owner's LOCAL date.
+        local_today = datetime.now(ZoneInfo(user.timezone)).date()
+        aq = db.query(Activity).filter(Activity.user_id == user.id,
+                                       Activity.activity_date == local_today)
+        if _ledger_soft_delete_available(db):
+            aq = aq.filter(text("activities.deleted_at IS NULL"))
+        activity_kcal_today = round(
+            sum(float(a.calories_burned or 0) for a in aq.all()), 1)
+    except Exception:
+        activity_kcal_today = None
+
     sleep_last = None
     sleep_rows = [m for m in measurements if m["metric_type"] == MetricType.SLEEP]
     if sleep_rows:
@@ -311,6 +370,7 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
         "calories_kcal_today": round(calories_kcal_today, 1),
         "calories_measured_at": calories_measured_at,
         "calories_is_stale": False,
+        "activity_kcal_today": activity_kcal_today,
         "last_sleep": sleep_last,
         "missing_data_note": "Absence of wearable data is reported as missing, never as zero.",
     }
@@ -919,6 +979,62 @@ def trends_bucketed(
         return {"granularity": granularity, "metric": metric, "period_label": period_label,
                 "period_key": period_key, "points": points}
 
+    # ---- activity_kcal / burned: total daily burn = BMR + active(walking) + sport ----
+    # Matches /energy-balance's burned definition. Active energy comes from the
+    # tracker ACTIVE_CALORIES when present, else steps-derived (0.04 kcal/step).
+    if metric in ("activity_kcal", "burned_kcal", "activity"):
+        bmr = user.basal_metabolism_kcal or 0.0
+        # sport (manual Activity rows) by local day
+        sport_rows = (db.query(Activity)
+                      .filter(Activity.user_id == user.id,
+                              Activity.activity_date >= start, Activity.activity_date <= end)
+                      .all())
+        sport: dict[date_type, float] = {}
+        for a in sport_rows:
+            sport[a.activity_date] = sport.get(a.activity_date, 0.0) + float(a.calories_burned or 0)
+        # active/walking energy + steps by local day
+        meas = (db.query(Measurement)
+                .filter(Measurement.user_id == user.id,
+                        Measurement.start_at >= start_dt, Measurement.start_at < end_dt)
+                .all())
+        active: dict[date_type, float] = {}
+        steps_by_day: dict[date_type, float] = {}
+        active_avail = False
+        for m in meas:
+            day = m.start_at.astimezone(tz).date()
+            if m.metric_type == MetricType.ACTIVE_CALORIES:
+                v = float((m.value_json or {}).get("value") or (m.value_json or {}).get("count") or 0)
+                active[day] = active.get(day, 0.0) + v
+                active_avail = True
+            elif m.metric_type == MetricType.STEPS:
+                steps_by_day[day] = steps_by_day.get(day, 0.0) + float((m.value_json or {}).get("count") or 0)
+        # walking kcal: prefer tracker active energy, else steps*0.04
+        buckets: list[list[float]] = [[] for _ in range(n)]
+        for i in range(n):
+            d = day_at(i)
+            dt = datetime.combine(d, datetime.min.time(), tzinfo=tz)
+            idx, _ = bucket_of(dt)
+            if idx is None:
+                continue
+            steps = steps_by_day.get(d, 0.0)
+            has_activity_data = steps > 0 or d in active or d in sport
+            walking = active.get(d, 0.0) if active_avail else (steps * 0.04 if steps else 0.0)
+            burned = bmr + walking + sport.get(d, 0.0)
+            buckets[idx].append(burned if has_activity_data else float("nan"))
+        points = []
+        for i in range(n):
+            vals = buckets[i]
+            present = [v for v in vals if v == v]  # drop NaN (no-data days)
+            if not present:
+                points.append({"date": day_at(i).isoformat(), "value": None, "label": ""})
+                continue
+            v = present[-1]  # most recent day with data in the bucket
+            d = day_at(i)
+            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+            points.append({"date": d.isoformat(), "value": round(v, 1), "label": lab})
+        return {"granularity": granularity, "metric": metric, "period_label": period_label,
+                "period_key": period_key, "points": points}
+
     # ---- measurement metrics ----
     metric_map = {
         "steps": (MetricType.STEPS, "sum"),
@@ -999,6 +1115,46 @@ def trends_bucketed(
             "period_key": period_key, "points": points}
 
 
+# --------------------------------------------------------------------------- #
+# Liquid category bucketing (single source of truth)
+# --------------------------------------------------------------------------- #
+# Stored `value_json.category` -> (canonical bucket, legacy bucket or None).
+# Each millilitre is counted ONCE in the canonical buckets; the legacy keys are
+# an additional view kept because the deployed web bundle's chart reads them.
+LIQUID_CANONICAL_CATS = [
+    "water", "coffee", "tea", "juice", "soda", "milk", "alcohol",
+    "smoothie", "broth", "other",
+]
+LIQUID_LEGACY_CATS = [
+    "water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol",
+]
+LIQUID_CATEGORY_MAP: dict[str, tuple[str, str | None]] = {
+    "water": ("water", None),
+    "juice": ("juice", "non_alcoholic"),
+    "soda": ("soda", "non_alcoholic"),
+    "coffee": ("coffee", "non_alcoholic"),
+    "tea": ("tea", "non_alcoholic"),
+    "milk": ("milk", "non_alcoholic"),
+    "smoothie": ("smoothie", "non_alcoholic"),
+    "broth": ("broth", "non_alcoholic"),
+    "non_alcoholic": ("other", "non_alcoholic"),
+    "beer": ("alcohol", "beer"),
+    "wine": ("alcohol", "wine"),
+    "spirits": ("alcohol", "spirits"),
+    "other_alcohol": ("alcohol", "other_alcohol"),
+    "alcohol": ("alcohol", "other_alcohol"),
+}
+
+
+def liquid_category_buckets(cat: str | None) -> tuple[str, str | None]:
+    """Map a stored liquid category to (canonical bucket, legacy bucket).
+
+    Unknown categories fall back to the non-alcoholic bucket rather than to
+    water, so an unrecognised drink is never silently counted as water.
+    """
+    return LIQUID_CATEGORY_MAP.get(cat or "water", ("other", "non_alcoholic"))
+
+
 @router.get("/trends/liquids")
 def liquids_bucketed(
     granularity: Literal["day", "week", "month"] = "day",
@@ -1019,7 +1175,8 @@ def liquids_bucketed(
     """
     tz = ZoneInfo(user.timezone or "UTC")
     today = datetime.now(tz).date()
-    cats = ["water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol"]
+    cats = LIQUID_LEGACY_CATS        # chart series (unchanged key names)
+    canon_cats = LIQUID_CANONICAL_CATS  # drinks-list series
 
     if granularity == "day":
         base_monday, _ = _iso_week_bounds(today)
@@ -1084,8 +1241,9 @@ def liquids_bucketed(
             .order_by(Measurement.start_at.asc())
             .all())
 
-    # per-bucket per-category sums
+    # per-bucket per-category sums (legacy view + canonical view)
     buckets = [dict((c, 0) for c in cats) for _ in range(n)]
+    canon_buckets = [dict((c, 0) for c in canon_cats) for _ in range(n)]
     for m in rows:
         vj = m.value_json or {}
         amt = vj.get("amount_ml") or vj.get("volume_ml") or vj.get("water_ml")
@@ -1094,26 +1252,35 @@ def liquids_bucketed(
         idx, _ = bucket_of(m.start_at)
         if idx is None:
             continue
-        cat = vj.get("category") or "water"
-        if cat not in cats:
-            cat = "water"
-        buckets[idx][cat] += float(amt)
+        # Canonical + legacy, explicitly. Previously an unrecognised category
+        # was forced into "water"; with canonical categories stored by the
+        # writer that would silently turn a juice into water.
+        canon, legacy = liquid_category_buckets(vj.get("category"))
+        canon_buckets[idx][canon] += float(amt)
+        if legacy:
+            buckets[idx][legacy] += float(amt)
 
     points = []
     for i in range(n):
         row = buckets[i]
-        has = any(v > 0 for v in row.values())
-        d = day_at(i)
-        lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+        crow = canon_buckets[i]
+        # total counts each millilitre once, from the canonical buckets
+        has = any(v > 0 for v in crow.values())
+        day = day_at(i)
+        lab = bucket_of(datetime.combine(day, datetime.min.time(), tzinfo=tz))[1]
         points.append({
-            "date": d.isoformat(),
+            "date": day.isoformat(),
             "label": lab,
-            "total_ml": round(sum(row.values()), 1) if has else None,
+            "total_ml": round(sum(crow.values()), 1) if has else None,
+            # legacy keys (the chart's series; key names must not change)
             **{c: (round(row[c], 1) if row[c] > 0 else None) for c in cats},
+            # canonical keys (the drinks list names these)
+            **{c: (round(crow[c], 1) if crow[c] > 0 else None) for c in canon_cats},
         })
 
     return {"granularity": granularity, "metric": "liquids", "period_label": period_label,
-            "period_key": period_key, "categories": cats, "points": points}
+            "period_key": period_key, "categories": cats,
+            "canonical_categories": canon_cats, "points": points}
 
 
 @router.get("/goals")

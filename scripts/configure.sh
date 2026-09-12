@@ -34,11 +34,22 @@ curl -sf -m 30 -X POST "$TF/settings/model-providers" \
   >/dev/null 2>&1 || warn "Model provider registration returned non-2xx (may already exist)."
 
 # 3. Register the drHiro tools MCP server (SSE URL inside the compose network)
+# NOTE: drhiro-tools now runs on :3101 (the hardened drhiro-mcp service owns :3100).
 info "Registering drhiro-tools MCP server..."
 curl -sf -m 30 -X POST "$TF/settings/mcp-servers" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"drhiro-tools","type":"sse","url":"http://drhiro-tools:3100/sse","authType":"none"}' \
+  -d '{"name":"drhiro-tools","type":"sse","url":"http://drhiro-tools:3101/sse","authType":"none"}' \
   >/dev/null 2>&1 || warn "MCP server registration returned non-2xx (may already exist)."
+
+# 3b. Register the hardened drhiro-mcp server (token-gated, JSON-RPC over HTTP)
+# The MCP server fails closed without DRHIRO_MCP_SERVER_TOKEN; pass it as a header
+# via the authToken field (TrueForge attaches it as configured).
+info "Registering hardened drhiro-mcp server..."
+MCP_AUTH_JSON="{\"name\":\"drhiro-mcp\",\"type\":\"streamable\",\"url\":\"http://drhiro-mcp:3100/mcp\",\"authType\":\"header\",\"authHeader\":\"X-MCP-Token\",\"authToken\":\"${DRHIRO_MCP_SERVER_TOKEN}\"}"
+curl -sf -m 30 -X POST "$TF/settings/mcp-servers" \
+  -H 'Content-Type: application/json' \
+  -d "$MCP_AUTH_JSON" \
+  >/dev/null 2>&1 || warn "drhiro-mcp registration returned non-2xx (may already exist)."
 
 # 4. Create / update the drhiro agent from agent/drhiro.agent.json
 info "Creating drhiro agent..."

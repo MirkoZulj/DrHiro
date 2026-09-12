@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: drhiro
+          POSTGRES_PASSWORD: drhiro
+          POSTGRES_DB: drhiro
+        ports: ["5435:5432"]
+        options: >-
+          --health-cmd "pg_isready -U drhiro"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6382:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install -e packages/health-schema -e packages/rule-engine -e packages/nutrition-core -e "apps/api[dev]" -e apps/worker
+      - name: Package tests
+        run: |
+          . .venv/bin/activate
+          cd packages/rule-engine && python -m pytest tests/ -q
+          cd ../nutrition-core && python -m pytest tests/ -q
+      - name: API acceptance tests
+        env:
+          DRHIRO_DATABASE_URL: postgresql+psycopg://drhiro:drhiro@localhost:5435/drhiro
+          DRHIRO_JWT_SECRET: ci-secret-key-0123456789abcdefghijklmnopqrstuv
+          DRHIRO_TELEGRAM_BOT_TOKEN: 123456:ci-bot-token-for-initdata
+        run: |
+          . .venv/bin/activate
+          cd apps/api
+          alembic upgrade head
+          python -m pytest tests/ -q

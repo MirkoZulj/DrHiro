@@ -1,0 +1,42 @@
+# Dev/test override: bring up only postgres + redis locally.
+# Usage: docker compose -f infra/docker-compose.yml -f infra/docker-compose.dev.yml up -d postgres redis
+name: drhiro-dev
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: drhiro
+      POSTGRES_PASSWORD: drhiro
+      POSTGRES_DB: drhiro
+    ports:
+      - "5435:5432"
+    volumes:
+      - pgdata_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drhiro"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [drhiro-dev-net]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6382:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [drhiro-dev-net]
+
+volumes:
+  pgdata_dev:
+
+networks:
+  drhiro-dev-net:
+    driver: bridge

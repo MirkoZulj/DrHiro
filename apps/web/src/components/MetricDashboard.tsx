@@ -2,8 +2,16 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { authClient } from '../lib/auth'
 import { MetricConfig } from '../lib/types'
+import BmrCalculator from './BmrCalculator'
 
 type TF = 'D' | 'W' | 'M'
+
+/** Today in the browser's own timezone, as YYYY-MM-DD. Using toISOString() on a
+ *  local Date would shift the day for anyone east/west of UTC. */
+function todayLocalISO(): string {
+  const t = new Date()
+  return new Date(t.getTime() - t.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
+}
 
 interface Point { date: string; value: number | null; label: string }
 interface Bucketed { granularity: string; metric: string; period_label: string; period_key: string; points: Point[] }
@@ -62,6 +70,12 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
   const [source, setSource] = useState('')
   const [balanceVal, setBalanceVal] = useState<number | null>(null)
   const [todayIntake, setTodayIntake] = useState<number | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
+  const [showEntry, setShowEntry] = useState(false)
+  const [entryValue, setEntryValue] = useState('')
+  const [entryDate, setEntryDate] = useState<string>(() => todayLocalISO())
+  const [entryErr, setEntryErr] = useState<string | null>(null)
+  const [entryBusy, setEntryBusy] = useState(false)
 
   // Esc + scroll lock
   useEffect(() => {
@@ -125,7 +139,7 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
       }
       setLoading(false)
     })
-  }, [tf, offset, config.key])
+  }, [tf, offset, config.key, reloadKey])
 
   if (loading) return (
     <div className="modal-overlay" onClick={onClose}>
@@ -135,6 +149,33 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
       </div>
     </div>
   )
+
+  const isWeight = config.key === 'weight'
+
+  async function saveReading() {
+    const v = parseFloat(entryValue)
+    if (!Number.isFinite(v) || v <= 0 || v > 500) {
+      setEntryErr('Enter a weight in kg, e.g. 78.5')
+      return
+    }
+    setEntryBusy(true)
+    setEntryErr(null)
+    try {
+      // mid-day local time so the reading lands on the chosen date in any zone
+      const measuredAt = new Date(`${entryDate || todayLocalISO()}T12:00:00`)
+      await authClient.api('/ingest/manual/weight', {
+        method: 'POST',
+        body: JSON.stringify({ weight_kg: v, measured_at: measuredAt.toISOString() }),
+      })
+      setEntryValue('')
+      setShowEntry(false)
+      setReloadKey((k) => k + 1)
+    } catch (e) {
+      setEntryErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setEntryBusy(false)
+    }
+  }
 
   const points = (bucketed?.points ?? [])
   const periodLabel = bucketed?.period_label ?? ''
@@ -186,13 +227,46 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
           ) : isLiquid ? (
             <LiquidDashboard liquids={liquids} />
           ) : (
-            <MetricChartView points={points} config={config} goal={goalForTf} goalLabel={goalLabel} granularity={granularity}
-               />
+            <>
+              <MetricChartView points={points} config={config} goal={goalForTf} goalLabel={goalLabel} granularity={granularity}
+                 />
+              {config.key === 'activity' && <BmrCalculator />}
+              {isWeight && showEntry && (
+                <section className="section manual-entry-section">
+                  <h3>Add reading</h3>
+                  <div className="quick-entry-row">
+                    <input type="number" inputMode="decimal" step="0.1" value={entryValue}
+                      onChange={(e) => setEntryValue(e.target.value)} placeholder="Weight (kg)" />
+                    <input type="date" value={entryDate}
+                      onChange={(e) => setEntryDate(e.target.value)} />
+                  </div>
+                  <div className="quick-entry-row" style={{ marginTop: 8 }}>
+                    <button className="small" onClick={saveReading} disabled={entryBusy}>
+                      {entryBusy ? '…' : 'Save reading'}
+                    </button>
+                    <button className="small" onClick={() => { setShowEntry(false); setEntryErr(null) }}>
+                      Cancel
+                    </button>
+                  </div>
+                  {entryErr && <div className="error" style={{ marginTop: 8 }}>{entryErr}</div>}
+                </section>
+              )}
+            </>
           )}
         </div>
 
         <div className="modal-footer">
-          <button className="btn btn-primary" onClick={() => { onClose(); navigate(primaryTo) }}>{primaryAction}</button>
+          <button className="btn btn-primary" onClick={() => {
+            // A weight reading is entered here. Navigating to /activities lost
+            // the user's intent (and there is no weight control on that page).
+            if (isWeight) {
+              setEntryDate(todayLocalISO())
+              setShowEntry(true)
+            } else {
+              onClose()
+              navigate(primaryTo)
+            }
+          }}>{primaryAction}</button>
         </div>
       </div>
     </div>

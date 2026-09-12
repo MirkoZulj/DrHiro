@@ -22,6 +22,7 @@ EDITABLE_FIELDS = {
     "ai_api_key": True,
     "telegram_bot_token": True,
     "telegram_allowed_username": False,
+    "telegram_allowed_user_id": False,
 }
 
 SINGLETON_ID = "singleton"
@@ -123,6 +124,7 @@ _MODEL_FIELD = "model_name"
 _AI_KEY_FIELD = "ai_api_key"
 _TG_TOKEN_FIELD = "telegram_bot_token"
 _TG_USERNAME_FIELD = "telegram_allowed_username"
+_TG_USER_ID_FIELD = "telegram_allowed_user_id"
 
 
 def resolve_runtime(db: Session, env: dict) -> dict:
@@ -158,6 +160,7 @@ def resolve_runtime(db: Session, env: dict) -> dict:
         "ai_api_key": _pick(_AI_KEY_FIELD, "AI_API_KEY"),
         "telegram_bot_token": _pick(_TG_TOKEN_FIELD, "TELEGRAM_BOT_TOKEN"),
         "telegram_allowed_username": _pick(_TG_USERNAME_FIELD, "TELEGRAM_ALLOWED_USERNAME"),
+        "telegram_allowed_user_id": _pick(_TG_USER_ID_FIELD, "TELEGRAM_ALLOWED_USER_ID"),
     }
 
 

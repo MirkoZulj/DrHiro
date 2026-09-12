@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision: str = '3c00321778bc'
-down_revision: Union[str, None] = None
+down_revision: Union[str, None] = 'b2f3c4d5e6f7'  # food-domain baseline now runs first
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

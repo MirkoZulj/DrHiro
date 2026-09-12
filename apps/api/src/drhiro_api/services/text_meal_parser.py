@@ -158,23 +158,28 @@ def _to_float(raw: str) -> float:
 # ---------------------------------------------------------------------------
 
 def _extract_amount(text: str):
-    """Pull an explicit weight/volume out of the fragment.
+    """Pull an explicit weight OR volume out of the fragment.
 
-    Returns (remaining_text, grams|None).
+    Returns (remaining_text, grams|None, volume_ml|None).
+
+    A millilitre/litre figure is a VOLUME and is returned as volume_ml with grams
+    left unset. It is never copied into grams: storing "500 ml of water" as 500 g
+    miscategorises a drink as a solid and is what produced the production defect.
     """
     m = GRAMS_RE.search(text)
     if not m:
-        return text, None
+        return text, None, None
     value = _to_float(m.group(1))
     unit = m.group(2).lower()
+    rest = text[: m.start()] + " " + text[m.end():]
     if unit.startswith(("kg", "kilo")):
-        grams = value * 1000.0
-    elif unit in ("l", "litre", "litres", "liter", "liters"):
-        grams = value * 1000.0
-    else:
-        # g / gr / gram / grams / ml -- ml treated as 1 g for water-like foods.
-        grams = value
-    return (text[: m.start()] + " " + text[m.end():]), grams
+        return rest, value * 1000.0, None
+    if unit in ("l", "litre", "litres", "liter", "liters"):
+        return rest, None, value * 1000.0
+    if unit == "ml":
+        return rest, None, value
+    # g / gr / gram / grams
+    return rest, value, None
 
 
 def _extract_count(text: str):
@@ -210,9 +215,36 @@ def _extract_size(text: str):
     return text, 1.0
 
 
+_LEADING_VERB_RE = re.compile(
+    r"^\s*(?:i\s+)?(?:ate|eat|had|have|drank|drink|did|do|took|take|logged|log)"
+    r"(?:\s+up)?\s+", flags=re.I)
+
+
+def _strip_leading_verb(text: str) -> str:
+    """Drop "I ate" / "I had" / "I drank" style prefixes.
+
+    "I ate a banana" must yield the item name "banana", not "I banana".
+    Applied repeatedly so "I ate had x" cannot leave a stray verb behind.
+    """
+    out = text or ""
+    while True:
+        stripped = _LEADING_VERB_RE.sub("", out)
+        if stripped == out:
+            return stripped
+        out = stripped
+
+
 def _clean(text: str) -> str:
+    # Order matters: the leading verb is stripped BEFORE the noise pass, because
+    # NOISE already contains "ate"/"had" -- removing them first leaves a bare
+    # "I" behind and the item name becomes "I banana".
+    text = _strip_leading_verb(text)
     text = _noise_pattern().sub(" ", text)
     text = re.sub(r"[^\w\s'&-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Any pronoun left over after the noise pass.
+    text = re.sub(r"^(?:i|we)\s+", "", text, flags=re.I)
+    text = _strip_leading_verb(text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -375,7 +407,7 @@ def parse_meal_text(db, text: str) -> list[dict]:
             continue
 
         try:
-            rest, grams = _extract_amount(fragment)
+            rest, grams, volume_ml = _extract_amount(fragment)
             rest, qty, unit = _extract_count(rest)
             rest, size_factor = _extract_size(rest)
             cleaned = _clean(rest)
@@ -384,14 +416,17 @@ def parse_meal_text(db, text: str) -> list[dict]:
 
             food, matched, canon_key = _resolve(db, cleaned, vocabulary)
 
-            if grams is None:
+            if grams is None and volume_ml is None:
                 grams = _portion_grams(cleaned, food, qty, unit, size_factor, canon_key)
 
             item = {
                 "display_name": matched or cleaned,
-                "grams": float(grams),
+                "grams": float(grams) if grams is not None else None,
                 "quantity": float(qty) if qty else 1.0,
             }
+            if volume_ml is not None:
+                # Volume stays volume; grams is deliberately left unset.
+                item["volume_ml"] = float(volume_ml)
             if unit:
                 item["unit"] = unit
             if food is not None:

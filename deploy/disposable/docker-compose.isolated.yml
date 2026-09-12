@@ -1,0 +1,120 @@
+# Disposable isolated stack for the trusted-ingress vertical slice (R1).
+#
+# Disposable only; never used for production. Brought up on a workstation/disposable
+# host to exercise the trusted path with real containers and a real database.
+#
+# Isolation contract (enforced by tests/test_r1_stack_isolation.py over EFFECTIVE
+# access - secrets, mounts, privileges, admin interfaces and network reach):
+#   * `openclaw` and `mcp` are MODEL-ACCESSIBLE. No bot token, no JWT signing secret,
+#     no ingress signing key, no private key; no trusted spool/config mount; no
+#     administrative interface; attached ONLY to the `turn` network.
+#   * `ingress` is TRUSTED: the only holder of the bot token and signing key, the only
+#     mounter of the trusted spool, and the single Telegram consumer.
+#   * `postgres`/`redis`/`fake-telegram` sit on the `trusted` network only, so no
+#     model-accessible service can reach trusted state directly.
+name: drhiro-isolated
+
+x-app: &app
+  build:
+    context: ../..
+    dockerfile: deploy/disposable/Dockerfile
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: drhiro
+      POSTGRES_PASSWORD: disposable-only
+      POSTGRES_DB: drhiro_t1
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    networks: [trusted]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drhiro -d drhiro_t1"]
+      interval: 2s
+      timeout: 2s
+      retries: 40
+
+  redis:
+    image: redis:7-alpine
+    networks: [trusted]
+
+  fake-telegram:
+    <<: *app
+    command: ["python", "-u", "/app/fake_telegram.py"]
+    networks: [trusted]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8081/health')\""]
+      interval: 2s
+      timeout: 2s
+      retries: 40
+
+  # Runs the REAL Alembic chain, so the trusted ingress persists into genuine T1
+  # tables rather than a lookalike schema.
+  migrate:
+    <<: *app
+    command: ["sh", "-c",
+              "alembic -c /app/alembic.ini upgrade head && python /app/seed_catalog.py"]
+    environment:
+      DRHIRO_DATABASE_URL: "postgresql+psycopg2://drhiro:disposable-only@postgres:5432/drhiro_t1"
+      DATABASE_URL: "postgresql://drhiro:disposable-only@postgres:5432/drhiro_t1"
+      PYTHONPATH: "/app/drhiro_src"
+    networks: [trusted]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  # TRUSTED: sole Telegram consumer; sole holder of the bot token and signing key;
+  # sole owner of the trusted spool.
+  ingress:
+    <<: *app
+    command: ["python", "-u", "/app/ingress.py"]
+    environment:
+      TELEGRAM_BOT_TOKEN: "111111:disposable-bot-token"
+      DRHIRO_INGRESS_SIGNING_KEY: "disposable-ingress-signing-key"
+      DRHIRO_TELEGRAM_ID: "8677922871"
+      DATABASE_URL: "postgresql://drhiro:disposable-only@postgres:5432/drhiro_t1"
+      DRHIRO_DATABASE_URL: "postgresql+psycopg2://drhiro:disposable-only@postgres:5432/drhiro_t1"
+      TELEGRAM_API_URL: "http://fake-telegram:8081"
+      OPENCLAW_URL: "http://openclaw:8090"
+      INGRESS_ADMIN_PORT: "8082"
+      # Resolution auth. Present ONLY in the trusted ingress; never mounted into a
+      # model-accessible container. Throwaway value: this stack is disposable.
+      INGRESS_ADMIN_TOKEN: "disposable-admin-token"
+      # The authenticated administrator identity (review #3): the audit actor is
+      # ALWAYS this, never a caller-supplied string.
+      INGRESS_ADMIN_IDENTITY: "admin"
+      REPLY_OWNER_ID: "555000111"
+      # Short lease so receipt-recovery tests (crash after commit) re-drive promptly.
+      RECEIPT_LEASE_S: "6"
+    volumes:
+      - trusted-spool:/var/spool/telegram
+    networks: [trusted, turn]
+    depends_on:
+      postgres: {condition: service_healthy}
+      fake-telegram: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+
+  # MODEL-ACCESSIBLE: conversational engine only.
+  openclaw:
+    <<: *app
+    command: ["python", "-u", "/app/openclaw_stub.py"]
+    environment:
+      TURN_ONLY: "1"
+    networks: [turn]
+
+  # MODEL-ACCESSIBLE: the MCP the model calls.
+  mcp:
+    <<: *app
+    command: ["python", "-u", "/app/mcp_stub.py"]
+    environment:
+      TURN_ONLY: "1"
+    networks: [turn]
+
+networks:
+  trusted:
+    internal: true
+  turn:
+    internal: true
+
+volumes:
+  trusted-spool:

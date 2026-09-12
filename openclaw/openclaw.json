@@ -1,0 +1,76 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "~/.openclaw/workspace/drhiro",
+      "model": {
+        "primary": "${OPENCLAW_MODEL}"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "trueforge": {
+        "api": "openai-completions",
+        "baseUrl": "http://tf-shim:3200/v1",
+        "apiKey": "${TRUEFORGE_API_KEY}",
+        "models": [
+          {
+            "id": "trueforge-drhiro",
+            "name": "drHiro via TrueForge (shim)"
+          }
+        ]
+      },
+      "qwen-local": {
+        "api": "openai-completions",
+        "baseUrl": "http://desktop-33cidmi:8000/v1",
+        "apiKey": "${QWEN_LOCAL_API_KEY}",
+        "models": [
+          {
+            "id": "Qwen3.6-27B-Q4_K_M_MTP.gguf",
+            "name": "Qwen 27B MTP (Windows box) - direct, fallback only"
+          }
+        ]
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "dmPolicy": "pairing",
+      "groupPolicy": "disabled",
+      "capabilities": {
+        "inlineButtons": "all"
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "drhiro": {
+        "command": "node",
+        "args": [
+          "/home/node/.openclaw/mcp/drhiro-mcp-server.js"
+        ],
+        "transport": "stdio",
+        "enabled": true,
+        "env": {
+          "DRHIRO_MCP_API": "${OPENCLAW_DRHIRO_API}",
+          "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}",
+          "DRHIRO_TELEGRAM_ID": "${DRHIRO_TELEGRAM_ID}"
+        }
+      }
+    }
+  },
+  "skills": {
+    "entries": {
+      "skill-drhiro": {
+        "enabled": true,
+        "env": {
+          "OPENCLAW_DRHIRO_API": "${OPENCLAW_DRHIRO_API}",
+          "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}"
+        }
+      }
+    }
+  }
+}

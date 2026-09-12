@@ -44,6 +44,8 @@ export default function Home() {
   const [balanceContext, setBalanceContext] = useState(false)
   const [activityBurned, setActivityBurned] = useState<number | null>(null)
   const [balanceKcal, setBalanceKcal] = useState<number | null>(null)
+  const [burnSpark, setBurnSpark] = useState<number[]>([])
+  const [balanceSpark, setBalanceSpark] = useState<number[]>([])
   const [goals, setGoals] = useState<Record<string, number>>({})
 
   useEffect(() => {
@@ -58,12 +60,17 @@ export default function Home() {
   }, [])
 
   const refreshSpecial = () => {
-    authClient.api('/energy-balance?days=1').then((r) => {
+    // days=8 so we can draw a real trailing 7-day sparkline for Activity / balance
+    authClient.api('/energy-balance?days=8').then((r) => {
       const pts = r.points ?? []
       if (pts.length) {
         const last = pts[pts.length - 1]
         setActivityBurned(last.burned_kcal ?? 0)
         setBalanceKcal(last.balance_kcal ?? 0)
+        const burns = pts.map((p: any) => p.burned_kcal).filter((v: any) => v != null)
+        const bals = pts.map((p: any) => p.balance_kcal).filter((v: any) => v != null)
+        setBurnSpark(burns.slice(-7))
+        setBalanceSpark(bals.slice(-7))
       }
     }).catch(() => {})
   }
@@ -85,8 +92,8 @@ export default function Home() {
   }
 
   const sparkFor = (m: MetricConfig): number[] | undefined => {
-    if (m.key === 'activity') return [22, 40, 18, 55, 30, 64, 48]
-    if (m.key === 'balance') return [-20, -35, -10, -45, -30, -50, -61]
+    if (m.key === 'activity') return burnSpark.length > 1 ? burnSpark : undefined
+    if (m.key === 'balance') return balanceSpark.length > 1 ? balanceSpark : undefined
     return undefined
   }
 

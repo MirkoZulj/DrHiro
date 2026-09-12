@@ -16,10 +16,20 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload
 
 from drhiro_api.db import get_db
+from drhiro_api.routers.telegram_ingress import require_model_writer_allowed
 from drhiro_api.deps import get_current_user
 from drhiro_api.food_search import nutrient_map, resolve_food
 from drhiro_api.models import Food, FoodCatalogItem, FoodNutrient, Meal, MealItem, Nutrient, User
 from drhiro_api.security import audit
+from drhiro_api.services.consumption import (
+    create_beverage_projection,
+    propagate_beverage_patch,
+    delete_beverage_item,
+    _delete_beverage_projection_for_meal_items,
+    copy_beverage_link,
+    _classify_beverage,
+)
+from drhiro_api.models import BeverageMeasurement, Measurement
 from drhiro_nutrition.catalog import FoodItem, NutrientTotals, scale_nutrients
 from drhiro_nutrition.composite import CompositeCatalog
 
@@ -32,6 +42,9 @@ class MealItemIn(BaseModel):
     quantity: float = Field(default=1.0, ge=0)
     unit: str | None = None
     grams: float | None = Field(default=None, ge=0)
+    # A millilitre figure is a VOLUME. It must never be copied into grams.
+    volume_ml: float | None = Field(default=None, ge=0)
+    beverage_category: str | None = None
 
 
 class MealCreateRequest(BaseModel):
@@ -211,7 +224,7 @@ def _recompute_totals(meal: Meal) -> dict:
     every item mutation (patch / add / delete) so the meal's kcal can never
     drift away from the sum of its items.
     """
-    kcal = protein = carbs = fat = fiber = 0.0
+    kcal = protein = carbs = fat = fiber = sodium = 0.0
     estimated = False
     for i in meal.items:
         if (i.confidence if i.confidence is not None else 0.0) < 0.8:
@@ -222,12 +235,14 @@ def _recompute_totals(meal: Meal) -> dict:
         carbs += n.get("carbs_g") or 0.0
         fat += n.get("fat_g") or 0.0
         fiber += n.get("fiber_g") or 0.0
+        sodium += n.get("sodium_mg") or 0.0
     return {
         "kcal": round(kcal, 1),
         "protein_g": round(protein, 1),
         "carbs_g": round(carbs, 1),
         "fat_g": round(fat, 1),
         "fiber_g": round(fiber, 1),
+        "sodium_mg": round(sodium, 1),
         "estimated": estimated,
     }
 
@@ -358,7 +373,7 @@ def _owned_meal(db: Session, meal_id: str, user: User) -> Meal:
     return meal
 
 
-@router.post("", response_model=MealOut)
+@router.post("", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     meal = Meal(
         user_id=user.id,
@@ -374,9 +389,12 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
 
     totals_kcal = totals_protein = totals_carbs = totals_fat = totals_fiber = 0.0
     estimated = False
+    bev_category = _classify_beverage
     for item in req.items:
         nutrients, conf, source = _lookup_nutrients(db, item, user)
         estimated = estimated or conf < 0.8
+        is_beverage = item.beverage_category is not None or bev_category(item.display_name) is not None
+        effective_volume = item.volume_ml if item.volume_ml else (item.grams if is_beverage else None)
         mi = MealItem(
             meal_id=meal.id,
             food_catalog_item_id=item.food_catalog_item_id,
@@ -384,11 +402,20 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
             quantity=item.quantity,
             unit=item.unit,
             grams=item.grams,
+            volume_ml=effective_volume if is_beverage else item.volume_ml,
+            beverage_category=item.beverage_category or (bev_category(item.display_name) if is_beverage else None),
             nutrients_json=nutrients,
             source=source or "manual",
             confidence=conf,
         )
         db.add(mi)
+        db.flush()
+        # For beverages, create the linked liquid projection via shared domain
+        # (same helper the add-item path uses) so created drinks count as hydration.
+        if is_beverage and effective_volume and effective_volume > 0:
+            create_beverage_projection(db, user.id, mi, float(effective_volume),
+                                      item.beverage_category or bev_category(item.display_name) or "water",
+                                      meal.eaten_at)
         if nutrients:
             totals_kcal += nutrients.get("kcal") or 0
             totals_protein += nutrients.get("protein_g") or 0
@@ -404,7 +431,7 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
     return _meal_to_out(meal)
 
 
-@router.post("/from-text", response_model=MealOut)
+@router.post("/from-text", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def create_meal_from_text(req: MealCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Natural-language meal logging.
 
@@ -422,7 +449,7 @@ class PhotoDraftOut(BaseModel):
     message: str = "Draft created. Confirm before this meal becomes official."
 
 
-@router.post("/from-photo", response_model=PhotoDraftOut)
+@router.post("/from-photo", response_model=PhotoDraftOut, dependencies=[Depends(require_model_writer_allowed)])
 async def create_meal_from_photo(
     file: UploadFile = File(...),
     caption: str | None = None,
@@ -464,7 +491,7 @@ class BarcodeRequest(BaseModel):
     quantity: float = Field(default=1.0, ge=0.1, le=100)
 
 
-@router.post("/from-barcode", response_model=MealOut)
+@router.post("/from-barcode", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
 def create_meal_from_barcode(req: BarcodeRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     cat = _catalog()
     try:
@@ -537,230 +564,9 @@ def list_meals(
     return [_meal_to_out(m) for m in meals]
 
 
-@router.get("/{meal_id}", response_model=MealOut)
-def get_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    meal = (
-        db.query(Meal)
-        .options(selectinload(Meal.items))
-        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
-        .first()
-    )
-    if not meal:
-        raise HTTPException(status_code=404, detail="Meal not found")
-    return _meal_to_out(meal)
-
-
-class MealPatchRequest(BaseModel):
-    meal_type: str | None = None
-    notes: str | None = None
-    eaten_at: datetime | None = None
-
-
-@router.patch("/{meal_id}", response_model=MealOut)
-def patch_meal(meal_id: str, req: MealPatchRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    meal = (
-        db.query(Meal)
-        .options(selectinload(Meal.items))
-        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
-        .first()
-    )
-    if not meal:
-        raise HTTPException(status_code=404, detail="Meal not found")
-    if req.meal_type is not None:
-        meal.meal_type = req.meal_type
-    if req.notes is not None:
-        meal.notes = req.notes
-    if req.eaten_at is not None:
-        meal.eaten_at = req.eaten_at
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-class MealItemPatch(BaseModel):
-    display_name: str | None = None
-    quantity: float | None = None
-    unit: str | None = None
-    grams: float | None = None
-    # Explicit food re-pointing: same identifier shape GET /meals/foods/search
-    # returns ("external_id"); "food_catalog_item_id" accepted as alias so a UI
-    # can pipe search results straight in.
-    food_catalog_item_id: str | None = None
-    external_id: str | None = None
-
-
-@router.patch("/{meal_id}/items/{item_id}", response_model=MealOut)
-def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Correct one item of a meal AND re-resolve its nutrition.
-
-    Editing grams/name/quantity without recalculating nutrients_json stored
-    silently-wrong calories (a 100g wine serving corrected to 150g kept the
-    100g kcal). We now re-run the same resolution create uses, then rewrite
-    the parent meal's totals from all items.
-    """
-    meal = _owned_meal(db, meal_id, user)
-    item = next((i for i in meal.items if str(i.id) == str(item_id)), None)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    old_display_name = item.display_name
-    if req.display_name is not None:
-        item.display_name = req.display_name
-    if req.quantity is not None:
-        item.quantity = req.quantity
-    if req.unit is not None:
-        item.unit = req.unit
-    if req.grams is not None:
-        item.grams = req.grams
-    food_ref = req.food_catalog_item_id or req.external_id
-    if food_ref:
-        # Explicit correction: re-point at the chosen food, re-resolve nutrition
-        # FROM THAT FOOD at the item's grams, adopt its canonical name.
-        if not _apply_explicit_food(db, item, food_ref):
-            raise HTTPException(status_code=404, detail=f"Food not found: {food_ref}")
-    else:
-        # Re-resolve nutrition for the NEW field values (scales per-100g by grams,
-        # keeps the Atwater kcal fallback).
-        _resolve_item_nutrition(db, item, user)
-    item.user_corrected = True
-    _sync_totals(db, meal)
-    audit(db, "user", str(user.id), user.id, "meals.item_patch", "meal", str(meal.id), {"item_id": str(item_id)})
-    # Detect a display_name CORRECTION: remember the original text before the
-    # rename so the LLM can learn a general rule from it.
-    original_text = None
-    corrected_food_id = None
-    if req.display_name is not None and req.display_name != old_display_name:
-        original_text = old_display_name
-        corrected_food_id = (
-            item.food_catalog_item_id
-            or getattr(item, "food_id", None)
-        )
-    db.commit()
-    db.refresh(meal)
-    if original_text:
-        # Fire-and-forget: a failed enqueue/extraction never fails the PATCH.
-        from drhiro_api.services.task_queue import enqueue
-
-        enqueue(
-            "drhiro",
-            "drhiro_worker.jobs_extract_food_rule.extract_food_rule_job",
-            str(user.id),
-            original_text,
-            req.display_name,
-            str(corrected_food_id) if corrected_food_id else None,
-        )
-    return _meal_to_out(meal)
-
-
-@router.post("/{meal_id}/items", response_model=MealOut)
-def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Add one item to an existing meal, resolving nutrition like create does."""
-    meal = _owned_meal(db, meal_id, user)
-    nutrients, conf, source = _lookup_nutrients(db, req, user)
-    mi = MealItem(
-        meal_id=meal.id,
-        food_catalog_item_id=req.food_catalog_item_id,
-        display_name=req.display_name,
-        quantity=req.quantity,
-        unit=req.unit,
-        grams=req.grams,
-        nutrients_json=nutrients,
-        source=source or "manual",
-        confidence=conf,
-    )
-    db.add(mi)
-    _sync_totals(db, meal)
-    audit(db, "user", str(user.id), user.id, "meals.item_add", "meal", str(meal.id), {"display_name": req.display_name})
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-@router.delete("/{meal_id}/items/{item_id}", response_model=MealOut)
-def remove_meal_item(meal_id: str, item_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Remove one item from a meal and recompute the meal's totals."""
-    meal = _owned_meal(db, meal_id, user)
-    item = next((i for i in meal.items if str(i.id) == str(item_id)), None)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    db.delete(item)
-    _sync_totals(db, meal)
-    audit(db, "user", str(user.id), user.id, "meals.item_remove", "meal", str(meal.id), {"item_id": str(item_id)})
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-@router.post("/{meal_id}/confirm", response_model=MealOut)
-def confirm_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    meal = (
-        db.query(Meal)
-        .options(selectinload(Meal.items))
-        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
-        .first()
-    )
-    if not meal:
-        raise HTTPException(status_code=404, detail="Meal not found")
-    meal.status = "confirmed"
-    meal.confirmed_at = datetime.now()
-    meal.confidence = 1.0
-    audit(db, "user", str(user.id), user.id, "meals.confirm", "meal", str(meal.id))
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-@router.post("/{meal_id}/copy", response_model=MealOut)
-def copy_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    source = (
-        db.query(Meal)
-        .options(selectinload(Meal.items))
-        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
-        .first()
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="Meal not found")
-    meal = Meal(
-        user_id=user.id,
-        eaten_at=datetime.now(),
-        meal_type=source.meal_type,
-        status="confirmed",
-        input_method="copy",
-        notes=source.notes,
-        totals_json=source.totals_json,
-        confidence=1.0,
-    )
-    db.add(meal)
-    db.flush()
-    for i in source.items:
-        db.add(
-            MealItem(
-                meal_id=meal.id,
-                food_catalog_item_id=i.food_catalog_item_id,
-                display_name=i.display_name,
-                quantity=i.quantity,
-                unit=i.unit,
-                grams=i.grams,
-                nutrients_json=i.nutrients_json,
-                source=i.source,
-                confidence=i.confidence,
-            )
-        )
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-@router.delete("/{meal_id}")
-def delete_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    meal = db.query(Meal).filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id).first()
-    if not meal:
-        raise HTTPException(status_code=404, detail="Meal not found")
-    meal.status = "deleted"
-    audit(db, "user", str(user.id), user.id, "meals.delete", "meal", str(meal.id))
-    db.commit()
-    return {"ok": True}
-
-
+# Food-catalog search. Declared BEFORE the generic /{meal_id} route so the
+# literal "foods" segment is not captured as a meal_id (FastAPI matches routes
+# in declaration order; a UUID parse of "foods" would 500).
 @router.get("/foods/search")
 def search_foods(q: str = Query(min_length=1), limit: int = 10, user: User = Depends(get_current_user)):
     cat = _catalog()
@@ -802,6 +608,323 @@ def food_by_barcode(barcode: str, user: User = Depends(get_current_user)):
         "fat_g_per_100g": item.fat_g_per_100g,
         "barcode": item.barcode,
     }
+
+
+@router.get("/{meal_id}", response_model=MealOut)
+def get_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    meal = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    return _meal_to_out(meal)
+
+
+class MealPatchRequest(BaseModel):
+    meal_type: str | None = None
+    notes: str | None = None
+    eaten_at: datetime | None = None
+
+
+@router.patch("/{meal_id}", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
+def patch_meal(meal_id: str, req: MealPatchRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    meal = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    if req.meal_type is not None:
+        meal.meal_type = req.meal_type
+    if req.notes is not None:
+        meal.notes = req.notes
+    if req.eaten_at is not None:
+        meal.eaten_at = req.eaten_at
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+class MealItemPatch(BaseModel):
+    display_name: str | None = None
+    quantity: float | None = None
+    unit: str | None = None
+    grams: float | None = None
+    # Explicit food re-pointing: same identifier shape GET /meals/foods/search
+    # returns ("external_id"); "food_catalog_item_id" accepted as alias so a UI
+    # can pipe search results straight in.
+    food_catalog_item_id: str | None = None
+    external_id: str | None = None
+
+
+@router.patch("/{meal_id}/items/{item_id}", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
+def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Correct one item of a meal AND re-resolve its nutrition.
+
+    Editing grams/name/quantity without recalculating nutrients_json stored
+    silently-wrong calories (a 100g wine serving corrected to 150g kept the
+    100g kcal). We now re-run the same resolution create uses, then rewrite
+    the parent meal's totals from all items.
+    """
+    meal = _owned_meal(db, meal_id, user)
+    item = next((i for i in meal.items if str(i.id) == str(item_id)), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    old_display_name = item.display_name
+    old_grams = item.grams
+    if req.display_name is not None:
+        item.display_name = req.display_name
+    if req.quantity is not None:
+        item.quantity = req.quantity
+    if req.unit is not None:
+        item.unit = req.unit
+    if req.grams is not None:
+        item.grams = req.grams
+    food_ref = req.food_catalog_item_id or req.external_id
+    if food_ref:
+        # Explicit correction: re-point at the chosen food, re-resolve nutrition
+        # FROM THAT FOOD at the item's grams, adopt its canonical name.
+        if not _apply_explicit_food(db, item, food_ref):
+            raise HTTPException(status_code=404, detail=f"Food not found: {food_ref}")
+    else:
+        # Re-resolve nutrition for the NEW field values (scales per-100g by grams,
+        # keeps the Atwater kcal fallback).
+        _resolve_item_nutrition(db, item, user)
+    item.user_corrected = True
+
+    # Propagate beverage changes to linked Measurement (volume/category) via
+    # shared domain so the liquid projection stays consistent.
+    propagate_beverage_patch(db, user.id, meal_id, item, old_grams)
+
+    _sync_totals(db, meal)
+    audit(db, "user", str(user.id), user.id, "meals.item_patch", "meal", str(meal.id), {"item_id": str(item_id)})
+    # Detect a display_name CORRECTION: remember the original text before the
+    # rename so the LLM can learn a general rule from it.
+    original_text = None
+    corrected_food_id = None
+    if req.display_name is not None and req.display_name != old_display_name:
+        original_text = old_display_name
+        corrected_food_id = (
+            item.food_catalog_item_id
+            or getattr(item, "food_id", None)
+        )
+    db.commit()
+    db.refresh(meal)
+    if original_text:
+        # Fire-and-forget: a failed enqueue/extraction never fails the PATCH.
+        from drhiro_api.services.task_queue import enqueue
+
+        enqueue(
+            "drhiro",
+            "drhiro_worker.jobs_extract_food_rule.extract_food_rule_job",
+            str(user.id),
+            original_text,
+            req.display_name,
+            str(corrected_food_id) if corrected_food_id else None,
+        )
+    return _meal_to_out(meal)
+
+
+@router.post("/{meal_id}/items", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
+def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Add one item to an existing meal, resolving nutrition like create does.
+
+    For beverages, also creates the liquid Measurement + BeverageMeasurement
+    projection so the drink contributes to the water tile and the meal
+    carries a consistent projection (delegates to ``create_beverage_projection``).
+    """
+    meal = _owned_meal(db, meal_id, user)
+    nutrients, conf, source = _lookup_nutrients(db, req, user)
+
+    # Detect beverage: explicit food_catalog_item_id won't classify, but if
+    # _lookup_nutrients matched a liquid food, the source is "usda" with
+    # is_liquid — we still rely on _classify_beverage on the display_name.
+    from drhiro_api.services.consumption import _classify_beverage
+    bev_category = _classify_beverage(req.display_name)
+    is_beverage = bev_category is not None
+
+    # For beverages, use the separately supplied volume_ml; only derive
+    # volume from grams when no explicit ml value is supplied.
+    effective_volume = req.volume_ml if req.volume_ml else (req.grams if is_beverage else None)
+    mi = MealItem(
+        meal_id=meal.id,
+        food_catalog_item_id=req.food_catalog_item_id,
+        display_name=req.display_name,
+        quantity=req.quantity,
+        unit=req.unit,
+        grams=req.grams,
+        nutrients_json=nutrients,
+        source=source or "manual",
+        confidence=conf,
+        beverage_category=bev_category,
+        volume_ml=effective_volume,
+    )
+    db.add(mi)
+    db.flush()
+
+    # For beverages, create the linked liquid projection via shared domain
+    if is_beverage and effective_volume and effective_volume > 0:
+        create_beverage_projection(db, user.id, mi, float(effective_volume), bev_category, meal.eaten_at)
+
+    _sync_totals(db, meal)
+    audit(db, "user", str(user.id), user.id, "meals.item_add", "meal", str(meal.id), {"display_name": req.display_name})
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+@router.delete("/{meal_id}/items/{item_id}", response_model=MealOut)
+def remove_meal_item(meal_id: str, item_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Remove one item from a meal, recomputing the meal's totals.
+
+    For beverages, delegates to ``delete_beverage_item`` which also removes
+    the linked BeverageMeasurement + Measurement so no liquid row is orphaned.
+    """
+    meal = _owned_meal(db, meal_id, user)
+    item = next((i for i in meal.items if str(i.id) == str(item_id)), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # If the item is a beverage, delegate to the shared domain so the linked
+    # BeverageMeasurement + Measurement are removed atomically (no orphan).
+    bev = None
+    from drhiro_api.services.consumption import _classify_beverage
+    if item.beverage_category or _classify_beverage(item.display_name):
+        bev = True
+    if bev:
+        delete_beverage_item(db, user.id, meal_id, item_id)
+        # delete_beverage_item already recomputes meal totals; refresh + return
+        db.flush()
+        db.expire(meal, ["items"])
+        _sync_totals(db, meal)
+        audit(db, "user", str(user.id), user.id, "meals.item_remove", "meal", str(meal.id), {"item_id": str(item_id)})
+        db.commit()
+        db.refresh(meal)
+        return _meal_to_out(meal)
+
+    db.delete(item)
+    _sync_totals(db, meal)
+    audit(db, "user", str(user.id), user.id, "meals.item_remove", "meal", str(meal.id), {"item_id": str(item_id)})
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+@router.post("/{meal_id}/confirm", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
+def confirm_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    meal = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    meal.status = "confirmed"
+    meal.confirmed_at = datetime.now()
+    meal.confidence = 1.0
+    audit(db, "user", str(user.id), user.id, "meals.confirm", "meal", str(meal.id))
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+@router.post("/{meal_id}/copy", response_model=MealOut)
+def copy_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Copy a meal, including beverage liquid projections.
+
+    For each source item that has a linked BeverageMeasurement + Measurement,
+    the copy replicates the link so the copied drink carries a consistent
+    liquid projection (delegates to ``copy_beverage_link``).
+    """
+    source = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    meal = Meal(
+        user_id=user.id,
+        eaten_at=datetime.now(),
+        meal_type=source.meal_type,
+        status="confirmed",
+        input_method="copy",
+        notes=source.notes,
+        totals_json=source.totals_json,
+        confidence=1.0,
+    )
+    db.add(meal)
+    db.flush()
+    new_meal_id = meal.id
+    eaten_at = meal.eaten_at
+
+    for i in source.items:
+        new_mi = MealItem(
+            meal_id=new_meal_id,
+            food_catalog_item_id=i.food_catalog_item_id,
+            display_name=i.display_name,
+            quantity=i.quantity,
+            unit=i.unit,
+            grams=i.grams,
+            nutrients_json=i.nutrients_json,
+            source=i.source,
+            confidence=i.confidence,
+            beverage_category=i.beverage_category,
+            volume_ml=i.volume_ml,
+        )
+        db.add(new_mi)
+        db.flush()
+
+        # Replicate the BeverageMeasurement + Measurement for beverage items
+        if i.beverage_category or i.volume_ml:
+            copy_beverage_link(db, user.id, str(i.id), str(new_mi.id), eaten_at)
+
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+@router.delete("/{meal_id}")
+def delete_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    meal = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+
+    # Cascade to beverage liquid projections: remove linked BeverageMeasurement + Measurement
+    # for all beverage items in this meal so no orphaned liquid remains in the dashboard sum.
+    item_ids = [mi.id for mi in meal.items]
+    if item_ids:
+        bevs = db.query(BeverageMeasurement).filter(
+            BeverageMeasurement.meal_item_id.in_(item_ids)
+        ).all()
+        for bev in bevs:
+            db.query(Measurement).filter(
+                Measurement.id == bev.measurement_id,
+                Measurement.user_id == user.id,
+            ).delete(synchronize_session=False)
+        db.query(BeverageMeasurement).filter(
+            BeverageMeasurement.meal_item_id.in_(item_ids)
+        ).delete(synchronize_session=False)
+
+    # Hard-delete the meal and its items (cascade="all, delete-orphan" handles items)
+    meal.status = "deleted"
+    db.flush()
+    db.delete(meal)
+    audit(db, "user", str(user.id), user.id, "meals.delete", "meal", str(meal.id))
+    db.commit()
+    return {"ok": True}
 
 
 class RecipeRequest(BaseModel):

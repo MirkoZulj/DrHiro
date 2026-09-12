@@ -28,12 +28,12 @@ done < <(docker compose ps --all --format '{{.Name}} {{.Status}}' 2>/dev/null)
 # 2. TrueForge health
 if curl -sf -m 10 "$TF_BASE/healthz" >/dev/null 2>&1; then ok "TrueForge /healthz"; else bad "TrueForge /healthz unreachable"; fi
 
-# 3. drhiro-tools SSE endpoint (Qodo #4)
+# 3. drhiro-tools SSE endpoint (now on :3101; hardened drhiro-mcp owns :3100).
 # No `|| true` coercion: if curl cannot connect this branch must NOT claim success.
-if curl -sf -m 10 "http://localhost:3100/sse" >/dev/null 2>&1; then
-  ok "drhiro-tools SSE reachable on :3100"
+if curl -sf -m 10 "http://localhost:3101/sse" >/dev/null 2>&1; then
+  ok "drhiro-tools SSE reachable on :3101"
 else
-  bad "drhiro-tools not reachable on :3100"
+  bad "drhiro-tools not reachable on :3101"
 fi
 
 # 4. Telegram token valid + no webhook (secret-safe)

@@ -22,6 +22,7 @@ from drhiro_api.db import get_db
 from drhiro_api.deps import get_current_user
 from drhiro_api.models import DeviceConnection, IngestBatch, Measurement, User
 from drhiro_api.security import audit
+from drhiro_api.services.consumption import log_manual_liquid
 from drhiro_schema.metrics import HEALTH_CONNECT_RECORD_MAP, PLAUSIBLE_RANGES, MetricType
 from drhiro_schema.values import VALUE_SCHEMAS
 
@@ -263,6 +264,119 @@ def manual_water(req: ManualWaterRequest, user: User = Depends(get_current_user)
     return ManualResult(id=str(m.id), metric_type=MetricType.WATER, recorded_at=m.start_at)
 
 
+class ManualLiquidRequest(BaseModel):
+    """Reconciliation-aware manual liquid logging.
+
+    The agent model signals intent via request shape:
+      - Omit both source identity AND existing_item_id → AMBIGUOUS → CLARIFY
+        (unless `intent="new"` is set).
+      - Provide source identity (chat_id+message_id+bot_id) → SAME-EVENT:
+        replay saved result if already completed.
+      - Provide existing_item_id → RECONCILIATION: link to existing item.
+      - intent="new" (with no source identity / reference) → GENUINELY NEW drink.
+    """
+    amount_ml: int = Field(ge=0, le=10000)
+    measured_at: datetime | None = None
+    category: str = "water"
+    # Source identity (idempotent replay / same-event meal+liquid)
+    source: str = "telegram"
+    source_chat_id: str | None = None
+    source_message_id: str | None = None
+    source_bot_id: str | None = None
+    idempotency_key: str | None = None
+    # Explicit-reference reconciliation (also count that X as liquid)
+    existing_item_id: str | None = None
+    # Genuinely new drink context
+    display_name: str | None = None
+    notes: str | None = None
+    # Intent signaling
+    intent: str | None = None  # "new" for genuinely new drink; None = ambiguous
+
+
+class ManualLiquidResult(BaseModel):
+    ok: bool
+    measurement_id: str | None = None
+    metric_type: str | None = None
+    recorded_at: datetime | None = None
+    reconciled: bool = False
+    clarify: bool = False
+    message: str | None = None
+    error: str | None = None
+
+
+@router.post("/manual/liquid", response_model=ManualLiquidResult)
+def manual_liquid(req: ManualLiquidRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Reconciliation-aware manual liquid logging.
+
+    Routes through consumption.log_manual_liquid which enforces:
+      - Same-event / retry → replay saved result (no new row).
+      - Explicit reference → link to existing item (no second row).
+      - Genuinely new drink → new consumption with volume AND calories.
+      - Ambiguous → CLARIFY response (nothing written).
+    """
+    cat = req.category if req.category in LIQUID_CATEGORIES else "water"
+    result = log_manual_liquid(
+        db=db,
+        user_id=str(user.id),
+        amount_ml=float(req.amount_ml),
+        category=cat,
+        source=req.source,
+        source_chat_id=req.source_chat_id,
+        source_message_id=req.source_message_id,
+        source_bot_id=req.source_bot_id,
+        idempotency_key=req.idempotency_key,
+        existing_item_id=req.existing_item_id,
+        display_name=req.display_name,
+        eaten_at=req.measured_at,
+        notes=req.notes,
+        intent=req.intent,
+    )
+
+    if not result.get("ok"):
+        return ManualLiquidResult(
+            ok=False,
+            error=result.get("error"),
+            message=result.get("message", "Could not log that right now."),
+        )
+
+    data = result.get("data", {})
+
+    # Clarify response (ambiguous intent)
+    if result.get("clarify"):
+        return ManualLiquidResult(
+            ok=False,
+            clarify=True,
+            message=result.get("message"),
+        )
+
+    # Reconciliation response
+    if data.get("reconciled"):
+        return ManualLiquidResult(
+            ok=True,
+            measurement_id=str(data.get("measurement_id")),
+            metric_type=MetricType.WATER,
+            recorded_at=req.measured_at or datetime.now(),
+            reconciled=True,
+            message=result.get("message"),
+        )
+
+    # New drink / same-event replay response
+    items = data.get("items", [])
+    measurement_id = None
+    for it in items:
+        if it.get("measurement_id"):
+            measurement_id = str(it["measurement_id"])
+            break
+
+    return ManualLiquidResult(
+        ok=True,
+        measurement_id=measurement_id,
+        metric_type=MetricType.WATER,
+        recorded_at=req.measured_at or datetime.now(),
+        message=result.get("message"),
+    )
+
+
 class ManualTextRequest(BaseModel):
     text: str = Field(min_length=1)
 
@@ -294,7 +408,16 @@ _GLASSES_RE = re.compile(r"\b(\d+)\s+glass(?:es)?\b", re.IGNORECASE)
 # value_json = {"amount_ml": N, "category": <liquid_category>}.
 # Old rows have no category -> treated as "water".
 LIQUID_CATEGORIES = [
-    "water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol",
+    "water",
+    # canonical beverage categories (what the user actually drank). The
+    # dashboard folds these into the legacy non_alcoholic/alcohol buckets for
+    # the chart, but they are stored distinctly so the drinks list can name
+    # them. Before this, juice/coffee/tea/soda/milk all stored as one
+    # undifferentiated "non_alcoholic".
+    "juice", "coffee", "tea", "soda", "milk", "smoothie", "broth",
+    # legacy names (still accepted for old rows / manual callers)
+    "non_alcoholic", "beer", "wine", "spirits", "other_alcohol",
+    "alcohol", "other",
 ]
 # Keyword -> category, evaluated in order (most specific first). Croatian +
 # English keywords. Each value is a compiled regex matched as a word boundary
@@ -308,8 +431,18 @@ _LIQUID_KEYWORDS: list[tuple[str, re.Pattern]] = [
     ("beer", re.compile(r"\b(?:beer|pivo|lager|ale|stout|heineken|ozujsko|karlovačko|karlovacko|točeno|toceno|radler)\b", re.IGNORECASE)),
     # other alcoholic (cocktails, liqueurs, cider)
     ("other_alcohol", re.compile(r"\b(?:cocktail|koktel|cider|jabolčnik|jabolcnik|liqueur|liker|aperol|martini|baileys|amaretto|mojito|negroni|spritz)\b", re.IGNORECASE)),
-    # non-alcoholic beverages (coffee, tea, juice, soda, milk, energy, ...)
-    ("non_alcoholic", re.compile(r"\b(?:coffee|kava|cappuccino|latte|tea|čaj|caj|ice\s*tea|juice|sok|soda|cola|coke|coca|fanta|sprite|smoothie|shake|milk|mlijeko|mliko|energy|redbull|monster|cedevita|limunada|nectar)\b", re.IGNORECASE)),
+    # Canonical beverages. These come BEFORE the non_alcoholic catch-all so the
+    # stored category says what was drunk ("juice"), not just "not alcohol".
+    # The dashboard folds each into the legacy non_alcoholic bucket for the
+    # chart, so the tile/chart grouping is unchanged.
+    ("juice", re.compile(r"\b(?:juice|sok|nectar|cedevita|limunada)\b", re.IGNORECASE)),
+    ("coffee", re.compile(r"\b(?:coffee|kava|cappuccino|latte|espresso|macchiato|frappe)\b", re.IGNORECASE)),
+    ("tea", re.compile(r"\b(?:tea|čaj|caj|ice\s*tea)\b", re.IGNORECASE)),
+    ("soda", re.compile(r"\b(?:soda|cola|coke|coca|fanta|sprite|energy|redbull|monster)\b", re.IGNORECASE)),
+    ("milk", re.compile(r"\b(?:milk|mlijeko|mliko)\b", re.IGNORECASE)),
+    ("smoothie", re.compile(r"\b(?:smoothie|shake)\b", re.IGNORECASE)),
+    # anything else non-alcoholic
+    ("non_alcoholic", re.compile(r"\b(?:beverage|drink|pice|piće)\b", re.IGNORECASE)),
     # water (lowest priority)
     ("water", re.compile(r"\b(?:water|voda|mineral)\b", re.IGNORECASE)),
 ]

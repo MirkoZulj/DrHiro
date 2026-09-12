@@ -103,6 +103,26 @@ def _build_approval_prompt(pending: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _summarize_ingress_outcome(outcome: dict) -> str:
+    """Human reply for a trusted-ingress consumption result."""
+    result = outcome.get("result") or {}
+    data = result.get("data") or {}
+    totals = data.get("totals") or {}
+    if not totals:
+        return result.get("message") or "Logged."
+    parts = []
+    if totals.get("kcal") is not None:
+        parts.append(f"{round(float(totals['kcal']))} kcal")
+    for key, label in (("protein_g", "protein"), ("carbs_g", "carbs"), ("fat_g", "fat")):
+        if totals.get(key) is not None:
+            parts.append(f"{round(float(totals[key]), 1)}g {label}")
+    prefix = "Updated" if outcome.get("status") == "revised" else "Logged"
+    line = f"{prefix}: " + ", ".join(parts)
+    if data.get("nutrition_complete") is False:
+        line += "\n(Some items had no nutrition data — those are marked unknown, not zero.)"
+    return line
+
+
 class Bridge:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -118,6 +138,13 @@ class Bridge:
         self._pending_approvals: dict[int, list[dict]] = {}
         self._pending_revoke: dict[int, str] = {}  # chat_id -> device_id awaiting confirm
         self._running = True
+        # T1: verified bot identity + trusted ingress client (None when disabled).
+        self._bot_id: str = ""
+        self._ingress = None
+        if cfg.telegram_ingress_enabled and cfg.ingress_secret:
+            from .ingress import IngressClient
+
+            self._ingress = IngressClient(cfg.ingress_api_url, cfg.ingress_secret)
 
     # ------------------------------------------------------------------ #
     def start(self) -> None:
@@ -128,6 +155,10 @@ class Bridge:
         me = self.tg.get_me()
         log.info("Connected to Telegram bot username=%s", me.get("username"))
         log.info("Long-polling transport selected. No webhook will be used.")
+
+        # 1b. Establish the VERIFIED bot identity. Fail closed on mismatch:
+        # a surface label is never enough, and two different ids are ambiguous.
+        self._bot_id = self._verify_bot_id(me)
 
         # 2. Enforce webhook/polling exclusivity BEFORE polling.
         if not self.tg.ensure_polling_only():
@@ -155,6 +186,66 @@ class Bridge:
     def _stop(self, *_) -> None:
         log.info("Shutting down bridge.")
         self._running = False
+
+    # ------------------------------------------------------------------ #
+    # T1 trusted ingress
+    # ------------------------------------------------------------------ #
+
+    def _verify_bot_id(self, me: dict) -> str:
+        """Establish the verified bot identity from getMe, failing closed.
+
+        A configurable account label is not sufficient. If provisioning pinned
+        an id and it disagrees with getMe, the two are ambiguous and we refuse.
+        """
+        verified = str(me.get("id") or "")
+        if not verified:
+            raise RuntimeError("getMe returned no bot id")
+        configured = str(self.cfg.telegram_bot_id or "")
+        if configured and configured != verified:
+            raise RuntimeError(
+                "TELEGRAM_BOT_ID does not match the verified getMe id; refusing to start"
+            )
+        return verified
+
+    def _handle_trusted_ingress(self, update: dict) -> bool:
+        """Route an update through the trusted worker. True if fully handled.
+
+        Consumption is owned by the trusted worker. A turn with nothing
+        consumption-shaped is handed back to the conversational path.
+        """
+        from .ingress import extract_event
+
+        ev = extract_event(update, self._bot_id)
+        if ev is None:
+            return False
+
+        outcome = self._ingress.deliver(ev)
+        status = outcome.get("status")
+
+        if status == "no_consumption":
+            # Not a consumption turn — let the normal conversation handle it.
+            return False
+
+        if status in ("completed", "replayed", "revised"):
+            reply = _summarize_ingress_outcome(outcome)
+            if reply:
+                self.tg.send_message(int(ev.chat_id), reply, parse_mode=None)
+            return True
+
+        if status == "needs_clarification":
+            self.tg.send_message(
+                int(ev.chat_id),
+                "I couldn't pin down that entry, so I haven't logged anything. "
+                "Could you rephrase it with amounts?",
+                parse_mode=None,
+            )
+            return True
+
+        if status in ("rejected", "ignored", "cancelled"):
+            log.info("Ingress outcome %s for chat %s", status, ev.chat_id)
+            return True
+
+        return False
 
     def _poll_loop(self) -> None:
         offset: int | None = None
@@ -194,10 +285,17 @@ class Bridge:
                         chat_id, "Sorry, you are not authorized to use this bot."
                     )
                 return
+            data = (cb.get("data") or "")
+            if self._ingress is not None and data.split(":", 1)[0] in ("confirm", "cancel"):
+                try:
+                    if self._handle_trusted_ingress(update):
+                        return
+                except Exception as e:  # noqa: BLE001
+                    log.warning("trusted ingress callback failed: %s", e)
             self._handle_callback(cb)
             return
 
-        message = update.get("message")
+        message = update.get("message") or update.get("edited_message")
         if not message:
             return
         chat_id = (message.get("chat") or {}).get("id")
@@ -234,6 +332,20 @@ class Bridge:
         # Route bot commands BEFORE the agent loop.
         if text.startswith("/"):
             if self._handle_command(chat_id, text):
+                return
+
+        # T1: the trusted worker owns consumption. If it handles the turn we
+        # never reach the model, so the model cannot log a second consumption.
+        # If trusted ingress fails (e.g. ambiguous HTTP failure after a possible
+        # commit), we MUST NOT fall through to the model path -- that would
+        # risk writing a duplicate consumption via the model-backed writer.
+        if self._ingress is not None:
+            try:
+                if self._handle_trusted_ingress(update):
+                    return
+            except Exception as e:  # noqa: BLE001
+                log.warning("trusted ingress failed, NOT falling back to model: %s", e)
+                self.tg.send_message(chat_id, "Sorry, your message couldn't be processed right now. Please try again.")
                 return
 
         # Start a typing keepalive in the background for long turns.

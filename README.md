@@ -120,6 +120,15 @@ All values are provided interactively by `install.sh` and written to a protected
 | `EXPORT_DIR` | No | Where saved visit briefs are exported (default `/data/exports`). |
 | `APK_DIR` | No | Host directory holding the signed Bridge APK + sidecar (default `./apk`). |
 | `DRHIRO_DEBUG` | No | `true` enables debug logs (default `false`). |
+| `DRHIRO_TELEGRAM_ID` | No* | Numeric Telegram ID the gateway is paired with. The bridge uses ONLY this value as the Telegram identity; it never trusts a model-supplied divergent id. See [docs/IDENTITY.md](docs/IDENTITY.md).
+
+> *`DRHIRO_TELEGRAM_ID` is required when the OpenClaw assistant (tf-shim + MCP) is deployed — without it the bridge fails closed and every tool call returns "no configured identity".
+
+## Single-tenant identity model
+
+The drHiro gateway is **single-tenant**: each gateway instance serves exactly **one paired Telegram identity** (`DRHIRO_TELEGRAM_ID`). The MCP bridge intentionally forces the configured identity and silently discards any divergent `telegram_id` the model provides. This prevents a confused or manipulated agent from acting as a different paired user.
+
+This is a deliberate design decision. Supporting multiple users on a single gateway would require per-session bound identities (a separate identity-resolution path binding each verified session to its own stored identity), which is out of scope for the single-tenant deployment model. To serve multiple users, deploy separate gateway instances, each with its own `DRHIRO_TELEGRAM_ID`.
 
 ## Roadmap
 

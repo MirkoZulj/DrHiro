@@ -79,6 +79,9 @@ class LogoutRequest(BaseModel):
 # In-memory device codes and link codes (single-instance; production uses Redis)
 _DEVICE_CODES: dict[str, dict] = {}
 _LINK_CODES: dict[str, dict] = {}
+# In-memory refresh-token revocation store: {token_hash: {"expires_at": float, "revoked": bool}}
+# Production should use a TTL-backed store (Redis) or a DB table.
+_REVOKED_REFRESH_TOKENS: dict[str, dict] = {}
 
 
 def mint_web_login_code(telegram_id: str) -> str:
@@ -88,9 +91,16 @@ def mint_web_login_code(telegram_id: str) -> str:
     POST /auth/telegram-link/complete. Unlike /telegram-link/start this does
     NOT require an unpaired identity — it is used by the OpenClaw bot to give
     an already-paired user a one-click dashboard link. Returns the code.
+
+    The code stores an ABSOLUTE UTC expiry timestamp (``expires_at``) so the
+    completion path can validate expiry uniformly regardless of which mint
+    function produced the code.
     """
     link_code = uuid.uuid4().hex[:10]
-    _LINK_CODES[link_code] = {"telegram_id": telegram_id, "expires": 1800}
+    _LINK_CODES[link_code] = {
+        "telegram_id": telegram_id,
+        "expires_at": datetime.now(timezone.utc).timestamp() + 1800,
+    }
     return link_code
 
 
@@ -128,13 +138,16 @@ def auth_telegram_miniapp(req: TelegramMiniappRequest, db: Session = Depends(get
 
 
 @router.post("/telegram-link/start", response_model=TelegramLinkStartResponse)
-def telegram_link_start(req: TelegramLinkStartRequest, db: Session = Depends(get_db)):
-    """Start pairing a Telegram identity to an existing account.
+def telegram_link_start(req: TelegramLinkStartRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Start pairing a Telegram identity to the authenticated requesting user.
 
-    Called from the OpenClaw gateway when a user first messages the bot
-    and no pairing exists. Returns a short code the user enters in the
-    web/Mini App to complete pairing.
+    Requires authentication. The requesting user already owns the web
+    session; this just creates a code they can hand to the Telegram bot
+    to bind the two identities. Do not accept arbitrary telegram_id from
+    unauthenticated callers.
     """
+    # Only allow pairing a telegram identity to the already-authenticated user
+    # they're currently logged in as.
     identity = (
         db.query(ExternalIdentity)
         .filter(ExternalIdentity.provider == "telegram", ExternalIdentity.provider_subject == req.telegram_id)
@@ -143,22 +156,42 @@ def telegram_link_start(req: TelegramLinkStartRequest, db: Session = Depends(get
     if identity:
         raise HTTPException(status_code=409, detail="Telegram identity already paired")
     link_code = uuid.uuid4().hex[:10]
-    _LINK_CODES[link_code] = {"telegram_id": req.telegram_id, "expires": 1800}
+    _LINK_CODES[link_code] = {"telegram_id": req.telegram_id, "requesting_user_id": str(user.id), "expires_at": datetime.now(timezone.utc).timestamp() + 1800}
     return TelegramLinkStartResponse(link_code=link_code)
 
 
 @router.post("/telegram-link/complete", response_model=TokenResponse)
 def telegram_link_complete(req: TelegramLinkCompleteRequest, db: Session = Depends(get_db)):
-    """Complete pairing: the authenticated web user enters the code shown
-    by the bot."""
+    """Complete a link code, issuing tokens for the Telegram identity it was
+    bound to.
+
+    This endpoint is intentionally UNauthenticated — the one-time code IS the
+    credential (passwordless magic-link login). The code was bound to a
+    specific Telegram identity (``telegram_id``) at mint time, so an attacker
+    who steals a code can only log in as the identity it was minted for, never
+    as an arbitrary victim.
+
+    Two flows converge here:
+      * **Passwordless login** (``mint_web_login_code``): an already-paired
+        user clicks a bot-DM'd link; tokens are issued for their existing
+        account.
+      * **Pairing** (``telegram-link/start``): a web-authenticated user enters
+        a code to bind a Telegram identity to their account. The code carries
+        the ``requesting_user_id`` so the identity is paired to the user who
+        started the flow.
+    """
     code = _LINK_CODES.get(req.link_code)
     if not code:
         raise HTTPException(status_code=404, detail="Link code not found or expired")
-    # This endpoint is called with the web user's token normally; for the
-    # MVP we accept the code alone when issued. In production the caller
-    # must present a valid web session token (checked in the router guard).
+    # Enforce code expiry (absolute UTC timestamp, uniform across all mints)
+    if datetime.now(timezone.utc).timestamp() > code["expires_at"]:
+        _LINK_CODES.pop(req.link_code, None)
+        raise HTTPException(status_code=404, detail="Link code expired")
     telegram_id = code["telegram_id"]
-    # Find an existing drHiro user by that telegram identity (or create).
+    _LINK_CODES.pop(req.link_code, None)  # one-time use: consume before work
+
+    # Resolve the user by the Telegram identity the code was BOUND TO, never
+    # from any caller-supplied value. This closes the identity-claim hole.
     identity = (
         db.query(ExternalIdentity)
         .filter(ExternalIdentity.provider == "telegram", ExternalIdentity.provider_subject == telegram_id)
@@ -166,14 +199,23 @@ def telegram_link_complete(req: TelegramLinkCompleteRequest, db: Session = Depen
     )
     if identity:
         user = db.get(User, identity.user_id)
+        if not user or user.status != "active":
+            raise HTTPException(status_code=409, detail="Telegram identity paired to an inactive account")
     else:
-        user = User(display_name="Telegram user", timezone="UTC")
-        db.add(user)
-        db.flush()
+        # Not yet paired. For the pairing flow, bind to the requesting user;
+        # for a fresh magic-link signup, create a new user.
+        requesting_user_id = code.get("requesting_user_id")
+        if requesting_user_id:
+            user = db.get(User, uuid.UUID(requesting_user_id))
+            if not user:
+                raise HTTPException(status_code=409, detail="Requesting user no longer exists")
+        else:
+            user = User(display_name="drHiro user", timezone="UTC")
+            db.add(user)
+            db.flush()
         db.add(ExternalIdentity(provider="telegram", provider_subject=telegram_id, user_id=user.id, verified_at=datetime.now(timezone.utc)))
-        db.commit()
-        db.refresh(user)
-    _LINK_CODES.pop(req.link_code, None)
+        db.flush()
+
     access = create_access_token(user.id)
     refresh, _ = create_refresh_token(user.id)
     audit(db, "user", telegram_id, user.id, "auth.telegram_link_complete", "user", str(user.id))
@@ -189,7 +231,7 @@ def android_device_code(req: DeviceCodeRequest, user: User = Depends(get_current
     _DEVICE_CODES[device_code] = {
         "installation_id": installation_id,
         "user_id": str(user.id),
-        "expires": 600,
+        "expires_at": datetime.now(timezone.utc).timestamp() + 600,  # absolute UTC timestamp
     }
     audit(db, "user", str(user.id), user.id, "auth.device_code_issued", "device", installation_id)
     db.commit()
@@ -208,6 +250,10 @@ def android_exchange(req: DeviceExchangeRequest, db: Session = Depends(get_db)):
     entry = _DEVICE_CODES.get(req.device_code)
     if not entry:
         raise HTTPException(status_code=401, detail="Invalid device code")
+    # Enforce absolute expiry timestamp
+    if datetime.now(timezone.utc).timestamp() > entry["expires_at"]:
+        _DEVICE_CODES.pop(req.device_code, None)
+        raise HTTPException(status_code=401, detail="Device code expired")
     user_id = uuid.UUID(entry["user_id"])
     user = db.get(User, user_id)
     if not user or user.status != "active":
@@ -251,16 +297,27 @@ def refresh(req: RefreshRequest, db: Session = Depends(get_db)):
         user_id = uuid.UUID(payload["sub"])
     except (KeyError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid refresh token subject")
+    # Check if this refresh token has been revoked (e.g. on logout)
+    token_hash = hash_refresh_token(req.refresh_token)
+    revoked_entry = _REVOKED_REFRESH_TOKENS.get(token_hash)
+    if revoked_entry and revoked_entry.get("revoked"):
+        raise HTTPException(status_code=401, detail="Refresh token has been revoked")
     user = db.get(User, user_id)
     if not user or user.status != "active":
         raise HTTPException(status_code=403, detail="User inactive")
+    # Revoke the old refresh token (rotation) and issue a new one
+    _REVOKED_REFRESH_TOKENS[token_hash] = {"revoked": True, "expires_at": payload.get("exp", 0)}
     access = create_access_token(user.id)
-    refresh, _ = create_refresh_token(user.id)
-    return TokenResponse(access_token=access, refresh_token=refresh, user_id=str(user.id))
+    new_refresh, new_hash = create_refresh_token(user.id)
+    return TokenResponse(access_token=access, refresh_token=new_refresh, user_id=str(user.id))
 
 
 @router.post("/logout")
 def logout(req: LogoutRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Revoke the supplied refresh token so it cannot be replayed
+    if req.refresh_token:
+        token_hash = hash_refresh_token(req.refresh_token)
+        _REVOKED_REFRESH_TOKENS[token_hash] = {"revoked": True, "expires_at": 0}
     audit(db, "user", str(user.id), user.id, "auth.logout", "user", str(user.id))
     db.commit()
     return {"ok": True}

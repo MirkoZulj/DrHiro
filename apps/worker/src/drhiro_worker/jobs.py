@@ -13,6 +13,7 @@ from drhiro_api.config import get_settings
 from drhiro_api.db import SessionLocal
 from drhiro_api.models import Alert, Measurement, Reminder, ReminderOccurrence, User
 from drhiro_api.services.alerts import recompute_alerts_for_user
+from sqlalchemy import update as sa_update
 
 
 def recompute_alerts(user_id: str) -> dict:
@@ -54,6 +55,8 @@ def deliver_reminder(occurrence_id: str) -> dict:
             return {"error": "occurrence not found"}
         if occ.status == "sent":
             return {"skipped": "already sent"}
+        if occ.status != "queued":
+            return {"skipped": f"status is {occ.status}"}
 
         reminder = db.query(Reminder).filter(Reminder.id == occ.reminder_id).first()
         if not reminder or not reminder.enabled:
@@ -91,8 +94,23 @@ def deliver_reminder(occurrence_id: str) -> dict:
         )
 
         if resp.status_code == 200:
-            occ.status = "sent"
-            occ.sent_at = datetime.now(timezone.utc)
+            # Conditional UPDATE: only transition to 'sent' if the row is still
+            # 'queued'. If the scheduler (or another process) has moved the row
+            # past 'queued' (e.g. to 'cancelled'), this UPDATE affects 0 rows and
+            # we skip the commit — a stale 'sent' write can never clobber a
+            # completed state.
+            result = db.execute(
+                sa_update(ReminderOccurrence)
+                .where(
+                    ReminderOccurrence.id == uuid.UUID(occurrence_id),
+                    ReminderOccurrence.status == "queued",
+                )
+                .values(status="sent", sent_at=datetime.now(timezone.utc))
+            )
+            if result.rowcount == 0:
+                # Someone else already transitioned this occurrence — do not
+                # overwrite their completed state.
+                return {"skipped": "occurrence no longer queued"}
             db.commit()
             return {"delivered": True}
         else:

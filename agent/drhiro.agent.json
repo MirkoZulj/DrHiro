@@ -12,6 +12,11 @@
         "enable_tools": ["@all"],
         "require_approval_for_tools": ["save_visit_brief"],
         "preload": true
+      },
+      {
+        "name": "drhiro-mcp",
+        "enable_tools": ["@all"],
+        "preload": true
       }
     ],
     "response_format": {

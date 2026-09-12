@@ -26,6 +26,42 @@ object ApiClient {
      *  onboarding); no private default is baked in. */
     var baseUrl: String = ""
 
+    /** Normalize the configured base URL (strip trailing slash). */
+    fun normalizedBaseUrl(): String = baseUrl.trimEnd('/')
+
+    private const val PREFS = "drhiro_bridge"
+    private const val PREF_BASE_URL = "api_base_url"
+
+    /** Persist a user-supplied server URL and set it for all API calls. */
+    fun configure(context: Context, url: String) {
+        val clean = url.trim().trimEnd('/')
+        require(clean.startsWith("http://") || clean.startsWith("https://")) {
+            "Server URL must start with http:// or https://"
+        }
+        baseUrl = clean
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putString(PREF_BASE_URL, clean).apply()
+    }
+
+    /** Load the saved server URL at app start; returns it and sets baseUrl. */
+    fun loadFromPrefs(context: Context): String {
+        val saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(PREF_BASE_URL, "") ?: ""
+        baseUrl = saved.trimEnd('/')
+        return baseUrl
+    }
+
+    /** Fail loudly rather than build a broken relative URL. */
+    private fun requireBaseUrl() {
+        if (baseUrl.isBlank()) throw IllegalStateException(
+            "No drHiro server URL configured. Enter it in the app before linking."
+        )
+    }
+
+
+    /** The /api/v1 mount prefix for the drHiro Core API. */
+    private const val API_V1_PREFIX = "/api/v1"
+
     @Serializable
     data class UploadResponse(
         val accepted: Int = 0,
@@ -68,6 +104,7 @@ object ApiClient {
         batchId: String,
         records: List<Map<String, Any?>>,
     ): UploadResponse {
+        requireBaseUrl()
         val body = buildJsonObject {
             put("installation_id", installationId)
             put("batch_id", batchId)
@@ -79,7 +116,7 @@ object ApiClient {
         }.toString()
 
         val request = Request.Builder()
-            .url("$baseUrl/ingest/health-connect/batch")
+            .url("${normalizedBaseUrl()}$API_V1_PREFIX/ingest/health-connect/batch")
             .addHeader("Authorization", "Bearer $accessToken")
             .addHeader("Content-Type", JSON)
             .post(body.toRequestBody(JSON.toMediaType()))
@@ -95,11 +132,12 @@ object ApiClient {
 
     /** Refresh the access token using the stored refresh token. */
     private fun refreshAccessToken(context: Context): String {
+        requireBaseUrl()
         val refresh = TokenStore.refreshToken(context)
             ?: throw IllegalStateException("no refresh token stored")
         val body = buildJsonObject { put("refresh_token", refresh) }.toString()
         val request = Request.Builder()
-            .url("$baseUrl/auth/refresh")
+            .url("${normalizedBaseUrl()}$API_V1_PREFIX/auth/refresh")
             .addHeader("Content-Type", JSON)
             .post(body.toRequestBody(JSON.toMediaType()))
             .build()

@@ -24,12 +24,24 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+import drhiro_event_envelope as eventenv
+
 TRUEFORGE_URL = os.environ.get("TRUEFORGE_URL", "http://trueforge:8790")
 AGENT_NAME = os.environ.get("TRUEFORGE_AGENT", "drhiro")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/3")
 MODEL_ID = os.environ.get("SHIM_MODEL_ID", "trueforge-drhiro")
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "600"))
 SESSION_TTL = int(os.environ.get("SESSION_TTL", str(60 * 60 * 24 * 90)))
+
+# R2 trusted-config identity. DRHIRO_BOT_ID is the VERIFIED Telegram bot id
+# (getMe.id) mapped from the channel account at provisioning. DRHIRO_EVENT_SECRET
+# is the HMAC signing key shared only with the minting adapter; it must live in
+# secret management, NEVER in source control or prompts.
+SERVICE = os.environ.get("DRHIRO_SERVICE", "drhiro")
+DRHIRO_BOT_ID = os.environ.get("DRHIRO_BOT_ID", "")
+EVENT_SECRET = os.environ.get("DRHIRO_EVENT_SECRET", "")
+EVENT_MAX_AGE_S = int(os.environ.get("DRHIRO_EVENT_MAX_AGE_S", "300"))
+EVENT_RECORD_TTL = int(os.environ.get("DRHIRO_EVENT_RECORD_TTL", str(60 * 60 * 24 * 7)))
 
 _redis = None
 
@@ -162,33 +174,175 @@ async def get_or_create_session(key: str) -> str:
     return session_id
 
 
-async def stash_user_text(text: str) -> None:
-    """Record the user's raw words for the MCP layer.
+async def stash_user_text(text: str, conversation_id: str = "") -> None:
+    """Record the user's raw words for the MCP layer, scoped per conversation.
 
     Qwen paraphrases when it calls tools and frequently drops the day words
     ("On Monday for dinner ..." becomes "200g chicken and 150g rice"), which
     would silently log the meal against today. The MCP server reads this key to
     recover the date phrase, so correctness does not depend on the model
     faithfully echoing the sentence.
+
+    conversation_id is the shim's stable conversation key. If empty/missing,
+    we DO NOT WRITE AT ALL — a global fallback would leak state across
+    concurrent users.
     """
     try:
         r = await redis_conn()
-        await r.set("tfshim:last_user_text", text, ex=900)
+        if not conversation_id:
+            return  # fail-safe: never fall back to a global key
+        await r.set(f"tfshim:last_user_text:{conversation_id}", text, ex=900)
     except Exception:
         pass
 
 
-async def run_turn(session_id: str, text: str) -> str:
+async def bind_event(event_id: str, *, input_digest: str, issued_at: int,
+                     bot_id: str, chat_id: str, message_id: str) -> None:
+    """Persist durable, run-scoped trusted context keyed by event_id.
+
+    NOT a shared 'latest event' record: each event has its own key, so
+    concurrent turns cannot overwrite one another. The record outlives the
+    envelope (EVENT_RECORD_TTL >> EVENT_MAX_AGE_S) so a fresh authenticated
+    retry of an old event still resolves its durable result even after the
+    envelope credentials expired. The MCP/API resolve event context from this
+    record (run-scoped transport); identity never arrives as model args.
+    """
+    r = await redis_conn()
+    payload = json.dumps({
+        "event_id": event_id,
+        "service": SERVICE,
+        "bot_id": bot_id,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "input_digest": input_digest,
+        "issued_at": issued_at,
+        "bound_at": int(time.time()),
+    })
+    await r.set(f"tfshim:event:{event_id}", payload, ex=EVENT_RECORD_TTL)
+
+
+async def _store_result(event_id: str, result: dict) -> None:
+    """Persist a completed model turn result keyed by event_id.
+
+    A later authenticated retry of the same event (e.g. due to a network
+    timeout) can replay this stored result instead of re-running the model
+    turn, avoiding duplicate side-effects.
+
+    IMPORTANT: this runs AFTER the model turn has completed. A cache-write
+    failure here must NOT be converted into an error response — doing so
+    would invite a client retry that re-runs the turn and double-executes
+    side-effects. Failures are logged and swallowed; only the dedup replay
+    on retry is lost.
+    """
+    try:
+        r = await redis_conn()
+        payload = json.dumps(result)
+        await r.set(f"tfshim:result:{event_id}", payload, ex=EVENT_RECORD_TTL)
+    except Exception as e:
+        print(f"[_store_result] cache store failed for {event_id}: {e!r}", flush=True)
+
+
+async def _try_claim_event(event_id: str) -> str | None:
+    """Atomically claim the right to run a turn for this event.
+
+    Uses SET NX (set-if-not-exists) so that among concurrent deliveries of
+    the same event, exactly ONE wins the claim and runs the model/tools.
+    The claim has a TTL so a failed owner cannot deadlock the event forever.
+
+    Returns a unique claim token on success (the caller must present it to
+    release), or None if another delivery holds it (or the cache is
+    unavailable — fail open so we don't block traffic, with an empty token).
+    """
+    try:
+        r = await redis_conn()
+        token = uuid.uuid4().hex
+        # SET NX: only sets if key does not exist. Returns True if set, None/False if not.
+        ok = await r.set(
+            f"tfshim:claim:{event_id}",
+            token,
+            nx=True,
+            ex=max(60, TURN_TIMEOUT),
+        )
+        if ok:
+            return token
+        return None  # another delivery owns it
+    except Exception as e:
+        print(f"[_try_claim_event] cache claim failed for {event_id}: {e!r}", flush=True)
+        # fail open: run rather than drop traffic on cache outage; return a
+        # sentinel so release is a no-op (nothing to compare against)
+        return ""
+
+
+# Lua script for atomic compare-and-delete: only delete the claim when the
+# stored value matches the presenting owner's token. Returns 1 if deleted,
+# 0 otherwise. Prevents a stale owner from deleting a successor's claim
+# after the original claim's TTL expired and a retry acquired a new one.
+_COWNER_RELEASE_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
+
+
+async def _release_claim(event_id: str, token: str) -> None:
+    """Release the claim after the turn completes (best-effort, ownership-aware).
+
+    Only deletes the claim when the stored value matches OUR token. If the
+    claim's TTL expired and a retry acquired a replacement claim (different
+    token), our release is a no-op — the successor's claim survives, so a
+    later delivery cannot start a new turn. The TTL remains the ultimate
+    safety net.
+    """
+    if not token:
+        return  # fail-open path (cache outage); nothing owned, nothing to release
+    try:
+        r = await redis_conn()
+        await r.eval(_COWNER_RELEASE_LUA, 1, f"tfshim:claim:{event_id}", token)
+    except Exception as e:
+        print(f"[_release_claim] cache release failed for {event_id}: {e!r}", flush=True)
+
+
+async def _get_stored_result(event_id: str) -> dict | None:
+    """Return a previously stored model turn result, or None if not present.
+
+    A cache outage during lookup is treated as "no cached result" so the
+    request proceeds to run the model turn rather than surfacing an
+    unhandled error to the client.
+    """
+    try:
+        r = await redis_conn()
+        raw = await r.get(f"tfshim:result:{event_id}")
+    except Exception as e:
+        print(f"[_get_stored_result] cache lookup failed for {event_id}: {e!r}", flush=True)
+        return None
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+async def run_turn(session_id: str, text: str, conversation_id: str = "") -> str:
     """POST a turn and accumulate the streamed assistant reply."""
-    await stash_user_text(text)
+    await stash_user_text(text, conversation_id=conversation_id)
     chunks: list[str] = []
     finished = False
+
+    # Carry the conversation id into the turn so the agent can pass it to
+    # tools via their conversation_id argument. This is the only conduit
+    # from the shim to the MCP server (the model's tool-call arguments).
+    turn_input = [{"type": "user.message", "content": text}]
+    if conversation_id:
+        turn_input.append({"type": "context", "content": f"drhiro_conversation_id={conversation_id}"})
 
     async with httpx.AsyncClient(timeout=TURN_TIMEOUT) as c:
         async with c.stream(
             "POST",
             f"{TRUEFORGE_URL}/api/v1/sessions/{session_id}/turns",
-            json={"input": [{"type": "user.message", "content": text}]},
+            json={"input": turn_input},
             headers={"Accept": "text/event-stream"},
         ) as stream:
             async for line in stream.aiter_lines():
@@ -326,26 +480,112 @@ async def chat_completions(request: Request):
             status_code=400,
         )
 
-    text = latest_user_message(body)
+    # ---- R2: extract, verify, and REMOVE the trusted event envelope before
+    # anything is forwarded to the model. This is the adapter seam. If the
+    # trusted config (bot id / signing key) is missing we FAIL CLOSED: a
+    # consumption event must never be processed without verified identity.
+    if not DRHIRO_BOT_ID or not EVENT_SECRET:
+        return JSONResponse(
+            {"error": {"message": "event identity not configured; failing closed",
+                       "type": "server_error"}},
+            status_code=503,
+        )
+
+    try:
+        bound, cleaned = eventenv.extract_and_remove_envelope(
+            body,
+            secret=EVENT_SECRET.encode("utf-8"),
+            service=SERVICE,
+            bot_id=DRHIRO_BOT_ID,
+            now=int(time.time()),
+            max_age_s=EVENT_MAX_AGE_S,
+        )
+    except eventenv.NoEnvelopeError:
+        return JSONResponse(
+            {"error": {"message": "no event envelope in the designated block; refusing to log",
+                       "type": "invalid_request_error"}},
+            status_code=422,
+        )
+    except eventenv.EnvelopeError as e:
+        return JSONResponse(
+            {"error": {"message": f"event envelope rejected: {e.code}",
+                       "type": "invalid_request_error"}},
+            status_code=422,
+        )
+
+    # Use the CLEANED body so the envelope is never part of what reaches the
+    # model, the conversation history, or any prompt log.
+    text = latest_user_message(cleaned)
     if not text:
         return JSONResponse(
             {"error": {"message": "no user message found", "type": "invalid_request_error"}},
             status_code=400,
         )
 
-    key = conversation_key(body)
+    key = conversation_key(cleaned)
     model = body.get("model") or MODEL_ID
 
+    # Durable, run-scoped binding (per-event key, not a shared 'latest' slot).
     try:
-        session_id = await get_or_create_session(key)
-        reply = await run_turn(session_id, text)
-    except Exception as e:  # surface the failure to OpenClaw rather than hanging
+        await bind_event(
+            bound.event_id, input_digest=bound.input_digest, issued_at=bound.issued_at,
+            bot_id=bound.bot_id, chat_id=bound.chat_id, message_id=bound.message_id,
+        )
+    except Exception:
         return JSONResponse(
-            {"error": {"message": f"trueforge error: {e}", "type": "server_error"}},
-            status_code=502,
+            {"error": {"message": "event binding failed; refusing to log",
+                       "type": "server_error"}},
+            status_code=503,
         )
 
-    envelope = completion_envelope(reply, model)
+    # Dedup: if we already completed this event, return the cached result.
+    # This prevents a retry (after a timeout, for example) from re-running
+    # the model turn and possibly causing duplicate side-effects.
+    cached = await _get_stored_result(bound.event_id)
+    if cached is not None:
+        if not body.get("stream"):
+            return JSONResponse(cached)
+        # Streaming replay would be complex; just return non-stream for cached
+        return JSONResponse(cached)
+
+    # Atomic claim: ensure only ONE delivery of this event runs the turn/tools.
+    # SET NX wins for the first concurrent caller; losers wait briefly then
+    # check for the stored result (or replay the in-progress outcome).
+    claim_token = await _try_claim_event(bound.event_id)
+    if claim_token is None:
+        # Another delivery is running the turn. Poll briefly for its stored result.
+        import asyncio as _aio
+        for _ in range(5):
+            await _aio.sleep(0.3)
+            stored = await _get_stored_result(bound.event_id)
+            if stored is not None:
+                if not body.get("stream"):
+                    return JSONResponse(stored)
+                return JSONResponse(stored)
+        return JSONResponse(
+            {"error": {"message": "event in progress; retrying is safe",
+                       "type": "in_progress"}},
+            status_code=503,
+        )
+
+    try:
+        try:
+            session_id = await get_or_create_session(key)
+            reply = await run_turn(session_id, text, conversation_id=key)
+        except Exception as e:  # surface the failure to OpenClaw rather than hanging
+            await _release_claim(bound.event_id, claim_token)
+            return JSONResponse(
+                {"error": {"message": f"trueforge error: {e}", "type": "server_error"}},
+                status_code=502,
+            )
+
+        envelope = completion_envelope(reply, model)
+
+        # Store the completed result so a retry can replay it.
+        await _store_result(bound.event_id, envelope)
+    finally:
+        # Best-effort release; the TTL is the safety net if this fails.
+        await _release_claim(bound.event_id, claim_token)
 
     if not body.get("stream"):
         return JSONResponse(envelope)
