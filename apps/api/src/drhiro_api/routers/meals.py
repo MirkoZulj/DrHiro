@@ -388,9 +388,12 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
 
     totals_kcal = totals_protein = totals_carbs = totals_fat = totals_fiber = 0.0
     estimated = False
+    bev_category = _classify_beverage
     for item in req.items:
         nutrients, conf, source = _lookup_nutrients(db, item, user)
         estimated = estimated or conf < 0.8
+        is_beverage = item.beverage_category is not None or bev_category(item.display_name) is not None
+        effective_volume = item.volume_ml if item.volume_ml else (item.grams if is_beverage else None)
         mi = MealItem(
             meal_id=meal.id,
             food_catalog_item_id=item.food_catalog_item_id,
@@ -398,13 +401,20 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
             quantity=item.quantity,
             unit=item.unit,
             grams=item.grams,
-            volume_ml=item.volume_ml,
-            beverage_category=item.beverage_category,
+            volume_ml=effective_volume if is_beverage else item.volume_ml,
+            beverage_category=item.beverage_category or (bev_category(item.display_name) if is_beverage else None),
             nutrients_json=nutrients,
             source=source or "manual",
             confidence=conf,
         )
         db.add(mi)
+        db.flush()
+        # For beverages, create the linked liquid projection via shared domain
+        # (same helper the add-item path uses) so created drinks count as hydration.
+        if is_beverage and effective_volume and effective_volume > 0:
+            create_beverage_projection(db, user.id, mi, float(effective_volume),
+                                      item.beverage_category or bev_category(item.display_name) or "water",
+                                      meal.eaten_at)
         if nutrients:
             totals_kcal += nutrients.get("kcal") or 0
             totals_protein += nutrients.get("protein_g") or 0
