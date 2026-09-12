@@ -53,6 +53,12 @@ def upgrade() -> None:
                   server_default=sa.text('now()')),
         sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False,
                   server_default=sa.text('now()')),
+        # Soft-delete column: added here so a fresh Alembic install has it.
+        # The earlier logging-idempotency migration (9a1b2c3d4e5f) runs before
+        # this table exists, so it cannot supply the column. The ORM model
+        # deliberately does NOT map this column (it is referenced only through
+        # guarded raw SQL when schema_capabilities() reports it exists).
+        sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
     )
     op.create_index('ix_activities_user_id', TABLE, ['user_id'])
     op.create_index('ix_activities_user_date', TABLE, ['user_id', 'activity_date'])
