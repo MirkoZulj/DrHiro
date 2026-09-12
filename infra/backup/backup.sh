@@ -3,7 +3,11 @@
 # Restores into staging for the monthly restore test.
 set -euo pipefail
 
-COMPOSE_FILE="${DRHIRO_COMPOSE_FILE:-infra/docker-compose.yml}"
+# Resolve COMPOSE_FILE to an absolute path relative to this script's location
+# so cron invocations from any directory still find the Compose stack file.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="${DRHIRO_COMPOSE_FILE:-$SCRIPT_DIR/../docker-compose.yml}"
+COMPOSE_FILE="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)/$(basename "$COMPOSE_FILE")"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-drhiro}"
 DB_CONTAINER_SERVICE="${POSTGRES_SERVICE:-postgres}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
