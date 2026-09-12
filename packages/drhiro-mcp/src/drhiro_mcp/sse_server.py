@@ -126,9 +126,9 @@ TOOLS = [
     {"name": "get_trends", "description": "Get health trends for a metric over N days.", "inputSchema": {"type": "object", "properties": {"metric": {"type": "string", "default": "steps"}, "days": {"type": "integer", "default": 30}}}},
     {"name": "log_weight", "description": "Log a manual weight entry. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"value_kg": {"type": "number"}, "measured_at": {"type": "string"}}}},
     {"name": "log_blood_pressure", "description": "Log a manual blood pressure reading. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"systolic": {"type": "integer"}, "diastolic": {"type": "integer"}, "pulse": {"type": "integer"}, "measured_at": {"type": "string"}}}},
-    {"name": "log_meal", "description": "Log a meal. Set text to the user's food words INCLUDING any day or time they mentioned, copied verbatim - e.g. text=\"on Monday for dinner I had chicken breast 200g\" or text=\"yesterday for breakfast 3 eggs and toast\". Never resolve dates yourself and never drop the day words: the server computes the real date in the user's timezone. Put every food in that one sentence and call this tool once. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "meal_type": {"type": "string"}}, "required": ["text"]}},
+    {"name": "log_meal", "description": "Log a meal. Set text to the user's food words INCLUDING any day or time they mentioned, copied verbatim - e.g. text=\"on Monday for dinner I had chicken breast 200g\" or text=\"yesterday for breakfast 3 eggs and toast\". Never resolve dates yourself and never drop the day words: the server computes the real date in the user's timezone. Put every food in that one sentence and call this tool once. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "meal_type": {"type": "string"}, "conversation_id": {"type": "string", "description": "the drhiro_conversation_id from the context block (if provided)"}}, "required": ["text"]}},
     {"name": "ddg_nutrition_lookup", "description": "Search online for nutrition data via DuckDuckGo when the local database has no match. Use when the user pushes back on a 0 kcal / unmatched food and asks to look it up online. Returns per-100g kcal/protein/carbs/fat candidates, or [] if lookup is blocked.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}, {"name": "search_food", "description": "Search the food database for a food item by name.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 10}}}},
-    {"name": "log_meal_intelligent", "description": "Log a meal from the user's words. Picks the best matching foods, logs immediately, and returns what was logged. NEVER ask the user to choose options and NEVER call ask_user_question for meals - just call this tool once with the user's verbatim words, then relay the returned summary as-is.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "meal_type": {"type": "string"}}, "required": ["text"]}},
+    {"name": "log_meal_intelligent", "description": "Log a meal from the user's words. Picks the best matching foods, logs immediately, and returns what was logged. NEVER ask the user to choose options and NEVER call ask_user_question for meals - just call this tool once with the user's verbatim words, then relay the returned summary as-is.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "meal_type": {"type": "string"}, "conversation_id": {"type": "string", "description": "the drhiro_conversation_id from the context block (if provided)"}}, "required": ["text"]}},
     {"name": "confirm_intelligent_meal", "description": "Confirm a meal draft with user-selected food candidates. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"draft_id": {"type": "string"}, "selections": {"type": "array", "items": {"type": "integer"}}}, "required": ["draft_id", "selections"]}},
     {"name": "build_recipe", "description": "Build a recipe (multi-ingredient dish) from an ingredient list. Compute total weight and total nutrition, so the user can later log a portion. Example: name=\"gulash\", text=\"650g of beef, 400g of chickpeas, 200g of peas, 2 carrots, 1 onion, 2 tbsp of olive oil, 20g of butter, 1l of water\". Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "text": {"type": "string"}}, "required": ["name", "text"]}},
     {"name": "log_recipe_meal", "description": "Log a meal portion from a previously built recipe, scaling nutrients by (grams eaten / total recipe weight). Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"recipe_id": {"type": "string"}, "grams_eaten": {"type": "number"}, "meal_type": {"type": "string"}}, "required": ["recipe_id", "grams_eaten"]}},
@@ -137,17 +137,17 @@ TOOLS = [
     {"name": "list_activities", "description": "List logged activities for a date (YYYY-MM-DD, defaults to today). Returns each activity with its ID, title and calories_burned, so you can identify the ID of an entry to correct or delete via delete_activity.", "inputSchema": {"type": "object", "properties": {"date": {"type": "string", "description": "Optional date YYYY-MM-DD. Defaults to today."}}}},
     {"name": "update_activity", "description": "Edit an existing activity by its ID (change title, calories_burned, description, or activity_date). Use to fix a wrong-calorie or mis-typed activity entry in place instead of delete+re-log.", "inputSchema": {"type": "object", "properties": {"activity_id": {"type": "string"}, "title": {"type": "string"}, "description": {"type": "string"}, "calories_burned": {"type": "number"}, "activity_date": {"type": "string"}}, "required": ["activity_id"]}},
     {"name": "list_data_points", "description": "Find logged data points of any metric (water, weight, steps, sleep, blood_pressure, exercise, heart_rate, ...). Returns each point with its ID and value so you can identify and edit/delete it. Pass metric_type (optional) and/or date (YYYY-MM-DD) to narrow.", "inputSchema": {"type": "object", "properties": {"metric_type": {"type": "string", "description": "e.g. water, weight, steps, sleep, blood_pressure, exercise"}, "date": {"type": "string", "description": "Optional date YYYY-MM-DD to filter by"}}}},
-    {"name": "update_data_point", "description": "Edit an existing logged entry IN PLACE. Works for a health measurement (water, weight, steps, sleep, blood_pressure, exercise, heart_rate) — pass id (from list_data_points) and value/measured_at/unit. ALSO works for a MEAL ITEM'S PORTION WEIGHT — pass item (<fragment of the logged food name, e.g. 'steak'>) and grams (<new weight>) to change how much of that food was logged without changing which food; use this for requests like 'make the steak 200g', 'the steak should be 200g', 'change the steak weight to 200 grams'. This is the tool for correcting any logged value in place instead of delete+re-log.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string", "description": "data-point id (from list_data_points) for a health measurement edit"}, "value": {"type": "object", "description": "replacement value payload, e.g. {\"weight_kg\": 87}"}, "measured_at": {"type": "string"}, "unit": {"type": "string"}, "item": {"type": "string", "description": "fragment of a logged meal item's display name, e.g. 'steak' — for changing a meal item's portion weight"}, "grams": {"type": "number", "description": "new portion weight in grams — for changing a meal item's weight"}, "meal_id": {"type": "string", "description": "optional; defaults to latest meal when editing a meal item's weight"}}}},
+    {"name": "update_data_point", "description": "Edit an existing logged entry IN PLACE. Works for a health measurement (water, weight, steps, sleep, blood_pressure, exercise, heart_rate) — pass id (from list_data_points) and value/measured_at/unit. ALSO works for a MEAL ITEM'S PORTION WEIGHT — pass item (<fragment of the logged food name, e.g. 'steak'>) and grams (<new weight>) to change how much of that food was logged without changing which food; use this for requests like 'make the steak 200g', 'the steak should be 200g', 'change the steak weight to 200 grams'. This is the tool for correcting any logged value in place instead of delete+re-log.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string", "description": "data-point id (from list_data_points) for a health measurement edit"}, "value": {"type": "object", "description": "replacement value payload, e.g. {\"weight_kg\": 87}"}, "measured_at": {"type": "string"}, "unit": {"type": "string"}, "item": {"type": "string", "description": "fragment of a logged meal item's display name, e.g. 'steak' — for changing a meal item's portion weight"}, "grams": {"type": "number", "description": "new portion weight in grams — for changing a meal item's weight"}, "meal_id": {"type": "string", "description": "optional; defaults to latest meal when editing a meal item's weight"}, "conversation_id": {"type": "string", "description": "the drhiro_conversation_id from the context block (if provided)"}}}},
     {"name": "delete_data_point", "description": "Delete a logged data point by its ID (any metric). Use to remove a wrong, duplicate, or accidental measurement.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
     {"name": "set_custom_nutrition", "description": "Write user-provided nutrition values onto a logged meal item when the database has wrong or missing data. Pass item (fragment of the logged item name), meal_id (optional, defaults to newest matching meal), kcal_per_100g, protein_per_100g, carbs_per_100g, fat_per_100g, optionally fiber_per_100g and sodium_per_100g, optionally new_name.", "inputSchema": {"type": "object", "properties": {"item": {"type": "string"}, "meal_id": {"type": "string"}, "kcal_per_100g": {"type": "number"}, "protein_per_100g": {"type": "number"}, "carbs_per_100g": {"type": "number"}, "fat_per_100g": {"type": "number"}, "fiber_per_100g": {"type": "number"}, "sodium_per_100g": {"type": "number"}, "new_name": {"type": "string"}}, "required": ["item", "kcal_per_100g"]}},
     
     {"name": "learn_food", "description": "Store the user's OWN nutritional facts for a food so ALL future meals use them. Use when the user dictates macros (e.g. 'su\u0161ena vratina is 324 kcal, 34g protein, 21g fat per 100g') or after they provide values for an unmatched food. Pass name + per-100g values; text is optional free form.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "food name as the user calls it"}, "text": {"type": "string", "description": "optional: the user's full sentence containing the numbers"}, "kcal_per_100g": {"type": "number"}, "protein_g_per_100g": {"type": "number"}, "carbs_g_per_100g": {"type": "number"}, "fat_g_per_100g": {"type": "number"}, "fiber_g_per_100g": {"type": "number"}, "sodium_mg_per_100g": {"type": "number"}}, "required": ["name"]}},
-    {"name": "correct_meal_item", "description": "Correct one item in the most recent logged meal. Pass wrong=<matched-name fragment> and right=<what the user actually ate>. Re-searches foods and updates totals.", "inputSchema": {"type": "object", "properties": {"wrong": {"type": "string"}, "right": {"type": "string"}, "meal_id": {"type": "string", "description": "optional; defaults to latest meal"}}, "required": ["wrong", "right"]}},
+    {"name": "correct_meal_item", "description": "Correct one item in the most recent logged meal. Pass wrong=<matched-name fragment> and right=<what the user actually ate>. Re-searches foods and updates totals.", "inputSchema": {"type": "object", "properties": {"wrong": {"type": "string"}, "right": {"type": "string"}, "meal_id": {"type": "string", "description": "optional; defaults to latest meal"}, "conversation_id": {"type": "string", "description": "the drhiro_conversation_id from the context block (if provided)"}}, "required": ["wrong", "right"]}},
     {"name": "list_recipes", "description": "List the user's saved recipes with their ids and total weights.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "analyze_food_photo", "description": "Extract nutrition values from a FOOD LABEL or package photo the user sent. Call this when the user attaches a photo of a label/package instead of typing macros. Pass the photo file path from the [media attached: ...] text.", "inputSchema": {"type": "object", "properties": {"photo_path": {"type": "string", "description": "path of the attached image"}, "learn": {"type": "boolean", "default": True}, "grams": {"type": "number"}}, "required": ["photo_path"]}},
-    {"name": "log_water", "description": "Log water intake. Set amount_ml to the volume in millilitres. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"amount_ml": {"type": "number", "description": "volume in millilitres"}}, "required": ["amount_ml"]}},
-    {"name": "log_liquid", "description": "Log any liquid/drink intake with a category. Categories: water, non_alcoholic (juice/coffee/tea/soda/milk), beer, wine, spirits (whiskey/vodka/rum/gin/rakija), other_alcohol (cocktails/liqueurs/cider). Set amount_ml to the volume in millilitres and category to one of those values. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"amount_ml": {"type": "number", "description": "volume in millilitres"}, "category": {"type": "string", "description": "one of: water, non_alcoholic, beer, wine, spirits, other_alcohol", "enum": ["water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol"]}}, "required": ["amount_ml", "category"]}},
-    {"name": "log_activity", "description": "Log a physical activity. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "calories_burned": {"type": "number"}, "activity_date": {"type": "string"}}, "required": ["title", "calories_burned"]}}
+    {"name": "log_water", "description": "Log water intake. Set amount_ml to the volume in millilitres. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"amount_ml": {"type": "number", "description": "volume in millilitres"}, "conversation_id": {"type": "string", "description": "the drhiro_conversation_id from the context block (if provided)"}}, "required": ["amount_ml"]}},
+    {"name": "log_liquid", "description": "Log any liquid/drink intake with a category. Categories: water, non_alcoholic (juice/coffee/tea/soda/milk), beer, wine, spirits (whiskey/vodka/rum/gin/rakija), other_alcohol (cocktails/liqueurs/cider). Set amount_ml to the volume in millilitres and category to one of those values. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"amount_ml": {"type": "number", "description": "volume in millilitres"}, "category": {"type": "string", "description": "one of: water, non_alcoholic, beer, wine, spirits, other_alcohol", "enum": ["water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol"]}, "conversation_id": {"type": "string", "description": "the drhiro_conversation_id from the context block (if provided)"}}, "required": ["amount_ml", "category"]}},
+    {"name": "log_activity", "description": "Log a physical activity. Auto-confirms and returns the logged result immediately.", "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "calories_burned": {"type": "number"}, "activity_date": {"type": "string"}, "conversation_id": {"type": "string", "description": "the drhiro_conversation_id from the context block (if provided)"}}, "required": ["title", "calories_burned"]}}
 ]
 
 # Simple in-memory session store
@@ -453,22 +453,26 @@ _DATE_HINT_RE = re.compile(
 )
 
 
-async def _recover_date_phrase(text):
+async def _recover_date_phrase(text, conversation_id=""):
     """Prepend the user's own date words when the model dropped them.
 
     Qwen paraphrases on tool calls and often discards the day ("On Monday for
     dinner I had X" -> "X"), which would log the meal against today. The shim
     stashes the raw user turn in Redis; if our text carries no date hint but
     theirs does, restore the original sentence instead of guessing.
+
+    conversation_id is the shim's stable conversation key. When present we read
+    the scoped key; when absent we SKIP recovery (never fall back to a global
+    key — that would leak state across concurrent users).
     """
     if _DATE_HINT_RE.search(text):
         return text
-    if not REDIS_URL:
+    if not REDIS_URL or not conversation_id:
         return text
     try:
         import redis.asyncio as aioredis
         r = aioredis.from_url(REDIS_URL, decode_responses=True)
-        raw = await r.get("tfshim:last_user_text")
+        raw = await r.get(f"tfshim:last_user_text:{conversation_id}")
         await r.aclose()
     except Exception:
         return text
@@ -804,11 +808,12 @@ async def handle_mcp(request: Request):
                             elif 'glass' in m.group(2).lower():
                                 val = val * 200
                             amount = val
-                if amount is None and REDIS_URL:
+                conversation_id = _as_text(args.get("conversation_id"))
+                if amount is None and REDIS_URL and conversation_id:
                     try:
                         import redis.asyncio as aioredis
                         rcli = aioredis.from_url(REDIS_URL, decode_responses=True)
-                        raw = await rcli.get("tfshim:last_user_text")
+                        raw = await rcli.get(f"tfshim:last_user_text:{conversation_id}")
                         await rcli.aclose()
                         if raw:
                             import re
@@ -899,11 +904,12 @@ async def handle_mcp(request: Request):
                             elif 'glass' in m.group(2).lower():
                                 val = val * 200
                             amount = val
-                if amount is None and REDIS_URL:
+                conversation_id = _as_text(args.get("conversation_id"))
+                if amount is None and REDIS_URL and conversation_id:
                     try:
                         import redis.asyncio as aioredis
                         rcli = aioredis.from_url(REDIS_URL, decode_responses=True)
-                        raw = await rcli.get("tfshim:last_user_text")
+                        raw = await rcli.get(f"tfshim:last_user_text:{conversation_id}")
                         await rcli.aclose()
                         if raw:
                             import re
@@ -992,11 +998,12 @@ async def handle_mcp(request: Request):
                 # which is non-empty and would block recovery -- clear it first.
                 if title and title.strip().lower() in ('__type', '__type__', 'string', 'number', 'title', 'type', 'description', 'properties', 'required', 'default', 'example'):
                     title = ''
-                if (not title or kcal is None) and REDIS_URL:
+                conversation_id = _as_text(args.get("conversation_id"))
+                if (not title or kcal is None) and REDIS_URL and conversation_id:
                     try:
                         import redis.asyncio as aioredis
                         rcli = aioredis.from_url(REDIS_URL, decode_responses=True)
-                        raw = await rcli.get("tfshim:last_user_text")
+                        raw = await rcli.get(f"tfshim:last_user_text:{conversation_id}")
                         await rcli.aclose()
                         if raw:
                             import re
@@ -1203,11 +1210,12 @@ async def handle_mcp(request: Request):
                     if isinstance(mt_val, str) and _plausible_food_text(mt_val) and re.search(r"\d|\b(?:had|ate|steak|chicken|egg|bread|rice|salad|cheese|fish|pasta|soup|meat|beef|pork|yogurt|fruit)\b", mt_val, re.I):
                         text = mt_val.strip()
                 # Last resort: the shim stashes the user's raw words in Redis.
-                if not text and REDIS_URL:
+                conversation_id = _as_text(args.get("conversation_id"))
+                if not text and REDIS_URL and conversation_id:
                     try:
                         import redis.asyncio as aioredis
                         rcli = aioredis.from_url(REDIS_URL, decode_responses=True)
-                        raw = await rcli.get("tfshim:last_user_text")
+                        raw = await rcli.get(f"tfshim:last_user_text:{conversation_id}")
                         await rcli.aclose()
                         if raw and _plausible_food_text(raw) and not _looks_like_edit_instruction(raw):
                             text = raw.strip()
@@ -1240,7 +1248,7 @@ async def handle_mcp(request: Request):
                     text = f"{text} {g:g}g"
 
                 # Restore date words the model dropped while paraphrasing.
-                text = await _recover_date_phrase(text)
+                text = await _recover_date_phrase(text, conversation_id)
 
                 payload = {"text": text}
                 # Only pass meal_type when the model actually supplied one; an
@@ -1356,6 +1364,7 @@ async def handle_mcp(request: Request):
                     except Exception:
                         _grams = None
                 _meal_id = _as_text(args.get("meal_id")) or _deep_str(args.get("meal_id"))
+                conversation_id = _as_text(args.get("conversation_id"))
                 # Is this a MEAL ITEM WEIGHT edit (item + grams)? If so route to
                 # the meal service's set-weight endpoint (deterministic rescale).
                 if _item or _grams:
@@ -1376,14 +1385,14 @@ async def handle_mcp(request: Request):
                         else:
                             text = await call_api("POST", f"/meals/{meal_id}/items/set-weight",
                                                   {"text": _item, "grams": float(_grams)})
-                elif not _pid and REDIS_URL:
+                elif not _pid and REDIS_URL and conversation_id:
                     # No id and no item/grams: the model likely emitted a pure
                     # schema echo. Recover a weight-correction sentence
                     # ("change the steak weight to 200g") from the shim Redis key.
                     try:
                         import redis.asyncio as aioredis
                         rcli = aioredis.from_url(REDIS_URL, decode_responses=True)
-                        raw = await rcli.get("tfshim:last_user_text")
+                        raw = await rcli.get(f"tfshim:last_user_text:{conversation_id}")
                         await rcli.aclose()
                         wc = _extract_weight_correction(raw or "")
                         if wc:
@@ -1514,6 +1523,7 @@ async def handle_mcp(request: Request):
                 wrong = _as_text(rescued.get("wrong")) or _deep_str(rescued.get("wrong"))
                 right = _as_text(rescued.get("right")) or _deep_str(rescued.get("right"))
                 meal_id = _as_text(rescued.get("meal_id")) or _deep_str(rescued.get("meal_id"))
+                conversation_id = _as_text(args.get("conversation_id"))
                 meal_id = await _resolve_meal_id(meal_id)
                 if not meal_id:
                     try:
@@ -1523,11 +1533,11 @@ async def handle_mcp(request: Request):
                         meal_id = ""
                 # Pure schema-echo carries no names. Recover the user's
                 # correction sentence ("Correct X to Y") from the shim Redis key.
-                if (not wrong or not right) and REDIS_URL:
+                if (not wrong or not right) and REDIS_URL and conversation_id:
                     try:
                         import redis.asyncio as aioredis
                         rcli = aioredis.from_url(REDIS_URL, decode_responses=True)
-                        raw = await rcli.get("tfshim:last_user_text")
+                        raw = await rcli.get(f"tfshim:last_user_text:{conversation_id}")
                         await rcli.aclose()
                         pairs = _extract_correction_pairs(raw or "")
                         if pairs:
@@ -1597,11 +1607,12 @@ async def handle_mcp(request: Request):
                    if isinstance(mt_val, str) and _plausible_food_text(mt_val) and re.search(r"\d|\b(?:had|ate|steak|chicken|egg|bread|rice|salad|cheese|fish|pasta|soup|meat|beef|pork|yogurt|fruit)\b", mt_val, re.I):
                        text = mt_val.strip()
                 # Last resort: the shim stashes the user's raw words in Redis.
-                if not text and REDIS_URL:
+                conversation_id = _as_text(args.get("conversation_id"))
+                if not text and REDIS_URL and conversation_id:
                    try:
                        import redis.asyncio as aioredis
                        rcli = aioredis.from_url(REDIS_URL, decode_responses=True)
-                       raw = await rcli.get("tfshim:last_user_text")
+                       raw = await rcli.get(f"tfshim:last_user_text:{conversation_id}")
                        await rcli.aclose()
                        if raw and _plausible_food_text(raw) and not _looks_like_edit_instruction(raw):
                            text = raw.strip()
@@ -1613,7 +1624,7 @@ async def handle_mcp(request: Request):
                        "error": "no_food_text",
                        "message": "log_meal_intelligent requires 'text' as the user's food words.",
                    })}], "isError": True}})
-                text = await _recover_date_phrase(text)
+                text = await _recover_date_phrase(text, conversation_id)
                 payload = {"text": text}
                 mt = rescued.get("meal_type")
                 if mt:
