@@ -43,7 +43,8 @@ class TestR4MigrationChain:
         """Exactly one head: the chain must be linear (no forks)."""
         heads = _script().get_heads()
         assert len(heads) == 1, f"expected single head, got {heads}"
-        assert heads[0] == "c4e5f6a7b8c9"
+        # d6e7f8a9b0c1 adds app_settings.telegram_allowed_user_id (settings authz).
+        assert heads[0] == "d6e7f8a9b0c1"
 
     def test_activities_adoption_revision_is_deferred(self):
         """b7c8d9e0f1a2 (the `activities` adoption) is DEFERRED, not in the chain.
