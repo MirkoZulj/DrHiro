@@ -550,19 +550,23 @@ def _write_ledgers(db: Session, user, parsed: "ParsedLog", now, existing,
             it.__dict__["_meal_item_id"] = mi.id
             if nutrients and not nutrients.get("unresolved"):
                 meal_nutrients.append(nutrients)
-        # Compute and set meal.totals_json from resolved item nutrients
-        if meal_nutrients:
-            totals = {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "fiber_g": 0.0, "sodium_mg": 0.0, "estimated": False}
-            for nj in meal_nutrients:
-                for k in totals:
-                    if k == "estimated":
-                        continue
-                    try:
-                        totals[k] += float(nj.get(k) or 0)
-                    except (TypeError, ValueError):
-                        pass
-            totals = {k: round(v, 2) if isinstance(v, float) else v for k, v in totals.items()}
-            meal.totals_json = totals
+        # Always set meal.totals_json from the CURRENT item set (never stale):
+        # an edit that replaces resolved items with unresolved ones must not
+        # carry forward the previous meal's calories.
+        totals = {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "fiber_g": 0.0, "sodium_mg": 0.0, "estimated": False}
+        for nj in meal_nutrients:
+            for k in totals:
+                if k == "estimated":
+                    continue
+                try:
+                    totals[k] += float(nj.get(k) or 0)
+                except (TypeError, ValueError):
+                    pass
+        if not meal_nutrients:
+            # Nothing resolved: mark estimated rather than retaining old totals.
+            totals["estimated"] = True
+        totals = {k: round(v, 2) if isinstance(v, float) else v for k, v in totals.items()}
+        meal.totals_json = totals
     elif prev_meal:
         # The new text no longer implies a meal (G6: juice -> water).
         _soft_delete_meal(db, prev_meal)
