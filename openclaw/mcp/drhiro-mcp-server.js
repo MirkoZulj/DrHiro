@@ -74,10 +74,28 @@ const TOOLS = [
 
 /**
  * Resolve the Telegram identity to send to the API.
+ *
  * Security rule (Qodo #10): the bridge MUST NOT forward a model-supplied
  * telegram_id verbatim. It uses the deployment's configured identity
  * (DRHIRO_TELEGRAM_ID) and ignores any divergent value the model provides.
  * When no identity is configured, calls fail closed (no impersonation risk).
+ *
+ * Single-tenant identity model (Qodo #5):
+ *   Each drHiro gateway deploys for ONE paired Telegram identity
+ *   (DRHIRO_TELEGRAM_ID). This is intentional: the gateway is a personal,
+ *   single-user surface — one gateway instance serves exactly one paired
+ *   Telegram user. The bridge enforces this by design: it always uses the
+ *   configured identity and silently discards any divergent id the model
+ *   provides.
+ *
+ *   Supporting multiple users on a single gateway would require per-session
+ *   bound identities (a separate identity-resolution path that binds each
+ *   verified chat/session to its own stored identity), which is out of scope
+ *   for the single-tenant deployment model. To serve multiple users, deploy
+ *   separate gateway instances, each with its own DRHIRO_TELEGRAM_ID.
+ *
+ *   DO NOT weaken this gate to recover a "missing" id from the model — that
+ *   would let a confused or manipulated agent act as a different paired user.
  */
 function resolveTelegramId(modelSupplied) {
   if (!CONFIGURED_TELEGRAM_ID) return null;
