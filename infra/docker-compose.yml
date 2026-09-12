@@ -108,7 +108,7 @@ services:
     build:
       context: ../apps/web
       args:
-        VITE_API_BASE: /drhiro/api/v1
+        VITE_API_BASE: /api/v1
         VITE_BASE_PATH: /drhiro-app/
     image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-web:${DRHIRO_VERSION:-0.1.0}
     restart: unless-stopped
