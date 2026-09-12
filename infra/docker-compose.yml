@@ -47,7 +47,7 @@ services:
     - 8010:8000
   intelligent-meal:
     build:
-      context: ./services/intelligent-meal
+      context: ../services/intelligent-meal
     image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-intelligent-meal:${DRHIRO_VERSION:-0.1.0}
     restart: unless-stopped
     expose: ['8090']
