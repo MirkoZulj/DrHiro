@@ -328,6 +328,7 @@ class AppSetting(Base):
     ai_api_key: Mapped[str | None] = mapped_column(Text, nullable=True)          # secret
     telegram_bot_token: Mapped[str | None] = mapped_column(Text, nullable=True)  # secret
     telegram_allowed_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    telegram_allowed_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # numeric Telegram ID for settings auth
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
