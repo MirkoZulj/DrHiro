@@ -91,9 +91,16 @@ def mint_web_login_code(telegram_id: str) -> str:
     POST /auth/telegram-link/complete. Unlike /telegram-link/start this does
     NOT require an unpaired identity — it is used by the OpenClaw bot to give
     an already-paired user a one-click dashboard link. Returns the code.
+
+    The code stores an ABSOLUTE UTC expiry timestamp (``expires_at``) so the
+    completion path can validate expiry uniformly regardless of which mint
+    function produced the code.
     """
     link_code = uuid.uuid4().hex[:10]
-    _LINK_CODES[link_code] = {"telegram_id": telegram_id, "expires": 1800}
+    _LINK_CODES[link_code] = {
+        "telegram_id": telegram_id,
+        "expires_at": datetime.now(timezone.utc).timestamp() + 1800,
+    }
     return link_code
 
 
@@ -154,37 +161,61 @@ def telegram_link_start(req: TelegramLinkStartRequest, user: User = Depends(get_
 
 
 @router.post("/telegram-link/complete", response_model=TokenResponse)
-def telegram_link_complete(req: TelegramLinkCompleteRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Complete pairing: the authenticated web user enters the code shown
-    by the bot. Binds the Telegram identity to the CURRENTLY authenticated
-    user, never to the identity encoded in a stolen code."""
+def telegram_link_complete(req: TelegramLinkCompleteRequest, db: Session = Depends(get_db)):
+    """Complete a link code, issuing tokens for the Telegram identity it was
+    bound to.
+
+    This endpoint is intentionally UNauthenticated — the one-time code IS the
+    credential (passwordless magic-link login). The code was bound to a
+    specific Telegram identity (``telegram_id``) at mint time, so an attacker
+    who steals a code can only log in as the identity it was minted for, never
+    as an arbitrary victim.
+
+    Two flows converge here:
+      * **Passwordless login** (``mint_web_login_code``): an already-paired
+        user clicks a bot-DM'd link; tokens are issued for their existing
+        account.
+      * **Pairing** (``telegram-link/start``): a web-authenticated user enters
+        a code to bind a Telegram identity to their account. The code carries
+        the ``requesting_user_id`` so the identity is paired to the user who
+        started the flow.
+    """
     code = _LINK_CODES.get(req.link_code)
     if not code:
         raise HTTPException(status_code=404, detail="Link code not found or expired")
-    # Enforce code expiry
+    # Enforce code expiry (absolute UTC timestamp, uniform across all mints)
     if datetime.now(timezone.utc).timestamp() > code["expires_at"]:
         _LINK_CODES.pop(req.link_code, None)
         raise HTTPException(status_code=404, detail="Link code expired")
     telegram_id = code["telegram_id"]
-    # Bind the Telegram identity to the AUTHENTICATED requesting user,
-    # not to whatever user the code was originally intended for. This
-    # prevents an attacker from claiming another user's telegram id.
+    _LINK_CODES.pop(req.link_code, None)  # one-time use: consume before work
+
+    # Resolve the user by the Telegram identity the code was BOUND TO, never
+    # from any caller-supplied value. This closes the identity-claim hole.
     identity = (
         db.query(ExternalIdentity)
         .filter(ExternalIdentity.provider == "telegram", ExternalIdentity.provider_subject == telegram_id)
         .first()
     )
     if identity:
-        # The telegram identity is already paired to some user.
-        if str(identity.user_id) == str(user.id):
-            # Already paired to the requesting user -- nothing to do, just return tokens
-            pass
-        else:
-            raise HTTPException(status_code=409, detail="Telegram identity already paired to another account")
+        user = db.get(User, identity.user_id)
+        if not user or user.status != "active":
+            raise HTTPException(status_code=409, detail="Telegram identity paired to an inactive account")
     else:
+        # Not yet paired. For the pairing flow, bind to the requesting user;
+        # for a fresh magic-link signup, create a new user.
+        requesting_user_id = code.get("requesting_user_id")
+        if requesting_user_id:
+            user = db.get(User, uuid.UUID(requesting_user_id))
+            if not user:
+                raise HTTPException(status_code=409, detail="Requesting user no longer exists")
+        else:
+            user = User(display_name="drHiro user", timezone="UTC")
+            db.add(user)
+            db.flush()
         db.add(ExternalIdentity(provider="telegram", provider_subject=telegram_id, user_id=user.id, verified_at=datetime.now(timezone.utc)))
         db.flush()
-    _LINK_CODES.pop(req.link_code, None)
+
     access = create_access_token(user.id)
     refresh, _ = create_refresh_token(user.id)
     audit(db, "user", telegram_id, user.id, "auth.telegram_link_complete", "user", str(user.id))
