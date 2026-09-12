@@ -60,6 +60,14 @@ docs/deliverables/meal-liquid-idempotency/review_bundle/review10_focused_bundle.
 docs/deliverables/meal-liquid-idempotency/review_bundle/review11/
 docs/deliverables/meal-liquid-idempotency/review_bundle/review11_focused_bundle.tar.gz
 
+# Generated review evidence is kept OUT of the repository entirely.
+# These were the vectors that carried private data into a public repo.
+docs/deliverables/
+artifacts/
+*.patch
+*.tar.gz
+__pycache__/
+
 # --- Loose Android APK binaries ---
 # Signed builds live on the VPS / Telegram (installed at runtime); never in git.
 # (The apk/ directory rule above covers the sidecar; this covers loose files.)

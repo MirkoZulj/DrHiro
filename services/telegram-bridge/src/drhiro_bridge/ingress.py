@@ -14,7 +14,7 @@ Trust boundary:
 Adding a second poller or a webhook receiver would break single-owner, so this
 deliberately hooks into the existing poll loop instead.
 
-See docs/deliverables/meal-liquid-idempotency/T1_ingress_design_and_writer_ownership.md
+See the T1 ingress design note.
 """
 from __future__ import annotations
 
