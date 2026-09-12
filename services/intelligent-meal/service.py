@@ -48,11 +48,19 @@ log = logging.getLogger("intelligent-meal")
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DB_URL = os.environ.get("DATABASE_URL", "")
-REDIS_URL = os.environ.get("REDIS_URL", "")
+DB_URL = os.environ.get("DRHIRO_DATABASE_URL") or os.environ.get("DATABASE_URL", "")
+REDIS_URL = os.environ.get("DRHIRO_REDIS_URL") or os.environ.get("REDIS_URL", "")
 JWT_SECRET = os.environ.get("DRHIRO_JWT_SECRET", "")
 SERVICE_TOKEN = os.environ.get("DRHIRO_SERVICE_TOKEN", "")
 TELEGRAM_ID = os.environ.get("DRHIRO_TELEGRAM_ID", "")
+
+# Fail fast with a clear message if the database URL is not configured,
+# instead of passing an empty string to create_engine at import time.
+if not DB_URL:
+    raise RuntimeError(
+        "intelligent-meal: neither DRHIRO_DATABASE_URL nor DATABASE_URL is set. "
+        "Configure one of these environment variables to point to the database."
+    )
 
 # Camoufox / Pi SSH config
 PI_HOST = os.environ.get("PI_HOST", "")
