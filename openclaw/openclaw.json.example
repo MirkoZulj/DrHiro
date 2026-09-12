@@ -47,7 +47,7 @@
       "drhiro": {
         "command": "node",
         "transport": "stdio",
-        "enabled": false,
+        "enabled": true,
         "env": {
           "DRHIRO_MCP_API": "${OPENCLAW_DRHIRO_API}",
           "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}"
@@ -58,7 +58,7 @@
   "skills": {
     "entries": {
       "skill-drhiro": {
-        "enabled": false,
+        "enabled": true,
         "env": {
           "OPENCLAW_DRHIRO_API": "${OPENCLAW_DRHIRO_API}",
           "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}"
