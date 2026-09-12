@@ -221,16 +221,34 @@ async def _store_result(event_id: str, result: dict) -> None:
     A later authenticated retry of the same event (e.g. due to a network
     timeout) can replay this stored result instead of re-running the model
     turn, avoiding duplicate side-effects.
+
+    IMPORTANT: this runs AFTER the model turn has completed. A cache-write
+    failure here must NOT be converted into an error response — doing so
+    would invite a client retry that re-runs the turn and double-executes
+    side-effects. Failures are logged and swallowed; only the dedup replay
+    on retry is lost.
     """
-    r = await redis_conn()
-    payload = json.dumps(result)
-    await r.set(f"tfshim:result:{event_id}", payload, ex=EVENT_RECORD_TTL)
+    try:
+        r = await redis_conn()
+        payload = json.dumps(result)
+        await r.set(f"tfshim:result:{event_id}", payload, ex=EVENT_RECORD_TTL)
+    except Exception as e:
+        print(f"[_store_result] cache store failed for {event_id}: {e!r}", flush=True)
 
 
 async def _get_stored_result(event_id: str) -> dict | None:
-    """Return a previously stored model turn result, or None if not present."""
-    r = await redis_conn()
-    raw = await r.get(f"tfshim:result:{event_id}")
+    """Return a previously stored model turn result, or None if not present.
+
+    A cache outage during lookup is treated as "no cached result" so the
+    request proceeds to run the model turn rather than surfacing an
+    unhandled error to the client.
+    """
+    try:
+        r = await redis_conn()
+        raw = await r.get(f"tfshim:result:{event_id}")
+    except Exception as e:
+        print(f"[_get_stored_result] cache lookup failed for {event_id}: {e!r}", flush=True)
+        return None
     if raw is None:
         return None
     try:
