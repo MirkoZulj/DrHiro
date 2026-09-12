@@ -28,6 +28,7 @@ MCP_DIR = Path(__file__).resolve().parent.parent / "packages" / "drhiro-mcp" / "
 # The MCP server hard-codes its port to 3100 (uvicorn.run(port=3100)); probe it
 # there. This is safe in this environment (checked free).
 PORT = 3100
+MCP_TEST_TOKEN = "pytest-mcp-test-token-do-not-use-in-prod"
 
 
 @pytest.fixture(scope="module")
@@ -37,6 +38,7 @@ def mcp_proc():
     env["DRHIRO_TRUSTED_INGRESS_WRITERS_DISABLED"] = "true"
     env["PORT"] = str(PORT)
     env["PYTHONPATH"] = str(MCP_DIR)
+    env["DRHIRO_MCP_SERVER_TOKEN"] = MCP_TEST_TOKEN
     p = subprocess.Popen(
         [sys.executable, str(MCP_DIR / "drhiro_mcp" / "sse_server.py")],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -64,7 +66,7 @@ def mcp_proc():
 
 
 def _call(base, name, args=None, session=None):
-    headers = {}
+    headers = {"X-MCP-Token": MCP_TEST_TOKEN}
     if session:
         headers["mcp-session-id"] = session
     r = httpx.post(
@@ -102,3 +104,65 @@ class TestMCPWriterGate:
         result = body.get("result", {})
         # Not the model-writer-disabled sentinel.
         assert "model_writer_disabled" not in str(result)
+
+
+class TestMCPAuthentication:
+    """Qodo #15 — caller authentication gate."""
+
+    def test_unauthenticated_request_is_401(self, mcp_proc):
+        """tools/call without a token must be rejected with 401."""
+        r = httpx.post(
+            mcp_proc,
+            json={"jsonrpc": "2.0", "id": "1", "method": "tools/call",
+                  "params": {"name": "get_steps", "arguments": {}}},
+            timeout=10,
+        )
+        assert r.status_code == 401, r.text
+
+    def test_invalid_token_is_401(self, mcp_proc):
+        """tools/call with a WRONG token must be rejected with 401."""
+        r = httpx.post(
+            mcp_proc,
+            json={"jsonrpc": "2.0", "id": "1", "method": "tools/call",
+                  "params": {"name": "get_steps", "arguments": {}}},
+            headers={"X-MCP-Token": "wrong-token"},
+            timeout=10,
+        )
+        assert r.status_code == 401, r.text
+
+    def test_bearer_token_auth_works(self, mcp_proc):
+        """Authorization: Bearer <token> must be accepted."""
+        r = httpx.post(
+            mcp_proc,
+            json={"jsonrpc": "2.0", "id": "1", "method": "tools/list",
+                  "params": {}},
+            headers={"Authorization": f"Bearer {MCP_TEST_TOKEN}"},
+            timeout=10,
+        )
+        assert r.status_code == 200, r.text
+
+    def test_initialize_still_works_without_token(self, mcp_proc):
+        """The initialize handshake is exempt from auth so clients can discover."""
+        r = httpx.post(
+            mcp_proc,
+            json={"jsonrpc": "2.0", "id": "1", "method": "initialize",
+                  "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "1.0.0"}}},
+            timeout=10,
+        )
+        # initialize is exempt — should succeed (200) even without auth
+        assert r.status_code == 200, r.text
+
+    def test_get_endpoint_requires_auth(self, mcp_proc):
+        """GET /mcp must also require auth (Qodo #15)."""
+        base = mcp_proc.rsplit("/mcp", 1)[0]
+        r = httpx.get(f"{base}/mcp", timeout=10)
+        assert r.status_code == 401, r.text
+
+        r = httpx.get(f"{base}/mcp", headers={"X-MCP-Token": MCP_TEST_TOKEN}, timeout=10)
+        assert r.status_code == 200, r.text
+
+    def test_healthz_remains_open(self, mcp_proc):
+        """The /healthz liveness probe must remain reachable without auth."""
+        base = mcp_proc.rsplit("/mcp", 1)[0]
+        r = httpx.get(f"{base}/healthz", timeout=10)
+        assert r.status_code == 200, r.text

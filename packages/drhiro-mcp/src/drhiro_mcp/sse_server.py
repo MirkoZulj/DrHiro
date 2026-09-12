@@ -22,6 +22,42 @@ TELEGRAM_ID = os.environ.get("DRHIRO_TELEGRAM_ID", "")
 REDIS_URL = os.environ.get("REDIS_URL", "")
 _LIQUID_WRITER_MODE = os.environ.get("DRHIRO_LIQUID_WRITER", "legacy")
 
+# ---------------------------------------------------------------------------
+# Authentication (Qodo #15).
+#
+# The MCP server holds a privileged integration identity (the SERVICE_TOKEN /
+# TOKEN it uses to call the drHiro API). Without caller authentication, any
+# network client that can reach the port can invoke write-capable tools using
+# that identity. We require a shared secret on every MCP request.
+#
+# FAIL CLOSED: if no expected token is configured, refuse to serve. The
+# expected token is read from DRHIRO_MCP_SERVER_TOKEN, falling back to
+# DRHIRO_SERVICE_TOKEN. If neither is set, _authorized() always returns False.
+#
+# Bind host defaults to loopback (127.0.0.1) — only widen via DRHIRO_MCP_BIND.
+# ---------------------------------------------------------------------------
+
+MCP_SERVER_TOKEN = os.environ.get("DRHIRO_MCP_SERVER_TOKEN", "") or SERVICE_TOKEN
+MCP_BIND_HOST = os.environ.get("DRHIRO_MCP_BIND", "127.0.0.1")
+
+
+def _authorized(request: Request) -> bool:
+    """Return True when the request carries the expected MCP server token.
+
+    Checks X-MCP-Token header first, then Authorization: Bearer. Pure helper
+    so the check is unit-testable without spinning up the server. Fail-closed:
+    when no MCP_SERVER_TOKEN is configured, always returns False.
+    """
+    if not MCP_SERVER_TOKEN:
+        return False
+    header = request.headers.get("X-MCP-Token", "")
+    if header and header == MCP_SERVER_TOKEN:
+        return True
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and auth[7:] == MCP_SERVER_TOKEN:
+        return True
+    return False
+
 
 def get_liquid_writer_mode() -> str:
     """Return the active liquid-writer mode.
@@ -745,6 +781,23 @@ async def _resolve_meal_id(raw_id: str) -> str:
 
 
 async def handle_mcp(request: Request):
+    # Qodo #15: authenticate the caller. Fail-closed: missing/invalid token -> 401.
+    # The initialize handshake is exempt so a client can discover the session,
+    # but tools/call, tools/list still require auth (tools/list reveals the
+    # surface so it is also gated).
+    if not _authorized(request):
+        body = None
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        method = (body or {}).get("method", "")
+        if method != "initialize":
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": (body or {}).get("id"),
+                 "error": {"code": -32000, "message": "Unauthorized: missing or invalid MCP token"}},
+                status_code=401,
+            )
     try:
         body = await request.json()
     except Exception:
@@ -1826,14 +1879,35 @@ async def handle_mcp(request: Request):
     return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}})
 
 async def handle_mcp_get(request: Request):
-    """TrueForge probes GET before POST; answer instead of 405."""
+    """TrueForge probes GET before POST; answer instead of 405.
+
+    Qodo #15: this GET endpoint is also gated. The /healthz liveness probe
+    remains open. If no MCP_SERVER_TOKEN is configured, we still answer the
+    GET with a hint that auth is needed (so discovery tools don't see an
+    empty surface) but no tool data leaks.
+    """
+    if not _authorized(request):
+        return JSONResponse(
+            {"ok": False, "error": "unauthorized", "hint": "Provide X-MCP-Token or Authorization: Bearer header"},
+            status_code=401,
+        )
     return JSONResponse({"ok": True, "transport": "streamable-http", "endpoint": "/mcp", "methods": ["POST"]})
 
 app = Starlette(routes=[
     Route("/mcp", endpoint=handle_mcp, methods=["POST"]),
+    Route("/mcp", endpoint=handle_mcp_get, methods=["GET"]),
     Route("/healthz", endpoint=lambda r: JSONResponse({"ok": True}), methods=["GET"]),
 ])
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=3100)
+    if not MCP_SERVER_TOKEN:
+        import sys as _sys
+        print(
+            "[mcp] WARNING: No DRHIRO_MCP_SERVER_TOKEN or DRHIRO_SERVICE_TOKEN "
+            "configured. The server will refuse all MCP requests (fail-closed). "
+            "Set DRHIRO_MCP_SERVER_TOKEN to enable callers.",
+            file=_sys.stderr,
+            flush=True,
+        )
+    uvicorn.run(app, host=MCP_BIND_HOST, port=3100)
