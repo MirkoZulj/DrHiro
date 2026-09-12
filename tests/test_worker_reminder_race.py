@@ -170,3 +170,25 @@ def test_sent_not_reverted_by_scheduler_commit(db):
     occ = db.query(ReminderOccurrence).filter(ReminderOccurrence.id == occ_id).first()
     assert occ.status == "sent"
     assert occ.sent_at is not None
+
+
+def test_run_once_restores_pending_on_enqueue_failure(db):
+    """Qodo #9 — if q.enqueue() fails (e.g. Redis down), the occurrence must
+    be restored to 'pending' so a later scheduler tick retries it. A failed
+    enqueue must never strand the row as 'queued' with no job."""
+    from drhiro_worker.scheduler import run_once
+
+    uid, rid, occ_id = _seed_reminder_and_occurrence(db)
+
+    mock_queue = MagicMock()
+    mock_queue.enqueue.side_effect = Exception("Redis down")
+    with patch("drhiro_worker.scheduler.Queue", return_value=mock_queue), \
+         patch("drhiro_worker.scheduler.redis"):
+        result = run_once()
+
+    assert result["due_delivered"] == 0
+    # The occurrence must NOT remain 'queued' — it must be 'pending' so the
+    # next scheduler tick picks it up again.
+    from drhiro_api.models import ReminderOccurrence
+    occ = db.query(ReminderOccurrence).filter(ReminderOccurrence.id == occ_id).first()
+    assert occ.status == "pending"

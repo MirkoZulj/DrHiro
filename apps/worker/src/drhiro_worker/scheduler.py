@@ -8,6 +8,7 @@ Runs as a long-lived process (scheduler service). On each tick:
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 
@@ -18,6 +19,8 @@ from drhiro_api.config import get_settings
 from drhiro_api.db import SessionLocal
 from drhiro_api.models import Reminder, ReminderOccurrence
 from drhiro_api.routers.reminders import _compute_next_due
+
+logger = logging.getLogger(__name__)
 
 TICK_SECONDS = 30
 
@@ -69,8 +72,20 @@ def run_once() -> dict:
             #      status = 'queued') cannot overwrite the completed 'sent'.
             occ.status = "queued"
             db.commit()
-            q.enqueue("drhiro_worker.jobs.deliver_reminder", str(occ.id))
-            delivered += 1
+            try:
+                q.enqueue("drhiro_worker.jobs.deliver_reminder", str(occ.id))
+                delivered += 1
+            except Exception as e:
+                # Enqueue failed (Redis down, queue unavailable). Restore the
+                # occurrence to 'pending' so the next scheduler tick retries
+                # instead of stranding the row forever as 'queued' with no job.
+                logger.error(
+                    "enqueue failed for occurrence %s: %s; restoring to pending",
+                    occ.id,
+                    e,
+                )
+                occ.status = "pending"
+                db.commit()
         return {"occurrences_created": created, "due_delivered": delivered}
     finally:
         db.close()
