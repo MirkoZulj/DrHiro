@@ -118,13 +118,29 @@ class HealthConnectReader(private val context: Context) {
         // thousands of day groups). Clamping to a bounded window keeps every
         // call under the cap; the cursor advances each sync so history
         // backfills incrementally across runs.
+        // When the cursor predates the MAX_GROUPS_DAYS window, read a bounded
+        // window from the cursor forward rather than from (now - MAX_GROUPS_DAYS)
+        // to now. Silently narrowing the start to the latest window and then
+        // persisting the newest returned bucket as the cursor would leave every
+        // step older than that window permanently behind the cursor — never
+        // uploaded, never reachable by later syncs. Reading forward from the
+        // cursor keeps the existing "advance to newest end_at" logic correct:
+        // the cursor walks forward one bounded window per sync until caught up,
+        // then resumes incremental reads from the cursor to the present.
         val nowLdt = LocalDateTime.now(zone)
         val maxWindowStart = nowLdt.minusDays(MAX_GROUPS_DAYS)
-        val effStart = if (sinceDayStartLdt.isBefore(maxWindowStart)) maxWindowStart else sinceDayStartLdt
+        val effStart = sinceDayStartLdt
+        val effEnd = if (sinceDayStartLdt.isBefore(maxWindowStart)) {
+            // Cap the end so we never request more than MAX_GROUPS_DAYS groups
+            // in a single call. The next sync picks up from effEnd.
+            sinceDayStartLdt.plusDays(MAX_GROUPS_DAYS)
+        } else {
+            nowLdt
+        }
 
         val request = AggregateGroupByPeriodRequest(
             metrics = setOf(StepsRecord.COUNT_TOTAL),
-            timeRangeFilter = TimeRangeFilter.between(effStart, nowLdt),
+            timeRangeFilter = TimeRangeFilter.between(effStart, effEnd),
             timeRangeSlicer = Period.ofDays(1),
             dataOriginFilter = emptySet(),
         )
