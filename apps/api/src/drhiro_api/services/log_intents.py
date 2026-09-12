@@ -467,7 +467,17 @@ def _resolve_intent_nutrition(db: Session, it: LogIntent, user_id: str) -> dict 
             "fat_g": None, "fiber_g": None, "sodium_mg": None,
             "sources": [], "resolved_food": food.display_name, "unresolved": True,
         }
-    grams = it.grams or food.serving_grams or 100.0
+    # Scale factor against per-100g nutrient values:
+    # - Solid food: grams/100.
+    # - Drink (volume_ml, no grams): treat density as ~1 g/ml so a 300ml
+    #   milk shows ~3x the 100ml nutrition rather than identical serving.
+    # - Fallback: food.serving_grams/100, or 1.0 (100g reference).
+    if it.grams:
+        scale = it.grams / 100
+    elif it.volume_ml:
+        scale = it.volume_ml / 100
+    else:
+        scale = (food.serving_grams or 100.0) / 100
     energy_per_100g = nmap.get("energy")
     if not energy_per_100g:
         energy_per_100g = (
@@ -476,12 +486,12 @@ def _resolve_intent_nutrition(db: Session, it: LogIntent, user_id: str) -> dict 
             + 9.0 * (nmap.get("fat") or 0)
         )
     totals = NutrientTotals(
-        kcal=(energy_per_100g or 0) * grams / 100,
-        protein_g=(nmap.get("protein") or 0) * grams / 100,
-        carbs_g=(nmap.get("carbs") or 0) * grams / 100,
-        fat_g=(nmap.get("fat") or 0) * grams / 100,
-        fiber_g=(nmap.get("fiber") or 0) * grams / 100,
-        sodium_mg=(nmap.get("sodium") or 0) * grams / 100,
+        kcal=(energy_per_100g or 0) * scale,
+        protein_g=(nmap.get("protein") or 0) * scale,
+        carbs_g=(nmap.get("carbs") or 0) * scale,
+        fat_g=(nmap.get("fat") or 0) * scale,
+        fiber_g=(nmap.get("fiber") or 0) * scale,
+        sodium_mg=(nmap.get("sodium") or 0) * scale,
         sources=["usda:fdc-v1"],
     )
     return {
