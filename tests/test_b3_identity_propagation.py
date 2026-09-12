@@ -329,3 +329,34 @@ class TestB3LogManualLiquidIdentity:
         # Replay returns the saved result
         assert r2["ok"] is True
         assert r1["data"]["meal_id"] == r2["data"]["meal_id"]
+
+    def test_liquid_log_new_intent_without_identity_accepted(self, db, user):
+        """intent='new' with telegram source but no identity → accepted (Qodo #7)."""
+        result = log_manual_liquid(
+            db=db, user_id=user.id, amount_ml=330, category="coffee",
+            source="telegram",
+            intent="new",
+            display_name="morning coffee",
+        )
+        assert result["ok"] is True
+        assert result.get("data") is not None
+        # Verify a consumption was actually written
+        meal_id = result["data"].get("meal_id")
+        assert meal_id is not None
+        items = result["data"].get("items", [])
+        assert len(items) >= 1
+        assert items[0].get("volume_ml") == 330
+        # Verify it was persisted to the database
+        meal = db.query(Meal).filter(Meal.id == meal_id).first()
+        assert meal is not None
+
+    def test_liquid_log_missing_identity_still_requires_identity(self, db, user):
+        """No identity AND no intent='new' → identity_required (regression guard)."""
+        for bad_intent in (None, "edit", "update", "delete"):
+            result = log_manual_liquid(
+                db=db, user_id=user.id, amount_ml=250, category="water",
+                source="telegram",
+                intent=bad_intent,
+            )
+            assert result["ok"] is False, f"intent={bad_intent!r} should be rejected"
+            assert result.get("error") == "identity_required"

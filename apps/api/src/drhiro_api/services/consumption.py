@@ -1497,8 +1497,10 @@ def log_manual_liquid(
 
     # --- 2b. Telegram source without identity → FAIL CLOSED ------------------
     # If the caller explicitly signals telegram source but omits the required
-    # identity, reject immediately. Do NOT fall through to ambiguous/clarify.
-    if source == "telegram":
+    # identity, reject immediately — UNLESS intent="new" is set, which is the
+    # documented no-identity path (create a genuinely new drink). Identity is
+    # still required for identity-dependent intents (None/edit/update/delete).
+    if source == "telegram" and intent != "new":
         return {
             "ok": False,
             "error": "identity_required",
