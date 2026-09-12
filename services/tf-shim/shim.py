@@ -242,6 +242,40 @@ async def _store_result(event_id: str, result: dict) -> None:
         print(f"[_store_result] cache store failed for {event_id}: {e!r}", flush=True)
 
 
+async def _try_claim_event(event_id: str) -> bool:
+    """Atomically claim the right to run a turn for this event.
+
+    Uses SET NX (set-if-not-exists) so that among concurrent deliveries of
+    the same event, exactly ONE wins the claim and runs the model/tools.
+    The claim has a TTL so a failed owner cannot deadlock the event forever.
+
+    Returns True if THIS call won the claim, False if another delivery holds
+    it (or the cache is unavailable — fail open so we don't block traffic).
+    """
+    try:
+        r = await redis_conn()
+        # SET NX: only sets if key does not exist. Returns True if set, None/False if not.
+        ok = await r.set(
+            f"tfshim:claim:{event_id}",
+            "1",
+            nx=True,
+            ex=max(60, TURN_TIMEOUT),
+        )
+        return bool(ok)
+    except Exception as e:
+        print(f"[_try_claim_event] cache claim failed for {event_id}: {e!r}", flush=True)
+        return True  # fail open: run rather than drop traffic on cache outage
+
+
+async def _release_claim(event_id: str) -> None:
+    """Release the claim after the turn completes (best-effort)."""
+    try:
+        r = await redis_conn()
+        await r.delete(f"tfshim:claim:{event_id}")
+    except Exception as e:
+        print(f"[_release_claim] cache release failed for {event_id}: {e!r}", flush=True)
+
+
 async def _get_stored_result(event_id: str) -> dict | None:
     """Return a previously stored model turn result, or None if not present.
 
@@ -486,19 +520,43 @@ async def chat_completions(request: Request):
         # Streaming replay would be complex; just return non-stream for cached
         return JSONResponse(cached)
 
-    try:
-        session_id = await get_or_create_session(key)
-        reply = await run_turn(session_id, text, conversation_id=key)
-    except Exception as e:  # surface the failure to OpenClaw rather than hanging
+    # Atomic claim: ensure only ONE delivery of this event runs the turn/tools.
+    # SET NX wins for the first concurrent caller; losers wait briefly then
+    # check for the stored result (or replay the in-progress outcome).
+    if not await _try_claim_event(bound.event_id):
+        # Another delivery is running the turn. Poll briefly for its stored result.
+        import asyncio as _aio
+        for _ in range(5):
+            await _aio.sleep(0.3)
+            stored = await _get_stored_result(bound.event_id)
+            if stored is not None:
+                if not body.get("stream"):
+                    return JSONResponse(stored)
+                return JSONResponse(stored)
         return JSONResponse(
-            {"error": {"message": f"trueforge error: {e}", "type": "server_error"}},
-            status_code=502,
+            {"error": {"message": "event in progress; retrying is safe",
+                       "type": "in_progress"}},
+            status_code=503,
         )
 
-    envelope = completion_envelope(reply, model)
+    try:
+        try:
+            session_id = await get_or_create_session(key)
+            reply = await run_turn(session_id, text, conversation_id=key)
+        except Exception as e:  # surface the failure to OpenClaw rather than hanging
+            await _release_claim(bound.event_id)
+            return JSONResponse(
+                {"error": {"message": f"trueforge error: {e}", "type": "server_error"}},
+                status_code=502,
+            )
 
-    # Store the completed result so a retry can replay it.
-    await _store_result(bound.event_id, envelope)
+        envelope = completion_envelope(reply, model)
+
+        # Store the completed result so a retry can replay it.
+        await _store_result(bound.event_id, envelope)
+    finally:
+        # Best-effort release; the TTL is the safety net if this fails.
+        await _release_claim(bound.event_id)
 
     if not body.get("stream"):
         return JSONResponse(envelope)
