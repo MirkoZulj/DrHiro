@@ -17,10 +17,21 @@ from sqlalchemy.orm import Session
 from drhiro_api.db import get_db
 from drhiro_api.deps import get_current_user
 from drhiro_api.models import (
-    AuditEvent,
+    Activity,
+    Alert,
+    BeverageMeasurement,
     ConsentGrant,
+    ConsumptionItem,
+    ConsumptionOperation,
+    DailyAggregate,
+    DeviceConnection,
+    ExternalIdentity,
+    FoodCatalogItem,
+    FoodResolutionRule,
     Goal,
+    IngestBatch,
     Meal,
+    MealItem,
     Measurement,
     Reminder,
     ReminderOccurrence,
@@ -199,18 +210,39 @@ def request_deletion(req: DeletionRequest, user: User = Depends(get_current_user
         audit(db, "user", str(user.id), user.id, "privacy.deletion_requested", "user", str(user.id))
         db.commit()
         return {"ok": True, "message": "Deletion requested. Confirm to purge."}
-    # Purge tenant data (measurements, meals, reminders, goals, grants, audit).
+    # Purge tenant data. Every model with a user_id (per-user data) must be
+    # listed here so account deletion is a true purge. See models.py — all
+    # classes declaring user_id FK to users.id belong in this tuple.
     # ReminderOccurrence has no user_id column -- delete via join to Reminder.
     db.query(ReminderOccurrence).filter(
         ReminderOccurrence.reminder_id.in_(
             db.query(Reminder.id).filter(Reminder.user_id == user.id)
         )
     ).delete(synchronize_session=False)
-    for model in (Measurement, Meal, Reminder, Goal, ConsentGrant):
-        db.query(model).filter(
-            model.user_id == user.id
-        ).delete(synchronize_session=False)
+    db.query(MealItem).filter(
+        MealItem.meal_id.in_(db.query(Meal.id).filter(Meal.user_id == user.id))
+    ).delete(synchronize_session=False)
+    for model in (
+        Activity,
+        Alert,
+        BeverageMeasurement,
+        ConsumptionItem,
+        ConsumptionOperation,
+        DailyAggregate,
+        DeviceConnection,
+        ExternalIdentity,
+        FoodCatalogItem,
+        FoodResolutionRule,
+        Goal,
+        IngestBatch,
+        Meal,
+        Measurement,
+        Reminder,
+    ):
+        db.query(model).filter(model.user_id == user.id).delete(synchronize_session=False)
+    # ConsentGrant has no user_id column — keyed by grantor_user_id / grantee_user_id.
     db.query(ConsentGrant).filter(ConsentGrant.grantor_user_id == user.id).delete(synchronize_session=False)
+    db.query(ConsentGrant).filter(ConsentGrant.grantee_user_id == user.id).delete(synchronize_session=False)
     # Anonymize the user rather than hard-delete (keeps audit referential integrity)
     user.display_name = "deleted-user"
     user.status = "deleted"
