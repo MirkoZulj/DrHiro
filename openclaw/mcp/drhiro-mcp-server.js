@@ -7,7 +7,7 @@
  * config; the agent sees the real drHiro tool schemas and calls them.
  *
  * Tools forward to the drHiro Core API with the signed service token and
- * the sender's Telegram id (supplied by OpenClaw as telegram_id).
+ * the deployment's configured Telegram identity (NEVER a model-supplied one).
  */
 
 "use strict";
@@ -17,6 +17,11 @@ const readline = require("readline");
 
 const API_BASE = process.env.DRHIRO_MCP_API || "http://api:8000/api/v1";
 const SERVICE_TOKEN = process.env.DRHIRO_OPENCLAW_SERVICE_TOKEN || "";
+// The deployment's bound Telegram identity. The bridge forwards ONLY this
+// identity to the API as X-Telegram-Id. A model-supplied telegram_id that
+// differs is silently dropped — a confused/manipulated model can never act
+// as a different paired user. When unset, no tools can be called (fail-closed).
+const CONFIGURED_TELEGRAM_ID = process.env.DRHIRO_TELEGRAM_ID || "";
 
 function tool(name, description, inputSchema, handler) {
   return { name, description, inputSchema, handler };
@@ -67,15 +72,30 @@ const TOOLS = [
     (a) => call("POST", "/tools/undo_last_user_action", a, {})),
 ];
 
+/**
+ * Resolve the Telegram identity to send to the API.
+ * Security rule (Qodo #10): the bridge MUST NOT forward a model-supplied
+ * telegram_id verbatim. It uses the deployment's configured identity
+ * (DRHIRO_TELEGRAM_ID) and ignores any divergent value the model provides.
+ * When no identity is configured, calls fail closed (no impersonation risk).
+ */
+function resolveTelegramId(modelSupplied) {
+  if (!CONFIGURED_TELEGRAM_ID) return null;
+  // Ignore any model-supplied value that diverges from the configured identity.
+  if (modelSupplied && modelSupplied !== CONFIGURED_TELEGRAM_ID) return CONFIGURED_TELEGRAM_ID;
+  return CONFIGURED_TELEGRAM_ID;
+}
+
 async function call(method, path, args, body) {
   if (!SERVICE_TOKEN) return { ok: false, error: "DRHIRO_OPENCLAW_SERVICE_TOKEN not set" };
-  const telegramId = args && args.telegram_id;
+  const telegramId = resolveTelegramId(args && args.telegram_id);
+  if (!telegramId) return { ok: false, error: "No configured Telegram identity (DRHIRO_TELEGRAM_ID not set)" };
   try {
     const res = await fetch(API_BASE + path, {
       method,
       headers: {
         "X-Service-Token": SERVICE_TOKEN,
-        "X-Telegram-Id": telegramId || "",
+        "X-Telegram-Id": telegramId,
         "Content-Type": "application/json",
       },
       body: body ? JSON.stringify(body) : undefined,
