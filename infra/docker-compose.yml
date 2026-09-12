@@ -50,10 +50,13 @@ services:
       context: ../services/intelligent-meal
     image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-intelligent-meal:${DRHIRO_VERSION:-0.1.0}
     restart: unless-stopped
+    env_file: .env
     expose: ['8090']
     environment:
       DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/2
+      DRHIRO_JWT_SECRET: ${DRHIRO_JWT_SECRET}
+      DRHIRO_SERVICE_TOKEN: ${DRHIRO_SERVICE_TOKEN}
     depends_on:
       postgres:
         condition: service_healthy
