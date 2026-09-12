@@ -78,16 +78,16 @@ if [[ "$1" == "compose" && "$2" == "ps" ]]; then
   echo "trueforge Up 2 minutes"
 fi
 ''')
-    # Fail any request touching the SSE probe (localhost:3100).
+    # Fail any request touching the SSE probe (localhost:3101; drhiro-tools moved).
     _write_stub(stub_bin, "curl", '''#!/usr/bin/env bash
 case "$*" in
-  *3100/sse*) exit 1 ;;
+  *3101/sse*) exit 1 ;;
 esac
 exit 0
 ''')
     code, out = _run_health_check(stub_bin)
     assert code != 0
-    assert "FAIL drhiro-tools not reachable on :3100" in out
+    assert "FAIL drhiro-tools not reachable on :3101" in out
 
 
 def test_health_check_passes_when_all_ok(stub_bin, tmp_path):

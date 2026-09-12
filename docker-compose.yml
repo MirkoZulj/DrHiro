@@ -184,18 +184,41 @@ services:
       context: ./services/drhiro-tools
     image: drhiro-tools:${DRHIRO_VERSION:-0.1.0}
     restart: unless-stopped
-    expose: ["3100"]
+    expose: ["3101"]
     environment:
       EXPORT_DIR: /data/exports
       DRHIRO_VERSION: ${DRHIRO_VERSION:-0.1.0}
       # FastMCP SSE server binds this port (pydantic-settings FASTMCP_ prefix).
-      # The compose exposes 3100 and TrueForge registers
-      # http://drhiro-tools:3100/sse as the MCP server URL, so it MUST match.
-      FASTMCP_PORT: "3100"
+      # Moved to 3101: port 3100 is now owned by the hardened drhiro-mcp service.
+      FASTMCP_PORT: "3101"
     volumes:
       - exports_data:/data/exports
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:3100/sse')"]
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:3101/sse')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    networks: [drhiro-net]
+
+  # --- drHiro MCP server (hardened, token-gated) -----------------------------
+  drhiro-mcp:
+    build:
+      context: ./packages/drhiro-mcp
+    image: drhiro-mcp:${DRHIRO_VERSION:-0.1.0}
+    restart: unless-stopped
+    expose: ["3100"]
+    environment:
+      DRHIRO_API_URL: http://api:8000/api/v1
+      DRHIRO_SERVICE_TOKEN: ${DRHIRO_SERVICE_TOKEN}
+      DRHIRO_MCP_SERVER_TOKEN: ${DRHIRO_MCP_SERVER_TOKEN}
+      DRHIRO_MCP_BIND: "0.0.0.0"
+      REDIS_URL: redis://redis:6379/3
+      DRHIRO_LIQUID_WRITER: ${DRHIRO_LIQUID_WRITER:-legacy}
+    depends_on:
+      api: { condition: service_started }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:3100/healthz')"]
       interval: 20s
       timeout: 5s
       retries: 3
