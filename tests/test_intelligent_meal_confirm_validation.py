@@ -164,6 +164,147 @@ def test_out_of_range_selection_rejected(db, user):
     assert meals_after == meals_before, "A meal row was committed despite invalid selection"
 
 
+def test_user_b_cannot_alter_user_a_meal_set_weight(db):
+    """User B cannot alter User A's meal via set-weight endpoint (Qodo #2)."""
+    import json
+    svc = _import_service()
+    fake_redis = FakeRedis()
+    svc.redis_client = fake_redis
+    svc.SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, expire_on_commit=False)
+
+    # Create two users
+    uid_a = uuid.uuid4()
+    uid_b = uuid.uuid4()
+    db.execute(
+        text("INSERT INTO users (id, display_name, timezone, locale, status, created_at, updated_at) "
+             "VALUES (:id, 'UserA', 'UTC', 'en', 'active', NOW(), NOW())"),
+        {"id": str(uid_a)},
+    )
+    db.execute(
+        text("INSERT INTO users (id, display_name, timezone, locale, status, created_at, updated_at) "
+             "VALUES (:id, 'UserB', 'UTC', 'en', 'active', NOW(), NOW())"),
+        {"id": str(uid_b)},
+    )
+    db.commit()
+
+    # User A creates a meal with one item
+    mid = uuid.uuid4()
+    db.execute(
+        text("INSERT INTO meals (id, user_id, eaten_at, meal_type, status, input_method, notes, totals_json, confidence, created_at, updated_at) "
+             "VALUES (:mid, :uid, NOW(), 'lunch', 'confirmed', 'test', 'test meal', '{\"kcal\": 500}', 1.0, NOW(), NOW())"),
+        {"mid": str(mid), "uid": str(uid_a)},
+    )
+    db.execute(
+        text("INSERT INTO meal_items (id, meal_id, display_name, quantity, grams, nutrients_json, source, confidence, user_corrected, created_at, updated_at) "
+             "VALUES (:iid, :mid, 'Chicken Breast', 1.0, 200, '{\"kcal\": 330}', 'test', 1.0, FALSE, NOW(), NOW())"),
+        {"iid": str(uuid.uuid4()), "mid": str(mid)},
+    )
+    db.commit()
+
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        # User B tries to set weight on User A's meal
+        result = loop.run_until_complete(svc.set_meal_item_weight(
+            meal_id=str(mid),
+            req=svc.SetWeightRequest(text="chicken", grams=300),
+            user={"id": str(uid_b), "telegram_id": "999"},
+            db=db,
+        ))
+    finally:
+        loop.close()
+
+    # Should be rejected (meal_not_found from User B's perspective)
+    assert result.get("ok") is False, f"User B was able to modify User A's meal: {result}"
+    assert result.get("error") == "meal_not_found", f"Expected meal_not_found, got: {result}"
+
+    # Verify the meal was NOT modified
+    db.expire_all()
+    meal = db.execute(text("SELECT totals_json FROM meals WHERE id = :mid"), {"mid": str(mid)}).fetchone()
+    assert meal is not None, "Meal was deleted"
+    totals = json.loads(meal[0]) if isinstance(meal[0], str) else meal[0]
+    assert totals.get("kcal") == 500, f"Meal totals were modified: {totals}"
+
+
+def test_user_b_cannot_alter_user_a_meal_set_custom(db):
+    """User B cannot alter User A's meal via set-custom endpoint (Qodo #2)."""
+    import json
+    svc = _import_service()
+    fake_redis = FakeRedis()
+    svc.redis_client = fake_redis
+    svc.SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, expire_on_commit=False)
+
+    # Create two users
+    uid_a = uuid.uuid4()
+    uid_b = uuid.uuid4()
+    db.execute(
+        text("INSERT INTO users (id, display_name, timezone, locale, status, created_at, updated_at) "
+             "VALUES (:id, 'UserA', 'UTC', 'en', 'active', NOW(), NOW())"),
+        {"id": str(uid_a)},
+    )
+    db.execute(
+        text("INSERT INTO users (id, display_name, timezone, locale, status, created_at, updated_at) "
+             "VALUES (:id, 'UserB', 'UTC', 'en', 'active', NOW(), NOW())"),
+        {"id": str(uid_b)},
+    )
+    db.commit()
+
+    # User A creates a meal with one item
+    mid = uuid.uuid4()
+    db.execute(
+        text("INSERT INTO meals (id, user_id, eaten_at, meal_type, status, input_method, notes, totals_json, confidence, created_at, updated_at) "
+             "VALUES (:mid, :uid, NOW(), 'lunch', 'confirmed', 'test', 'test meal', '{\"kcal\": 500}', 1.0, NOW(), NOW())"),
+        {"mid": str(mid), "uid": str(uid_a)},
+    )
+    db.execute(
+        text("INSERT INTO meal_items (id, meal_id, display_name, quantity, grams, nutrients_json, source, confidence, user_corrected, created_at, updated_at) "
+             "VALUES (:iid, :mid, 'Chicken Breast', 1.0, 200, '{\"kcal\": 330}', 'test', 1.0, FALSE, NOW(), NOW())"),
+        {"iid": str(uuid.uuid4()), "mid": str(mid)},
+    )
+    db.commit()
+
+    # Build a fake request for set_custom_nutrition
+    from starlette.requests import Request
+    from io import BytesIO
+
+    async def async_bytesio():
+        return BytesIO(b"")
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": f"/meals/{mid}/items/set-custom",
+        "query_string": b"kcal_per_100g=999&protein_per_100g=0&carbs_per_100g=0&fat_per_100g=0&fiber_per_100g=0&sodium_per_100g=0",
+        "headers": [],
+    }
+    request = Request(scope)
+
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        # User B tries to set custom nutrition on User A's meal
+        result = loop.run_until_complete(svc.set_custom_nutrition(
+            meal_id=str(mid),
+            request=request,
+            req=svc.MealIn(text="chicken"),
+            user={"id": str(uid_b), "telegram_id": "999"},
+            db=db,
+        ))
+    finally:
+        loop.close()
+
+    # Should be rejected (meal_not_found from User B's perspective)
+    assert result.get("ok") is False, f"User B was able to modify User A's meal: {result}"
+    assert result.get("error") == "meal_not_found", f"Expected meal_not_found, got: {result}"
+
+    # Verify the meal was NOT modified
+    db.expire_all()
+    meal = db.execute(text("SELECT totals_json FROM meals WHERE id = :mid"), {"mid": str(mid)}).fetchone()
+    assert meal is not None, "Meal was deleted"
+    totals = json.loads(meal[0]) if isinstance(meal[0], str) else meal[0]
+    assert totals.get("kcal") == 500, f"Meal totals were modified: {totals}"
+
+
 def test_negative_selection_rejected(db, user):
     """A negative selection index must be rejected."""
     import json

@@ -1556,7 +1556,7 @@ async def correct_meal_item(
             except Exception:
                 pass
     tot = {k: round(v, 2) for k, v in tot.items()}
-    db.execute(text("UPDATE meals SET totals_json = :tj, updated_at = NOW() WHERE id = :mid"), {"tj": json.dumps(tot), "mid": meal_id})
+    db.execute(text("UPDATE meals SET totals_json = :tj, updated_at = NOW() WHERE id = :mid AND user_id = :uid"), {"tj": json.dumps(tot), "mid": meal_id, "uid": user["id"]})
     db.commit()
     return {"ok": True, "meal_id": meal_id, "replaced": old_name, "replaced_with": new_name, "grams": grams, "totals": tot}
 
@@ -1593,7 +1593,7 @@ async def set_custom_nutrition(
     fib100 = _f("fiber_per_100g")
     sod100 = _f("sodium_per_100g")
     new_name = qp.get("new_name")
-    meal = db.execute(text("SELECT id FROM meals WHERE id = :mid"), {"mid": meal_id}).fetchone()
+    meal = db.execute(text("SELECT id FROM meals WHERE id = :mid AND user_id = :uid"), {"mid": meal_id, "uid": user["id"]}).fetchone()
     if not meal:
         return {"ok": False, "error": "meal_not_found"}
     items = db.execute(text("SELECT id, display_name, grams FROM meal_items WHERE meal_id = :mid"), {"mid": meal_id}).fetchall()
@@ -1626,7 +1626,7 @@ async def set_custom_nutrition(
             except Exception:
                 pass
     tot = {k: round(v, 2) for k, v in tot.items()}
-    db.execute(text("UPDATE meals SET totals_json = :tj, updated_at = NOW() WHERE id = :mid"), {"tj": json.dumps(tot), "mid": meal_id})
+    db.execute(text("UPDATE meals SET totals_json = :tj, updated_at = NOW() WHERE id = :mid AND user_id = :uid"), {"tj": json.dumps(tot), "mid": meal_id, "uid": user["id"]})
     db.commit()
     return {"ok": True, "item_id": item_id, "display_name": dn, "grams": grams,
             "per_100g": {"kcal": kcal100, "protein_g": prot100, "carbs_g": carb100, "fat_g": fat100},
@@ -1651,7 +1651,7 @@ async def set_meal_item_weight(
         return {"ok": False, "error": "missing_text"}
     if not new_grams or new_grams <= 0 or new_grams > 10000:
         return {"ok": False, "error": "bad_grams", "message": "grams must be a positive number."}
-    meal = db.execute(text("SELECT id FROM meals WHERE id = :mid"), {"mid": meal_id}).fetchone()
+    meal = db.execute(text("SELECT id FROM meals WHERE id = :mid AND user_id = :uid"), {"mid": meal_id, "uid": user["id"]}).fetchone()
     if not meal:
         return {"ok": False, "error": "meal_not_found"}
     items = db.execute(text("SELECT id, display_name, grams, nutrients_json FROM meal_items WHERE meal_id = :mid"), {"mid": meal_id}).fetchall()
@@ -1688,7 +1688,7 @@ async def set_meal_item_weight(
             except Exception:
                 pass
     tot = {k: round(v, 2) for k, v in tot.items()}
-    db.execute(text("UPDATE meals SET totals_json = :tj, updated_at = NOW() WHERE id = :mid"), {"tj": json.dumps(tot), "mid": meal_id})
+    db.execute(text("UPDATE meals SET totals_json = :tj, updated_at = NOW() WHERE id = :mid AND user_id = :uid"), {"tj": json.dumps(tot), "mid": meal_id, "uid": user["id"]})
     db.commit()
     return {"ok": True, "item_id": item_id, "display_name": old_name,
             "old_grams": old_grams, "grams": new_grams, "rescaled": nj,
@@ -1705,7 +1705,7 @@ async def resolve_meal(frag: str, user: dict = Depends(get_user_from_service_or_
             return {"ok": True, "meal_id": frag}
         except Exception:
             pass
-    row = db.execute(text("SELECT id FROM meals WHERE id::text LIKE :pat ORDER BY created_at DESC LIMIT 1"), {"pat": f"{frag}%"}).fetchone()
+    row = db.execute(text("SELECT id FROM meals WHERE user_id = :uid AND id::text LIKE :pat ORDER BY created_at DESC LIMIT 1"), {"uid": user["id"], "pat": f"{frag}%"}).fetchone()
     if row:
         return {"ok": True, "meal_id": str(row[0])}
     return {"ok": False, "error": "not_found"}
