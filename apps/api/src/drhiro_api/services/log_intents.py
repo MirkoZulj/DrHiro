@@ -30,6 +30,7 @@ from sqlalchemy import text as _sql
 from sqlalchemy.orm import Session
 
 from drhiro_api.models import Activity, BeverageMeasurement, MealItem, Measurement
+from drhiro_api.services.consumption import _delete_beverage_projection_for_meal_items
 
 # --------------------------------------------------------------------------- #
 # vocabulary
@@ -468,6 +469,11 @@ def _write_ledgers(db: Session, user, parsed: "ParsedLog", now, existing,
                         notes=None, totals_json=None, confidence=1.0)
             db.add(meal)
         db.flush()
+        # Delete the full beverage projection (BeverageMeasurement + Measurement)
+        # for all items before bulk-deleting items so no stale hydration survives
+        # and no orphaned link can be reused by copy logic.
+        existing_item_ids = [mi.id for mi in db.query(MealItem).filter(MealItem.meal_id == meal.id).all()]
+        _delete_beverage_projection_for_meal_items(db, str(user.id), existing_item_ids)
         # Replace the item set: an edit removes what the new text no longer implies.
         db.query(MealItem).filter(MealItem.meal_id == meal.id).delete()
         db.flush()

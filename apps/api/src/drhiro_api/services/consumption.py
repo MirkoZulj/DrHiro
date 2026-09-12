@@ -2216,6 +2216,34 @@ def delete_beverage_item(
     return {"ok": True, "item_id": item_id, "meal_totals": meal.totals_json if meal else {}}
 
 
+def _delete_beverage_projection_for_meal_items(
+    db: Session,
+    user_id: str,
+    meal_item_ids: list[uuid.UUID],
+) -> None:
+    """Delete the full beverage projection (BeverageMeasurement + Measurement)
+    for a set of meal items. Order: dependants (BeverageMeasurement) before
+    parents (Measurement). Safe for non-beverage items (no-op).
+
+    Use when meal items are being replaced/deleted so no stale hydration
+    survives and no orphaned link can be reused by copy logic.
+    """
+    if not meal_item_ids:
+        return
+    bevs = db.query(BeverageMeasurement).filter(
+        BeverageMeasurement.meal_item_id.in_(meal_item_ids),
+        BeverageMeasurement.user_id == user_id,
+    ).all()
+    bev_meas_ids = [bev.measurement_id for bev in bevs]
+    if bev_meas_ids:
+        db.query(Measurement).filter(
+            Measurement.id.in_(bev_meas_ids),
+            Measurement.user_id == user_id,
+        ).delete(synchronize_session=False)
+    for bev in bevs:
+        db.delete(bev)
+
+
 def copy_beverage_link(
     db: Session,
     user_id: str,

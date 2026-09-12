@@ -25,6 +25,7 @@ from drhiro_api.services.consumption import (
     create_beverage_projection,
     propagate_beverage_patch,
     delete_beverage_item,
+    _delete_beverage_projection_for_meal_items,
     copy_beverage_link,
     _classify_beverage,
 )
