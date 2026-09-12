@@ -1220,9 +1220,36 @@ async def confirm_meal(
             },
         }
 
+    # --- Validate selection indices BEFORE doing any work ---
+    # An out-of-range selection must be rejected (not silently produce an empty
+    # zero-total meal). Also fix the earlier undefined-name branch: the catalog
+    # learning hook referenced `c` before it was ever assigned.
+    for i, item_data in enumerate(draft["items"]):
+        sel_idx = req.selections[i] if i < len(req.selections) else 0
+        candidates = item_data.get("candidates", [])
+        if sel_idx < 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Selection index for item {i} is negative ({sel_idx}); all indices must be >= 0",
+            )
+        if candidates and sel_idx >= len(candidates):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Selection index {sel_idx} for item {i} is out of range "
+                    f"(only {len(candidates)} candidate(s) available)"
+                ),
+            )
+        if not candidates and sel_idx > 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Selection index {sel_idx} for item {i} is invalid (no candidates available)",
+            )
+
     # Create meal items
     totals = {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "fiber_g": 0.0, "sodium_mg": 0.0}
     item_details = []
+    has_any_item = False
 
     for i, item_data in enumerate(draft["items"]):
         sel_idx = req.selections[i] if i < len(req.selections) else 0
@@ -1309,27 +1336,13 @@ async def confirm_meal(
                 "grams": grams,
                 "source": c.get("source", "unknown"),
             })
-        elif fragment and candidates:
-            # Learning hook: if the winning candidate came from the google
-            # fallback, persist it into the private catalog so future meals hit
-            # the DB first (2026-08-30 pipeline fix).
-            try:
-                win_src = (c.get("source") or "").lower()
-                if "google" in win_src or "camoufox" in win_src:
-                    per100g = {
-                        "kcal": c.get("kcal_per_100g"),
-                        "protein_g": c.get("protein_g_per_100g"),
-                        "carbs_g": c.get("carbs_g_per_100g"),
-                        "fat_g": c.get("fat_g_per_100g"),
-                        "fiber_g": c.get("fiber_g_per_100g"),
-                        "sodium_mg": c.get("sodium_mg_per_100g"),
-                    }
-                    catalog_learn(db, fragment, per100g,
-                                  external_id="google:" + re.sub(r"[^a-z0-9]+", "-", fragment.lower()).strip("-")[:80])
-            except Exception as e:
-                log.warning(f"[catalog-learn] google learn failed: {e}")
-        else:
-            # No candidate: log raw fragment as 0-kcal placeholder (user adjusts later)
+            has_any_item = True
+        elif fragment:
+            # No candidate at this index (out-of-range or empty candidate list):
+            # log raw fragment as 0-kcal placeholder (user adjusts later).
+            # NOTE: the old "elif fragment and candidates" learning hook referenced
+            # `c` before assignment when sel_idx was out of range — fixed above by
+            # pre-validating indices so this branch is only reached with no candidate.
             item_id = str(uuid.uuid4())
             db.execute(
                 text("""
@@ -1353,6 +1366,17 @@ async def confirm_meal(
                 "grams": grams,
                 "source": "unmatched",
             })
+            has_any_item = True
+
+    # Zero-total / empty meal guard: if nothing was written, do NOT commit the
+    # meal row — roll back the INSERT and surface a clear error instead of a
+    # permanent empty record.
+    if not has_any_item:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail="Confirmation produced no meal items (no valid selections for any draft entry)",
+        )
 
     db.execute(
         text("UPDATE meals SET totals_json = :totals WHERE id = :id"),
