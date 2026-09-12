@@ -56,7 +56,8 @@
         "enabled": true,
         "env": {
           "DRHIRO_MCP_API": "${OPENCLAW_DRHIRO_API}",
-          "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}"
+          "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}",
+          "DRHIRO_TELEGRAM_ID": "${DRHIRO_TELEGRAM_ID}"
         }
       }
     }

@@ -311,6 +311,7 @@ services:
       NOUS_API_KEY: ${NOUS_API_KEY:-}
       OPENCLAW_DRHIRO_API: http://api:8000/api/v1
       DRHIRO_OPENCLAW_SERVICE_TOKEN: ${DRHIRO_OPENCLAW_SERVICE_TOKEN:-}
+      DRHIRO_TELEGRAM_ID: ${DRHIRO_TELEGRAM_ID:-}
     volumes:
       - ./openclaw/openclaw.json:/seed/openclaw.json:ro
       - ./openclaw/skill-drhiro:/seed/skills:ro
