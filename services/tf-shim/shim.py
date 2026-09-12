@@ -174,18 +174,24 @@ async def get_or_create_session(key: str) -> str:
     return session_id
 
 
-async def stash_user_text(text: str) -> None:
-    """Record the user's raw words for the MCP layer.
+async def stash_user_text(text: str, conversation_id: str = "") -> None:
+    """Record the user's raw words for the MCP layer, scoped per conversation.
 
     Qwen paraphrases when it calls tools and frequently drops the day words
     ("On Monday for dinner ..." becomes "200g chicken and 150g rice"), which
     would silently log the meal against today. The MCP server reads this key to
     recover the date phrase, so correctness does not depend on the model
     faithfully echoing the sentence.
+
+    conversation_id is the shim's stable conversation key. If empty/missing,
+    we DO NOT WRITE AT ALL — a global fallback would leak state across
+    concurrent users.
     """
     try:
         r = await redis_conn()
-        await r.set("tfshim:last_user_text", text, ex=900)
+        if not conversation_id:
+            return  # fail-safe: never fall back to a global key
+        await r.set(f"tfshim:last_user_text:{conversation_id}", text, ex=900)
     except Exception:
         pass
 
@@ -257,17 +263,24 @@ async def _get_stored_result(event_id: str) -> dict | None:
         return None
 
 
-async def run_turn(session_id: str, text: str) -> str:
+async def run_turn(session_id: str, text: str, conversation_id: str = "") -> str:
     """POST a turn and accumulate the streamed assistant reply."""
-    await stash_user_text(text)
+    await stash_user_text(text, conversation_id=conversation_id)
     chunks: list[str] = []
     finished = False
+
+    # Carry the conversation id into the turn so the agent can pass it to
+    # tools via their conversation_id argument. This is the only conduit
+    # from the shim to the MCP server (the model's tool-call arguments).
+    turn_input = [{"type": "user.message", "content": text}]
+    if conversation_id:
+        turn_input.append({"type": "context", "content": f"drhiro_conversation_id={conversation_id}"})
 
     async with httpx.AsyncClient(timeout=TURN_TIMEOUT) as c:
         async with c.stream(
             "POST",
             f"{TRUEFORGE_URL}/api/v1/sessions/{session_id}/turns",
-            json={"input": [{"type": "user.message", "content": text}]},
+            json={"input": turn_input},
             headers={"Accept": "text/event-stream"},
         ) as stream:
             async for line in stream.aiter_lines():
@@ -475,7 +488,7 @@ async def chat_completions(request: Request):
 
     try:
         session_id = await get_or_create_session(key)
-        reply = await run_turn(session_id, text)
+        reply = await run_turn(session_id, text, conversation_id=key)
     except Exception as e:  # surface the failure to OpenClaw rather than hanging
         return JSONResponse(
             {"error": {"message": f"trueforge error: {e}", "type": "server_error"}},
