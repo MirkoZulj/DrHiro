@@ -43,9 +43,10 @@ class TestR4MigrationChain:
         """Exactly one head: the chain must be linear (no forks)."""
         heads = _script().get_heads()
         assert len(heads) == 1, f"expected single head, got {heads}"
-        # e1f2a3b4c5d6 adds the partial unique index uq_meals_user_source_op
-        # for meal-confirmation idempotency (Finding #3).
-        assert heads[0] == "e1f2a3b4c5d6"
+        # a0b1c2d3e4f5 creates the activities table for fresh databases
+        # (Qodo #3). e1f2a3b4c5d6 adds the partial unique index
+        # uq_meals_user_source_op for meal-confirmation idempotency.
+        assert heads[0] == "a0b1c2d3e4f5"
 
     def test_activities_adoption_revision_is_deferred(self):
         """b7c8d9e0f1a2 (the `activities` adoption) is DEFERRED, not in the chain.
