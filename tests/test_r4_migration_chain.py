@@ -111,7 +111,8 @@ class TestR4MigrationChain:
 
     def test_meal_idempotency_migration_is_in_chain(self):
         """e1f2a3b4c5d6 (meal-confirmation idempotency) is in the chain and
-        chains off the prior head (d6e7f8a9b0c1)."""
+        chains off the prior head (d6e7f8a9b0c1). It descends from f1a2b3c4d5e6
+        (which adds meals.source_operation_id) so the column is guaranteed."""
         revisions = {r.revision: r for r in _script().walk_revisions()}
         assert "e1f2a3b4c5d6" in revisions, "meal idempotency migration missing"
         assert revisions["e1f2a3b4c5d6"].down_revision == "d6e7f8a9b0c1", (
@@ -128,3 +129,30 @@ class TestR4MigrationChain:
         # Partial index: WHERE source_operation_id IS NOT NULL so legacy NULL
         # rows stay allowed.
         assert "WHERE" in mig and "IS NOT NULL" in mig
+
+    def test_meal_idempotency_descends_from_source_operation_column(self):
+        """e1f2a3b4c5d6 (meal-confirmation idempotency) descends from
+        f1a2b3c4d5e6 (which adds meals.source_operation_id).
+
+        Verified: the chain is
+        ... f1a2b3c4d5e6 -> ... -> e1f2a3b4c5d6
+        so the column is guaranteed to exist when the index is created.
+        """
+        revisions = {r.revision: r for r in _script().walk_revisions()}
+        # f1a2b3c4d5e6 is an ancestor of e1f2a3b4c5d6
+        assert "f1a2b3c4d5e6" in revisions
+        assert "e1f2a3b4c5d6" in revisions
+        # Walk from e1f2a3b4c5d6 back to base, ensure f1a2b3c4d5e6 is reached
+        current = revisions["e1f2a3b4c5d6"]
+        found_f1a2 = False
+        while current is not None:
+            if current.revision == "f1a2b3c4d5e6":
+                found_f1a2 = True
+                break
+            if current.down_revision is None:
+                break
+            parent_id = current.down_revision
+            if isinstance(parent_id, tuple):
+                parent_id = parent_id[0]
+            current = revisions.get(parent_id)
+        assert found_f1a2, "f1a2b3c4d5e6 must be an ancestor of e1f2a3b4c5d6"
