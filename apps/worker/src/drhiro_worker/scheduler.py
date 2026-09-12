@@ -61,13 +61,16 @@ def run_once() -> dict:
         q = Queue("drhiro", connection=r)
         delivered = 0
         for occ in due:
-            # Mark as 'queued' so deliver_reminder knows to process it, then
-            # enqueue. The delivery job atomically transitions to 'sent' after
-            # successful Telegram send.
+            # Mark as 'queued' and COMMIT BEFORE enqueueing. This ensures:
+            #   1. The worker never observes the row in 'pending' status.
+            #   2. If the worker processes and commits 'sent' first, the
+            #      scheduler's earlier commit has already moved the row past
+            #      'pending' and the delivery job's conditional UPDATE (WHERE
+            #      status = 'queued') cannot overwrite the completed 'sent'.
             occ.status = "queued"
+            db.commit()
             q.enqueue("drhiro_worker.jobs.deliver_reminder", str(occ.id))
             delivered += 1
-        db.commit()
         return {"occurrences_created": created, "due_delivered": delivered}
     finally:
         db.close()
