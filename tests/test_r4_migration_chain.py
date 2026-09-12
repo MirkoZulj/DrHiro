@@ -43,8 +43,9 @@ class TestR4MigrationChain:
         """Exactly one head: the chain must be linear (no forks)."""
         heads = _script().get_heads()
         assert len(heads) == 1, f"expected single head, got {heads}"
-        # d6e7f8a9b0c1 adds app_settings.telegram_allowed_user_id (settings authz).
-        assert heads[0] == "d6e7f8a9b0c1"
+        # e1f2a3b4c5d6 adds the partial unique index uq_meals_user_source_op
+        # for meal-confirmation idempotency (Finding #3).
+        assert heads[0] == "e1f2a3b4c5d6"
 
     def test_activities_adoption_revision_is_deferred(self):
         """b7c8d9e0f1a2 (the `activities` adoption) is DEFERRED, not in the chain.
@@ -96,6 +97,7 @@ class TestR4MigrationChain:
             assert f"'{table}'" in mig or f'"{table}"' in mig, \
                 f"{table} not created by food baseline migration"
 
+
     def test_nutrient_columns_migration_has_upgrade_and_downgrade(self):
         """c9d0e1f2a3b4 (R4 nutrient columns) defines both upgrade and downgrade
         for the four provenance columns."""
@@ -105,3 +107,23 @@ class TestR4MigrationChain:
         for col in ["nutrient_basis", "resolution_source",
                     "food_catalog_item_id", "nutrition_complete"]:
             assert col in mig, f"{col} not handled by R4 migration"
+
+    def test_meal_idempotency_migration_is_in_chain(self):
+        """e1f2a3b4c5d6 (meal-confirmation idempotency) is in the chain and
+        chains off the prior head (d6e7f8a9b0c1)."""
+        revisions = {r.revision: r for r in _script().walk_revisions()}
+        assert "e1f2a3b4c5d6" in revisions, "meal idempotency migration missing"
+        assert revisions["e1f2a3b4c5d6"].down_revision == "d6e7f8a9b0c1", (
+            f"meal idempotency must chain off d6e7f8a9b0c1, got "
+            f"{revisions['e1f2a3b4c5d6'].down_revision}")
+
+    def test_meal_idempotency_migration_has_upgrade_and_downgrade(self):
+        """e1f2a3b4c5d6 defines both upgrade and downgrade (guarded partial
+        unique index creation / drop)."""
+        mig = open(os.path.join(ALEMBIC_DIR, "versions",
+                                "e1f2a3b4c5d6_meal_confirmation_idempotency.py")).read()
+        assert "def upgrade" in mig and "def downgrade" in mig
+        assert "uq_meals_user_source_op" in mig
+        # Partial index: WHERE source_operation_id IS NOT NULL so legacy NULL
+        # rows stay allowed.
+        assert "WHERE" in mig and "IS NOT NULL" in mig
