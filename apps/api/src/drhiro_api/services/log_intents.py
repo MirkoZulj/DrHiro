@@ -29,8 +29,9 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text as _sql
 from sqlalchemy.orm import Session
 
-from drhiro_api.models import Activity, BeverageMeasurement, MealItem, Measurement
+from drhiro_api.models import Activity, BeverageMeasurement, Meal, MealItem, Measurement, Nutrient
 from drhiro_api.services.consumption import _delete_beverage_projection_for_meal_items
+from drhiro_api.food_search import resolve_food, nutrient_map
 
 # --------------------------------------------------------------------------- #
 # vocabulary
@@ -433,6 +434,59 @@ def _merge_liquid_into_existing(db: Session, m: Measurement, intent: LogIntent) 
                    {"i": str(m.id)})
 
 
+def _resolve_intent_nutrition(db: Session, it: LogIntent, user_id: str) -> dict | None:
+    """Resolve scaled nutrition for one parsed meal intent.
+
+    Mirrors the confident branch of ``_lookup_nutrients`` in ``meals.py``:
+    resolve via the ranked ``resolve_food`` match, scale per-100g values by
+    grams, apply the Atwater kcal fallback when the food has no explicit
+    energy nutrient, and return a normalized 6-key payload. Returns the
+    unresolved payload (with ``unresolved=True``) when no match is found.
+    """
+    from drhiro_api.models import Food
+    from drhiro_nutrition.catalog import NutrientTotals
+
+    code_by_id = {n.id: n.nutrient_code for n in db.query(Nutrient).all()}
+    res = resolve_food(db, it.display_name, limit=5, user_id=user_id)
+    food = res.best if res else None
+
+    if food is None:
+        return {
+            "kcal": None, "protein_g": None, "carbs_g": None,
+            "fat_g": None, "fiber_g": None, "sodium_mg": None,
+            "sources": [], "resolved_food": None, "unresolved": True,
+        }
+
+    nmap = nutrient_map(food, code_by_id)
+    grams = it.grams or food.serving_grams or 100.0
+    energy_per_100g = nmap.get("energy")
+    if not energy_per_100g:
+        energy_per_100g = (
+            4.0 * (nmap.get("protein") or 0)
+            + 4.0 * (nmap.get("carbs") or 0)
+            + 9.0 * (nmap.get("fat") or 0)
+        )
+    totals = NutrientTotals(
+        kcal=(energy_per_100g or 0) * grams / 100,
+        protein_g=(nmap.get("protein") or 0) * grams / 100,
+        carbs_g=(nmap.get("carbs") or 0) * grams / 100,
+        fat_g=(nmap.get("fat") or 0) * grams / 100,
+        fiber_g=(nmap.get("fiber") or 0) * grams / 100,
+        sodium_mg=(nmap.get("sodium") or 0) * grams / 100,
+        sources=["usda:fdc-v1"],
+    )
+    return {
+        "kcal": totals.kcal,
+        "protein_g": totals.protein_g,
+        "carbs_g": totals.carbs_g,
+        "fat_g": totals.fat_g,
+        "fiber_g": totals.fiber_g,
+        "sodium_mg": totals.sodium_mg,
+        "sources": totals.sources,
+        "resolved_food": food.display_name,
+    }
+
+
 def _write_ledgers(db: Session, user, parsed: "ParsedLog", now, existing,
                    source: str, order_id: str) -> dict:
     """Write/refresh all three ledgers. `existing` is the previous result_json."""
@@ -478,7 +532,10 @@ def _write_ledgers(db: Session, user, parsed: "ParsedLog", now, existing,
         db.query(MealItem).filter(MealItem.meal_id == meal.id).delete()
         db.flush()
         result["meal_id"] = str(meal.id)
+        meal_nutrients = []  # collect per-item nutrient dicts for totals
         for it in meal_intents:
+            # Resolve nutrition for this intent (matches _lookup_nutrients)
+            nutrients = _resolve_intent_nutrition(db, it, str(user.id))
             mi = MealItem(meal_id=meal.id,
                           food_catalog_item_id=it.food_catalog_item_id,
                           display_name=it.display_name,
@@ -486,11 +543,26 @@ def _write_ledgers(db: Session, user, parsed: "ParsedLog", now, existing,
                           grams=it.grams,                 # volume never becomes grams
                           volume_ml=it.volume_ml,
                           beverage_category=it.category,
-                          nutrients_json=None, source="text", confidence=1.0)
+                          nutrients_json=nutrients, source="text", confidence=1.0)
             db.add(mi)
             db.flush()
             result["item_ids"].append(str(mi.id))
             it.__dict__["_meal_item_id"] = mi.id
+            if nutrients and not nutrients.get("unresolved"):
+                meal_nutrients.append(nutrients)
+        # Compute and set meal.totals_json from resolved item nutrients
+        if meal_nutrients:
+            totals = {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "fiber_g": 0.0, "sodium_mg": 0.0, "estimated": False}
+            for nj in meal_nutrients:
+                for k in totals:
+                    if k == "estimated":
+                        continue
+                    try:
+                        totals[k] += float(nj.get(k) or 0)
+                    except (TypeError, ValueError):
+                        pass
+            totals = {k: round(v, 2) if isinstance(v, float) else v for k, v in totals.items()}
+            meal.totals_json = totals
     elif prev_meal:
         # The new text no longer implies a meal (G6: juice -> water).
         _soft_delete_meal(db, prev_meal)

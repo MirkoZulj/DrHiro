@@ -675,3 +675,47 @@ def test_suite_h7_delete_one_drink_with_food_and_another_drink(client, user, aut
     assert remaining_cat == "water", f"H7: remaining liquid is {remaining_cat!r}, expected 'water'"
     names_after = [i["display_name"].lower() for i in after["items"]]
     assert any("chicken" in n for n in names_after), f"H7: chicken was lost: {names_after}"
+
+
+def test_text_logged_meal_resolves_nutrition(client, user, auth):
+    """Text-logged meals must resolve nutrition and set totals_json (Qodo #1).
+
+    Before the fix, ``_write_ledgers`` left ``MealItem.nutrients_json=None`` and
+    ``Meal.totals_json`` unset. After the fix, each item carries a resolved
+    per-item nutrients payload (or the ``unresolved`` placeholder when no
+    catalog match exists), and the meal's totals_json is computed whenever any
+    item resolves successfully.
+    """
+    r = client.post(TOOL, json={
+        "text": "chicken breast 200g",
+        "telegram_chat_id": CHAT_ID,
+        "telegram_message_id": "80001",
+    }, headers=auth)
+    assert r.status_code == 200, f"text-log failed: {r.status_code} {r.text[:200]}"
+
+    from drhiro_api.db import SessionLocal
+    from drhiro_api.models import Meal, MealItem
+    with SessionLocal() as db:
+        meals = (db.query(Meal)
+                 .filter(Meal.user_id == user["id"])
+                 .order_by(Meal.created_at.desc()).all())
+        assert meals, "no meals created for text-logged chicken breast"
+        meal = meals[0]
+        items = db.query(MealItem).filter(MealItem.meal_id == meal.id).all()
+        assert items, "no items on text-logged meal"
+        for it in items:
+            # The key fix: nutrients_json is NO LONGER None
+            assert it.nutrients_json is not None, (
+                f"item {it.display_name} nutrients_json is None (pre-fix behavior)")
+            # When a food resolves, kcal is non-zero; when unresolved, the
+            # payload carries unresolved=True with null kcal.
+            if it.nutrients_json.get("kcal") is not None:
+                assert it.nutrients_json.get("kcal", 0) > 0, (
+                    f"item {it.display_name} has zero kcal: {it.nutrients_json}")
+        # If ANY item resolved, totals_json must be set with non-zero kcal
+        resolved_items = [i for i in items
+                          if i.nutrients_json and i.nutrients_json.get("unresolved") is not True]
+        if resolved_items:
+            assert meal.totals_json, f"totals_json unset despite resolved items"
+            assert meal.totals_json.get("kcal", 0) > 0, (
+                f"totals_json.kcal is zero: {meal.totals_json}")
