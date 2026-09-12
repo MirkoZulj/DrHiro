@@ -1533,6 +1533,55 @@ def log_manual_liquid(
     )
 
 
+def _update_beverage_meal_item_from_measurement(
+    db: Session,
+    user_id: str,
+    meas: Measurement,
+    old_ml: float,
+    new_ml: float,
+) -> None:
+    """After a beverage Measurement value changes, rescale the linked MealItem's
+    nutrients/volume and recompute the parent Meal's totals_json.
+
+    No-op when the measurement is not linked to a beverage (no BeverageMeasurement).
+    This keeps hydration and the meal projection consistent.
+    """
+    bev = db.query(BeverageMeasurement).filter(
+        BeverageMeasurement.measurement_id == meas.id,
+        BeverageMeasurement.user_id == user_id,
+    ).first()
+    if not bev:
+        return
+
+    mi = db.query(MealItem).filter(MealItem.id == bev.meal_item_id).first()
+    if not mi:
+        # Orphaned beverage_measurement — clean up
+        db.delete(bev)
+        return
+
+    if old_ml > 0 and new_ml != old_ml:
+        factor = new_ml / old_ml
+        old_nj = mi.nutrients_json or {}
+        new_nj = {}
+        for k in NUTRIENT_KEYS:
+            try:
+                new_nj[k] = round(float(old_nj.get(k) or 0) * factor, 2)
+            except (TypeError, ValueError):
+                new_nj[k] = 0.0
+        mi.nutrients_json = new_nj
+        mi.volume_ml = new_ml
+        if mi.grams is not None:
+            mi.grams = new_ml  # 1ml ≈ 1g for beverages
+    elif old_ml == 0:
+        # old was 0; can't rescale, just set new volume
+        mi.volume_ml = new_ml
+
+    # Recompute meal totals from current items
+    meal = db.query(Meal).filter(Meal.id == mi.meal_id).first()
+    if meal:
+        _recompute_meal_totals(db, meal)
+
+
 def _reconcile_liquid(
     db: Session,
     user_id: str,
@@ -1545,86 +1594,65 @@ def _reconcile_liquid(
 
     Finds the existing item (by ConsumptionItem.id or BeverageMeasurement.id
     or Measurement.id) and updates its volume in place. Does NOT insert a
-    second row.
+    second row. Also updates the linked MealItem (volume + nutrients) and
+    the parent Meal totals_json so hydration and the meal projection agree.
     """
+    meas = None
+
     # Try ConsumptionItem.id first
     ci = db.query(ConsumptionItem).filter(
         ConsumptionItem.id == existing_item_id,
         ConsumptionItem.user_id == user_id,
     ).first()
-
     if ci and ci.measurement_id:
         meas = db.query(Measurement).filter(
             Measurement.id == ci.measurement_id,
             Measurement.user_id == user_id,
         ).first()
-        if meas:
-            old_vj = dict(meas.value_json or {})
-            old_ml = old_vj.get("amount_ml") or 0
-            old_vj["amount_ml"] = round(old_ml + amount_ml, 1)
-            meas.value_json = old_vj
-            db.commit()
-            return {
-                "ok": True,
-                "data": {
-                    "reconciled": True,
-                    "measurement_id": str(meas.id),
-                    "total_amount_ml": old_vj["amount_ml"],
-                    "category": old_vj.get("category", category),
-                },
-                "message": f"Added {int(amount_ml)} ml to existing drink (now {int(old_vj['amount_ml'])} ml total).",
-            }
 
     # Try BeverageMeasurement.id
-    bev = db.query(BeverageMeasurement).filter(
-        BeverageMeasurement.id == existing_item_id,
-        BeverageMeasurement.user_id == user_id,
-    ).first()
-    if bev:
-        meas = db.query(Measurement).filter(
-            Measurement.id == bev.measurement_id,
-            Measurement.user_id == user_id,
+    if meas is None:
+        bev = db.query(BeverageMeasurement).filter(
+            BeverageMeasurement.id == existing_item_id,
+            BeverageMeasurement.user_id == user_id,
         ).first()
-        if meas:
-            old_vj = dict(meas.value_json or {})
-            old_ml = old_vj.get("amount_ml") or 0
-            old_vj["amount_ml"] = round(old_ml + amount_ml, 1)
-            meas.value_json = old_vj
-            db.commit()
-            return {
-                "ok": True,
-                "data": {
-                    "reconciled": True,
-                    "measurement_id": str(meas.id),
-                    "total_amount_ml": old_vj["amount_ml"],
-                    "category": old_vj.get("category", category),
-                },
-                "message": f"Added {int(amount_ml)} ml to existing drink (now {int(old_vj['amount_ml'])} ml total).",
-            }
+        if bev:
+            meas = db.query(Measurement).filter(
+                Measurement.id == bev.measurement_id,
+                Measurement.user_id == user_id,
+            ).first()
 
     # Try Measurement.id directly
-    meas = db.query(Measurement).filter(
-        Measurement.id == existing_item_id,
-        Measurement.user_id == user_id,
-    ).first()
-    if meas:
-        old_vj = dict(meas.value_json or {})
-        old_ml = old_vj.get("amount_ml") or 0
-        old_vj["amount_ml"] = round(old_ml + amount_ml, 1)
-        meas.value_json = old_vj
-        db.commit()
-        return {
-            "ok": True,
-            "data": {
-                "reconciled": True,
-                "measurement_id": str(meas.id),
-                "total_amount_ml": old_vj["amount_ml"],
-                "category": old_vj.get("category", category),
-            },
-            "message": f"Added {int(amount_ml)} ml to existing drink (now {int(old_vj['amount_ml'])} ml total).",
-        }
+    if meas is None:
+        meas = db.query(Measurement).filter(
+            Measurement.id == existing_item_id,
+            Measurement.user_id == user_id,
+        ).first()
 
-    return {"ok": False, "error": "item_not_found", "message": "No existing drink found to reconcile with."}
+    if meas is None:
+        return {"ok": False, "error": "item_not_found",
+                "message": "No existing drink found to reconcile with."}
+
+    old_vj = dict(meas.value_json or {})
+    old_ml = old_vj.get("amount_ml") or 0
+    new_ml = round(old_ml + amount_ml, 1)
+    old_vj["amount_ml"] = new_ml
+    meas.value_json = old_vj
+
+    # Keep meal projection consistent: update linked MealItem + Meal totals
+    _update_beverage_meal_item_from_measurement(db, user_id, meas, old_ml, new_ml)
+
+    db.commit()
+    return {
+        "ok": True,
+        "data": {
+            "reconciled": True,
+            "measurement_id": str(meas.id),
+            "total_amount_ml": new_ml,
+            "category": old_vj.get("category", category),
+        },
+        "message": f"Added {int(amount_ml)} ml to existing drink (now {int(new_ml)} ml total).",
+    }
 
 
 def _liquid_to_parsed_items(
