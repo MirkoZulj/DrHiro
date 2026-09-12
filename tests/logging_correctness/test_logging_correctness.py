@@ -627,3 +627,51 @@ def test_suite_h4_echo_meal_item_volume_matches_liquid(client, user, auth):
     assert juice[0]["volume_ml"] == 200.0, (
         f"H4 echo: meal item volume_ml={juice[0]['volume_ml']} != 200 "
         "(the two ledgers disagree)")
+
+
+def test_suite_h6_delete_food_with_multiple_drinks_preserves_drinks(client, user, auth):
+    """Deleting a food item when multiple drinks are logged must NOT delete any drink.
+
+    Regression for Qodo #11: the old code fell back to the first liquid id when
+    Measurement.meal_item_id was empty, so deleting a food alongside multiple
+    drinks could delete an unrelated beverage measurement.
+    """
+    log(client, auth, "chicken 200g, water 500ml, coffee 200ml", message_id=10610)
+    before = observe(user["id"])
+    show("H6 before: chicken + water + coffee", before)
+    assert len(before["liquids"]) == 2, f"H6: expected 2 liquids, got {len(before['liquids'])}"
+    names_before = [i["display_name"].lower() for i in before["items"]]
+    assert any("chicken" in n for n in names_before), f"H6: chicken missing: {names_before}"
+
+    r = client.post(DELETE, json={"telegram_chat_id": CHAT_ID,
+                                  "telegram_message_id": "10610",
+                                  "item_name": "chicken"}, headers=auth)
+    after = observe(user["id"])
+    show("H6 after: delete chicken, drinks preserved", after)
+    assert r.status_code == 200, f"H6: {r.status_code} {r.text[:160]}"
+    assert len(after["liquids"]) == 2, (
+        f"H6: a drink was deleted with the chicken: {len(after['liquids'])} != 2 "
+        f"liquids={after['liquids']}")
+    names_after = [i["display_name"].lower() for i in after["items"]]
+    assert not any("chicken" in n for n in names_after), f"H6: chicken survived: {names_after}"
+
+
+def test_suite_h7_delete_one_drink_with_food_and_another_drink(client, user, auth):
+    """Deleting one drink by name (food + 2 drinks present) must delete only that drink."""
+    log(client, auth, "chicken 200g, water 500ml, coffee 200ml", message_id=10611)
+    before = observe(user["id"])
+    show("H7 before: chicken + water + coffee", before)
+    assert len(before["liquids"]) == 2, f"H7: expected 2 liquids, got {len(before['liquids'])}"
+
+    r = client.post(DELETE, json={"telegram_chat_id": CHAT_ID,
+                                  "telegram_message_id": "10611",
+                                  "item_name": "coffee"}, headers=auth)
+    after = observe(user["id"])
+    show("H7 after: delete coffee only", after)
+    assert r.status_code == 200, f"H7: {r.status_code} {r.text[:160]}"
+    assert len(after["liquids"]) == 1, (
+        f"H7: expected 1 liquid after deleting coffee, got {len(after['liquids'])}")
+    remaining_cat = (after["liquids"][0]["value_json"] or {}).get("category")
+    assert remaining_cat == "water", f"H7: remaining liquid is {remaining_cat!r}, expected 'water'"
+    names_after = [i["display_name"].lower() for i in after["items"]]
+    assert any("chicken" in n for n in names_after), f"H7: chicken was lost: {names_after}"

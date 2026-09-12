@@ -751,15 +751,28 @@ def delete_log(db: Session, user, *, telegram_message_id, telegram_chat_id,
 
     if len(item_matches) == 1:
         target = item_matches[0]
-        # the liquid written for this same item, if any
+        # the liquid written for this same item, if any — resolve the pairing
+        # through the authoritative BeverageMeasurement link (the new writer
+        # records the meal-item relationship there, not on Measurement.meal_item_id).
         paired = None
-        for lid in ids.get("liquid_ids") or []:
-            row = db.get(Measurement, uuid.UUID(str(lid)))
-            if row is not None and (
-                    str(getattr(row, "meal_item_id", "") or "")
-                    == str(target.id) or paired is None):
-                paired = row
-                break
+        bev_link = (db.query(BeverageMeasurement)
+                    .filter(BeverageMeasurement.meal_item_id == target.id)
+                    .first())
+        if bev_link is not None:
+            paired = db.get(Measurement, bev_link.measurement_id)
+        else:
+            # Fallback: legacy writers set Measurement.meal_item_id directly.
+            # Only consider measurements recorded by this operation.
+            op_liquid_ids = set(str(l) for l in (ids.get("liquid_ids") or []))
+            for lid in op_liquid_ids:
+                row = db.get(Measurement, uuid.UUID(lid))
+                if row is not None and (
+                        str(getattr(row, "meal_item_id", "") or "")
+                        == str(target.id)):
+                    paired = row
+                    break
+        # Never guess by taking the first liquid id: if the pairing cannot be
+        # resolved unambiguously, the beverage measurement is left untouched.
         kept = [i for i in (ids.get("item_ids") or []) if str(target.id) != str(i)]
         db.query(MealItem).filter(MealItem.id == target.id).delete()
         ids["item_ids"] = kept
