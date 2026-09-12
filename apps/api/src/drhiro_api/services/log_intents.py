@@ -458,6 +458,15 @@ def _resolve_intent_nutrition(db: Session, it: LogIntent, user_id: str) -> dict 
         }
 
     nmap = nutrient_map(food, code_by_id)
+    if not nmap:
+        # Matched a catalog food that has no usable nutrient rows. Do NOT
+        # emit a false zero-total — route through the unknown/fallback path
+        # so the meal is marked for review rather than logged as 0 kcal.
+        return {
+            "kcal": None, "protein_g": None, "carbs_g": None,
+            "fat_g": None, "fiber_g": None, "sodium_mg": None,
+            "sources": [], "resolved_food": food.display_name, "unresolved": True,
+        }
     grams = it.grams or food.serving_grams or 100.0
     energy_per_100g = nmap.get("energy")
     if not energy_per_100g:
