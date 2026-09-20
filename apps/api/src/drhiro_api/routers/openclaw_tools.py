@@ -526,3 +526,216 @@ def tool_issue_web_login_link(
         message="Dashboard login link minted.",
         data={"url": url, "link_code": link_code, "expires_in": 1800},
     )
+
+
+class GetPendingMealTool(BaseModel):
+    meal_id: str
+
+
+@router.post("/get_pending_meal", response_model=ToolResponse)
+def tool_get_pending_meal(req: GetPendingMealTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Get the parsed items of a meal with status=needs_review for agent verification."""
+    meal = db.query(Meal).filter(Meal.id == uuid.UUID(req.meal_id), Meal.user_id == user.id).first()
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    items = []
+    for item in meal.items:
+        items.append({
+            "item_id": str(item.id),
+            "display_name": item.display_name,
+            "grams": item.grams,
+            "unit": item.unit,
+            "nutrients": item.nutrients_json,
+        })
+    return ToolResponse(
+        ok=True,
+        data={
+            "meal_id": str(meal.id),
+            "meal_type": meal.meal_type,
+            "status": meal.status,
+            "items": items,
+        },
+    )
+
+
+
+
+class SearchFoodTool(BaseModel):
+    query: str
+    limit: int = 5
+
+
+@router.post("/search_food", response_model=ToolResponse)
+def tool_search_food(req: SearchFoodTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Search for foods by name. Returns ranked candidates with nutrition per 100g.
+
+    Local database resolution first; if it is thin/absent, falls back to a live
+    USDA FoodData Central lookup (USDA_API_KEY env var) so the agent can verify
+    a parser match against real online values.
+    """
+    import os as _os
+    from drhiro_api.food_search import resolve_food, nutrient_map
+    from drhiro_api.models import Nutrient
+    result = resolve_food(db, req.query, limit=req.limit, user_id=user.id)
+    code_by_id = {n.id: n.nutrient_code for n in db.query(Nutrient).all()}
+    candidates = []
+    for match in result.matches:
+        f = match.food
+        nmap = nutrient_map(f, code_by_id)
+        candidates.append({
+            "external_id": str(f.external_id),
+            "display_name": f.display_name,
+            "kcal_per_100g": nmap.get("energy"),
+            "protein_g_per_100g": nmap.get("protein"),
+            "carbs_g_per_100g": nmap.get("carbs"),
+            "fat_g_per_100g": nmap.get("fat"),
+            "fiber_g_per_100g": nmap.get("fiber"),
+            "sodium_mg_per_100g": nmap.get("sodium"),
+            "match_tier": match.tier,
+            "is_generic": bool(f.is_generic),
+            "source": "local",
+        })
+    online = _usda_online_candidates(req.query, req.limit)
+    seen = {c["display_name"].lower() for c in candidates}
+    for c in online:
+        key = c["display_name"].lower()
+        if key not in seen:
+            candidates.append(c)
+            seen.add(key)
+    # DuckDuckGo web fallback only when nothing credible found yet.
+    if not candidates and not result.ambiguous:
+        ddg = _ddg_online_candidates(req.query, req.limit)
+        for c in ddg:
+            key = c["display_name"].lower()
+            if key not in seen:
+                candidates.append(c)
+                seen.add(key)
+                try:
+                    _persist_ddg_food(db, c)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+    return ToolResponse(ok=True, data={
+        "candidates": candidates,
+        "ambiguous": result.ambiguous,
+        "online_lookup": bool(online),
+        "ddg_lookup": any(c.get("source") == "duckduckgo" for c in candidates),
+    })
+
+
+
+
+def _usda_online_candidates(query: str, limit: int):
+    """Live USDA FoodData Central lookup. Returns list of candidate dicts."""
+    import os as _os
+    key = _os.environ.get("USDA_API_KEY") or ""
+    if not key:
+        return []
+    try:
+        from drhiro_nutrition.usda import USDACatalog
+    except Exception:
+        return []
+    try:
+        cat = USDACatalog(api_key=key, timeout=8.0)
+        try:
+            items = cat.search(query, limit=limit)
+        finally:
+            cat.close()
+    except Exception:
+        return []
+    out = []
+    for it in items:
+        out.append({
+            "external_id": it.external_id,
+            "display_name": it.display_name,
+            "kcal_per_100g": it.kcal_per_100g,
+            "protein_g_per_100g": it.protein_g_per_100g,
+            "carbs_g_per_100g": it.carbs_g_per_100g,
+            "fat_g_per_100g": it.fat_g_per_100g,
+            "fiber_g_per_100g": it.fiber_g_per_100g,
+            "sodium_mg_per_100g": it.sodium_mg_per_100g,
+            "source": "usda-online",
+        })
+    return out
+
+
+def _ddg_online_candidates(query: str, limit: int):
+    """DuckDuckGo nutrition fallback via the VPS ddg_http service.
+
+    A bare food name often returns no parseable nutrition, so if the first
+    query yields nothing we retry once with 'nutrition per 100g' appended.
+    """
+    import json as _j
+    import re as _re
+    import urllib.request as _ur
+
+    def _fetch(q):
+        try:
+            body = _ur.urlopen(
+                _ur.Request(
+                    "http://172.20.0.1:8098/lookup",
+                    data=_j.dumps({"query": q}).encode(),
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=75,
+            ).read()
+            return _j.loads(body or b"{}")
+        except Exception:
+            return {}
+
+    data = _fetch(query)
+    if not data.get("candidates"):
+        data = _fetch(query + " nutrition per 100g")
+    out = []
+    for c in (data.get("candidates") or [])[:limit]:
+        if c.get("kcal_per_100g") is None and c.get("protein_g_per_100g") is None:
+            continue
+        slug = _re.sub(r"[^a-z0-9]+", "-", (c.get("display_name") or query).lower().strip())[:60]
+        out.append({
+            "external_id": "ddg:" + slug,
+            "display_name": c.get("display_name") or query,
+            "kcal_per_100g": c.get("kcal_per_100g"),
+            "protein_g_per_100g": c.get("protein_g_per_100g"),
+            "carbs_g_per_100g": c.get("carbs_g_per_100g"),
+            "fat_g_per_100g": c.get("fat_g_per_100g"),
+            "fiber_g_per_100g": None,
+            "sodium_mg_per_100g": None,
+            "source": "duckduckgo",
+        })
+    return out
+
+
+
+def _persist_ddg_food(db: Session, c: dict):
+    """Save a DDG-found food locally (drhiro_private source) if new. Best-effort."""
+    import uuid
+    from drhiro_api.models import Food, FoodNutrient, Nutrient, DataSource
+    ds = db.query(DataSource).filter(DataSource.source_key == "drhiro_private").first()
+    if ds is None:
+        return None
+    ex = db.query(Food).filter(Food.data_source_id == ds.id, Food.external_id == c["external_id"]).first()
+    if ex is not None:
+        return ex
+    f = Food(id=uuid.uuid4(), data_source_id=ds.id, external_id=c["external_id"],
+             display_name=c["display_name"], is_generic=True, is_liquid=False)
+    db.add(f)
+    db.flush()
+    # nutrient codes in this schema are the NAME strings search_food reads back.
+    vals = {
+        "energy": c.get("kcal_per_100g"),
+        "protein": c.get("protein_g_per_100g"),
+        "carbs": c.get("carbs_g_per_100g"),
+        "fat": c.get("fat_g_per_100g"),
+    }
+    rows = {n.nutrient_code: n for n in db.query(Nutrient).filter(Nutrient.nutrient_code.in_(list(vals))).all()}
+    for code, val in vals.items():
+        r = rows.get(code)
+        if r is None or val is None:
+            continue
+        db.add(FoodNutrient(food_id=f.id, nutrient_id=r.id, amount_per_100g=val, amount_per_serving=None))
+    db.flush()
+    return f
+
+
+
+
