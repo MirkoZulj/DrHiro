@@ -660,6 +660,17 @@ class MealItemPatch(BaseModel):
     # can pipe search results straight in.
     food_catalog_item_id: str | None = None
     external_id: str | None = None
+    # Custom nutrition override. When ANY *_per_100g value is supplied, the item's
+    # nutrients_json is written DIRECTLY from these values (scaled by grams/100),
+    # skipping catalog resolution. Lets the agent store exact per-100g values the
+    # user provides (or an online lookup returns) that no database food matches.
+    kcal_per_100g: float | None = None
+    protein_per_100g: float | None = None
+    carbs_per_100g: float | None = None
+    fat_per_100g: float | None = None
+    fiber_per_100g: float | None = None
+    sugar_per_100g: float | None = None
+    salt_g_per_100g: float | None = None
 
 
 @router.patch("/{meal_id}/items/{item_id}", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
@@ -685,16 +696,45 @@ def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User =
         item.unit = req.unit
     if req.grams is not None:
         item.grams = req.grams
-    food_ref = req.food_catalog_item_id or req.external_id
-    if food_ref:
-        # Explicit correction: re-point at the chosen food, re-resolve nutrition
-        # FROM THAT FOOD at the item's grams, adopt its canonical name.
-        if not _apply_explicit_food(db, item, food_ref):
-            raise HTTPException(status_code=404, detail=f"Food not found: {food_ref}")
+    # Custom nutrition override: if the user supplied any *_per_100g value,
+    # write nutrients_json DIRECTLY from those values (scaled by grams/100),
+    # skipping catalog resolution entirely. This lets the agent store exact
+    # nutrition (e.g. "100g bread = 281 kcal, fat 11.9g..." or an online
+    # lookup's values) that no database food matches. Values a user did NOT
+    # provide are omitted so the canonical shape stays intact.
+    custom_nutrients = {
+        name: getattr(req, name)
+        for name in ("kcal_per_100g", "protein_per_100g", "carbs_per_100g",
+                     "fat_per_100g", "fiber_per_100g", "sugar_per_100g",
+                     "salt_g_per_100g")
+        if getattr(req, name) is not None
+    }
+    if custom_nutrients:
+        grams = item.grams if item.grams is not None else 100.0
+        factor = grams / 100.0
+        item.nutrients_json = {
+            "kcal": custom_nutrients["kcal_per_100g"] * factor if "kcal_per_100g" in custom_nutrients else None,
+            "protein_g": custom_nutrients["protein_per_100g"] * factor if "protein_per_100g" in custom_nutrients else None,
+            "carbs_g": custom_nutrients["carbs_per_100g"] * factor if "carbs_per_100g" in custom_nutrients else None,
+            "fat_g": custom_nutrients["fat_per_100g"] * factor if "fat_per_100g" in custom_nutrients else None,
+            "fiber_g": custom_nutrients["fiber_per_100g"] * factor if "fiber_per_100g" in custom_nutrients else None,
+            "sugar_g": custom_nutrients["sugar_per_100g"] * factor if "sugar_per_100g" in custom_nutrients else None,
+            "salt_g": custom_nutrients["salt_g_per_100g"] * factor if "salt_g_per_100g" in custom_nutrients else None,
+            "sources": ["user-provided-per-100g"],
+        }
+        item.confidence = 1.0
+        item.source = "user"
     else:
-        # Re-resolve nutrition for the NEW field values (scales per-100g by grams,
-        # keeps the Atwater kcal fallback).
-        _resolve_item_nutrition(db, item, user)
+        food_ref = req.food_catalog_item_id or req.external_id
+        if food_ref:
+            # Explicit correction: re-point at the chosen food, re-resolve nutrition
+            # FROM THAT FOOD at the item's grams, adopt its canonical name.
+            if not _apply_explicit_food(db, item, food_ref):
+                raise HTTPException(status_code=404, detail=f"Food not found: {food_ref}")
+        else:
+            # Re-resolve nutrition for the NEW field values (scales per-100g by grams,
+            # keeps the Atwater kcal fallback).
+            _resolve_item_nutrition(db, item, user)
     item.user_corrected = True
 
     # Propagate beverage changes to linked Measurement (volume/category) via

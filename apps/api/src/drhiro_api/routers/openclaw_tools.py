@@ -275,6 +275,23 @@ class MealItemPatchTool(BaseModel):
     quantity: float | None = None
     unit: str | None = None
     grams: float | None = None
+    # Explicit food re-pointing: same identifier shape search_food / the foods
+    # search endpoint returns ("external_id"); "food_catalog_item_id" accepted
+    # as alias so a search result can be piped straight in. Forwarded to
+    # meals.MealItemPatch, which re-resolves nutrition FROM that food.
+    food_catalog_item_id: str | None = None
+    external_id: str | None = None
+    # Custom per-100g nutrition override — forwarded to meals.MealItemPatch so
+    # the agent can store exact values the user (or an online lookup) provides
+    # that no catalog food matches. Scaled by grams/100 on the server. When any
+    # of these is supplied, nutrients_json is written directly from them.
+    kcal_per_100g: float | None = None
+    protein_per_100g: float | None = None
+    carbs_per_100g: float | None = None
+    fat_per_100g: float | None = None
+    fiber_per_100g: float | None = None
+    sugar_per_100g: float | None = None
+    salt_g_per_100g: float | None = None
 
 
 class UpdateMealItemTool(BaseModel):
@@ -602,6 +619,16 @@ def tool_search_food(req: SearchFoodTool, user: User = Depends(_resolve_user), d
         if key not in seen:
             candidates.append(c)
             seen.add(key)
+    # Persist online hits (USDA + DuckDuckGo) into the local foods table so a
+    # later update_meal_item(display_name / external_id) can resolve them
+    # instead of falling back to 0 kcal. Best-effort: a persistence failure
+    # never fails the search itself.
+    for c in online:
+        try:
+            _persist_food(db, c)
+            db.commit()
+        except Exception:
+            db.rollback()
     # DuckDuckGo web fallback only when nothing credible found yet.
     if not candidates and not result.ambiguous:
         ddg = _ddg_online_candidates(req.query, req.limit)
@@ -611,7 +638,7 @@ def tool_search_food(req: SearchFoodTool, user: User = Depends(_resolve_user), d
                 candidates.append(c)
                 seen.add(key)
                 try:
-                    _persist_ddg_food(db, c)
+                    _persist_food(db, c)
                     db.commit()
                 except Exception:
                     db.rollback()
@@ -706,8 +733,13 @@ def _ddg_online_candidates(query: str, limit: int):
 
 
 
-def _persist_ddg_food(db: Session, c: dict):
-    """Save a DDG-found food locally (drhiro_private source) if new. Best-effort."""
+def _persist_food(db: Session, c: dict):
+    """Save an online-found food locally (drhiro_private source) if new. Best-effort.
+
+    Handles both USDA-online and DuckDuckGo candidate dicts: the external_id
+    namespace is preserved (USDA keeps its real FDC id; DDG keeps 'ddg:<slug>').
+    Returns the existing food row if one already exists for the id.
+    """
     import uuid
     from drhiro_api.models import Food, FoodNutrient, Nutrient, DataSource
     ds = db.query(DataSource).filter(DataSource.source_key == "drhiro_private").first()
