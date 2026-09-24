@@ -25,6 +25,7 @@ class FoodItem:
     fat_g_per_100g: float | None = None
     fiber_g_per_100g: float | None = None
     sodium_mg_per_100g: float | None = None
+    alcohol_g_per_100g: float | None = None
     serving_grams: float | None = None
     serving_unit: str | None = None
     is_liquid: bool = False

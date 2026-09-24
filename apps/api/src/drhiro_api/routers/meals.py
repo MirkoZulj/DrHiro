@@ -6,7 +6,9 @@ never become confirmed data without explicit user confirmation.
 
 from __future__ import annotations
 
+import logging
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 from typing import Literal
 
@@ -21,6 +23,7 @@ from drhiro_api.deps import get_current_user
 from drhiro_api.food_search import nutrient_map, resolve_food
 from drhiro_api.models import Food, FoodCatalogItem, FoodNutrient, Meal, MealItem, Nutrient, User
 from drhiro_api.security import audit
+from drhiro_api.nutrition_validation import validate_energy
 from drhiro_api.services.consumption import (
     create_beverage_projection,
     propagate_beverage_patch,
@@ -34,6 +37,8 @@ from drhiro_nutrition.catalog import FoodItem, NutrientTotals, scale_nutrients
 from drhiro_nutrition.composite import CompositeCatalog
 
 router = APIRouter(prefix="/meals", tags=["meals"])
+
+log = logging.getLogger(__name__)
 
 
 class MealItemIn(BaseModel):
@@ -178,7 +183,25 @@ def _lookup_nutrients(db: Session, item: MealItemIn, user: User) -> tuple[dict |
             grams = food.serving_grams * item.quantity
         if grams is None:
             grams = 100.0
+        # Atwater gate: an online food whose published energy contradicts
+        # its own macros (e.g. a kJ value read as kcal) must not be logged.
+        # Replace with the macro-implied value, marked in sources.
+        check = validate_energy(
+            food.kcal_per_100g, food.protein_g_per_100g,
+            food.carbs_g_per_100g, food.fat_g_per_100g,
+            food.alcohol_g_per_100g,
+        )
+        if check.corrected:
+            log.warning(
+                "Atwater-correcting energy for %s (%s): published %s kcal, macros imply %s",
+                food.display_name, food.external_id,
+                check.published_kcal, check.corrected_kcal,
+            )
+            food = replace(food, kcal_per_100g=check.corrected_kcal)
         totals = scale_nutrients(food, grams)
+        if check.corrected:
+            totals.sources.append("energy-atwater-corrected")
+            return _totals_to_json(totals), 0.5, food.source
         return _totals_to_json(totals), 0.7, food.source
     finally:
         cat.close()

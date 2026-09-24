@@ -47,6 +47,7 @@ from drhiro_api.models import (
     Nutrient,
 )
 from drhiro_api.food_search import resolve_food, nutrient_map
+from drhiro_api.nutrition_validation import validate_candidate_energy
 
 log = logging.getLogger("drhiro.consumption")
 
@@ -528,6 +529,14 @@ def _usda_search(query: str, limit: int = 3) -> list[dict]:
 
     Restricted to Foundation/SR Legacy/Survey data types to avoid branded
     products (which often have misleading descriptions).
+
+    USDA search returns TWO ``Energy`` rows per food — kcal (nutrientId 1008)
+    and kJ (nutrientId 1062). Keying by nutrientName lets the kJ figure
+    clobber kcal (~4.2x inflation); keying by nutrientId does not. The
+    published energy is additionally Atwater-validated against the macros
+    (see nutrition_validation) as a defense against any remaining
+    unit/rounding corruption: an impossible value is replaced by the
+    Atwater-implied one and the correction is recorded.
     """
     import os
     import time
@@ -561,18 +570,35 @@ def _usda_search(query: str, limit: int = 3) -> list[dict]:
             desc = f.get("description", "")
             if not desc:
                 continue
-            nuts = {n.get("nutrientName"): n.get("value") for n in f.get("foodNutrients", [])}
-            out.append({
+            # Key by nutrientId, NOT nutrientName: 'Energy' appears twice
+            # (kcal 1008 / kJ 1062) and the name-keyed dict kept the kJ row.
+            nuts = {
+                n.get("nutrientId"): n.get("value")
+                for n in f.get("foodNutrients", [])
+            }
+            cand = {
                 "display_name": desc.title(),
-                "kcal_per_100g": _norm_usda_val(nuts.get("Energy")),
-                "protein_g_per_100g": _norm_usda_val(nuts.get("Protein")),
-                "carbs_g_per_100g": _norm_usda_val(nuts.get("Carbohydrate, by difference")),
-                "fat_g_per_100g": _norm_usda_val(nuts.get("Total lipid (fat)")),
-                "fiber_g_per_100g": _norm_usda_val(nuts.get("Fiber, total dietary")),
-                "sodium_mg_per_100g": _norm_usda_val(nuts.get("Sodium, Na")),
+                "kcal_per_100g": _norm_usda_val(nuts.get(1008)),
+                "protein_g_per_100g": _norm_usda_val(nuts.get(1003)),
+                "carbs_g_per_100g": _norm_usda_val(nuts.get(1005)),
+                "fat_g_per_100g": _norm_usda_val(nuts.get(1004)),
+                "fiber_g_per_100g": _norm_usda_val(nuts.get(1079)),
+                "sodium_mg_per_100g": _norm_usda_val(nuts.get(1093)),
+                "alcohol_g_per_100g": _norm_usda_val(nuts.get(1018)),
                 "source": "usda",
                 "confidence": 0.85,
-            })
+            }
+            check = validate_candidate_energy(cand)
+            if check.corrected:
+                log.warning(
+                    "USDA energy for %s (fdc %s) contradicts its macros: "
+                    "published %s kcal, Atwater %s — storing Atwater value",
+                    desc, f.get("fdcId"), check.published_kcal, check.corrected_kcal,
+                )
+                cand["kcal_per_100g"] = check.corrected_kcal
+                cand["energy_atwater_corrected"] = True
+                cand["confidence"] = 0.7  # corrected, not label-verified
+            out.append(cand)
         _USDA_CACHE[key] = (now, out)
         return out
     except Exception:

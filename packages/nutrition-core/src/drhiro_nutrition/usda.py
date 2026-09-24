@@ -19,6 +19,8 @@ NUTRIENT_IDS = {
     "fat": 1004,          # g
     "fiber": 1079,        # g
     "sodium": 1093,       # mg
+    "alcohol": 1018,      # g — needed so Atwater validation of alcoholic
+                          # drinks counts 7 kcal/g ethanol, not just macros
 }
 
 
@@ -59,6 +61,7 @@ class USDACatalog:
             fat_g_per_100g=nutrients.get(NUTRIENT_IDS["fat"]),
             fiber_g_per_100g=nutrients.get(NUTRIENT_IDS["fiber"]),
             sodium_mg_per_100g=nutrients.get(NUTRIENT_IDS["sodium"]),
+            alcohol_g_per_100g=nutrients.get(NUTRIENT_IDS["alcohol"]),
         )
 
     def search(self, query: str, limit: int = 10) -> list[FoodItem]:

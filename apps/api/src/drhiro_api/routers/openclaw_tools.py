@@ -10,6 +10,7 @@ Each tool maps 1:1 to a function the drHiro skill exposes to the agent.
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,8 @@ from drhiro_rules.calculations import weight_trend
 from drhiro_schema.metrics import MetricType
 
 router = APIRouter(prefix="/tools", tags=["openclaw-tools"])
+
+log = logging.getLogger(__name__)
 
 
 def _resolve_user(
@@ -681,6 +684,7 @@ def _usda_online_candidates(query: str, limit: int):
             "fat_g_per_100g": it.fat_g_per_100g,
             "fiber_g_per_100g": it.fiber_g_per_100g,
             "sodium_mg_per_100g": it.sodium_mg_per_100g,
+            "alcohol_g_per_100g": it.alcohol_g_per_100g,
             "source": "usda-online",
         })
     return out
@@ -739,15 +743,34 @@ def _persist_food(db: Session, c: dict):
     Handles both USDA-online and DuckDuckGo candidate dicts: the external_id
     namespace is preserved (USDA keeps its real FDC id; DDG keeps 'ddg:<slug>').
     Returns the existing food row if one already exists for the id.
+
+    Energy is Atwater-validated before storage: a published kcal that
+    contradicts the candidate's own macros is replaced by the Atwater value,
+    with an audit event recording the correction (never silently).
     """
     import uuid
     from drhiro_api.models import Food, FoodNutrient, Nutrient, DataSource
+    from drhiro_api.security import audit as _audit
+    from drhiro_api.nutrition_validation import validate_candidate_energy
     ds = db.query(DataSource).filter(DataSource.source_key == "drhiro_private").first()
     if ds is None:
         return None
     ex = db.query(Food).filter(Food.data_source_id == ds.id, Food.external_id == c["external_id"]).first()
     if ex is not None:
         return ex
+    # Atwater gate: reject impossible published energy before it enters the
+    # catalog. Store the macro-implied value instead, with a visible marker.
+    # The dict is corrected IN PLACE: tool_search_food's candidate list holds
+    # the same objects, so the agent sees the corrected value + marker too.
+    check = validate_candidate_energy(c)
+    if check.corrected:
+        log.warning(
+            "Atwater-correcting energy for %s (%s): published %s kcal, macros imply %s",
+            c.get("display_name"), c.get("external_id"),
+            check.published_kcal, check.corrected_kcal,
+        )
+        c["kcal_per_100g"] = check.corrected_kcal
+        c["energy_atwater_corrected"] = True
     f = Food(id=uuid.uuid4(), data_source_id=ds.id, external_id=c["external_id"],
              display_name=c["display_name"], is_generic=True, is_liquid=False)
     db.add(f)
@@ -766,6 +789,16 @@ def _persist_food(db: Session, c: dict):
             continue
         db.add(FoodNutrient(food_id=f.id, nutrient_id=r.id, amount_per_100g=val, amount_per_serving=None))
     db.flush()
+    if check.corrected:
+        # Provenance marker: the audit log keeps the USDA fdc id, the
+        # published value, and what was stored instead.
+        _audit(db, "system", None, None, "foods.energy_atwater_corrected", "food", str(f.id), {
+            "external_id": c["external_id"],
+            "display_name": c["display_name"],
+            "published_kcal_per_100g": check.published_kcal,
+            "stored_kcal_per_100g": check.corrected_kcal,
+            "atwater_kcal_per_100g": check.atwater_kcal,
+        })
     return f
 
 
