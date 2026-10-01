@@ -384,6 +384,7 @@ def trends(
     db: Session = Depends(get_db),
 ):
     days = int(period[:-1])
+    tz = ZoneInfo(user.timezone or "UTC")
     measurements = _measurements_since(db, user.id, days)
     if metric == "weight":
         return weight_trend(measurements, days)
@@ -409,15 +410,21 @@ def trends(
             "avg_7d": rolling_average(measurements, MetricType.HEART_RATE, 7),
         }
     if metric in ("calories", "nutrition"):
-        return _nutrition_trend(db, user.id, days)
+        return _nutrition_trend(db, user.id, days, tz)
     raise HTTPException(status_code=400, detail=f"Unsupported metric: {metric}")
 
 
 
 
 
-def _nutrition_trend(db: Session, user_id: uuid.UUID, days: int) -> dict:
-    """Daily nutrition totals from meals over the trailing window."""
+def _nutrition_trend(db: Session, user_id: uuid.UUID, days: int, tz=None) -> dict:
+    """Daily nutrition totals from meals over the trailing window.
+
+    `tz` must be the USER's timezone: the day key has to match the day the
+    bucketed charts use, otherwise a meal at local midnight is attributed to the
+    previous day here and to the correct day there, and the dashboard's "today"
+    figures disagree with the chart above them.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     meals = (
         db.query(Meal)
@@ -428,7 +435,7 @@ def _nutrition_trend(db: Session, user_id: uuid.UUID, days: int) -> dict:
     from collections import defaultdict
     daily: dict[str, dict] = defaultdict(lambda: {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "meals_count": 0})
     for m in meals:
-        local_day = m.eaten_at.date().isoformat()
+        local_day = (m.eaten_at.astimezone(tz) if tz else m.eaten_at).date().isoformat()
         t = m.totals_json or {}
         daily[local_day]["kcal"] += t.get("kcal") or 0
         daily[local_day]["protein_g"] += t.get("protein_g") or 0
@@ -926,12 +933,18 @@ def trends_bucketed(
             end = date_type(y + 1, 1, 1)
         else:
             end = date_type(y, qm + 3, 1)
-        n = 13
+        # The window is a CALENDAR quarter, but the buckets are ISO weeks counted
+        # from the Monday of the quarter's first day. When the quarter's last day
+        # is not a Sunday, its final ISO week spills past bucket 12 and those days
+        # were silently dropped even though they sit inside the window — Q3 2026
+        # lost Sep 28-30, Q4 2026 loses Dec 28-31. Widen n to cover the window.
+        base_m, _ = _iso_week_bounds(start)
+        last_monday, _ = _iso_week_bounds(end - timedelta(days=1))
+        n = (last_monday - base_m).days // 7 + 1
         def bucket_of(dt):
             monday0, _ = _iso_week_bounds(dt.date())
-            base_m, _ = _iso_week_bounds(start)
             idx = (monday0 - base_m).days // 7
-            if idx < 0 or idx >= 13:
+            if idx < 0 or idx >= n:
                 return None, None
             return idx, f"W{dt.date().isocalendar()[1]}"
         period_label = f"Q{((qm-1)//3)+1} {y}"
@@ -963,6 +976,10 @@ def trends_bucketed(
                  .filter(Meal.user_id == user.id,
                          Meal.eaten_at >= start_dt, Meal.eaten_at < end_dt,
                          Meal.status != "deleted")
+                 # Deterministic order: the calorie and macro branches must sum the
+                 # same floats in the same order or the two charts can disagree by
+                 # a rounding step at .x5 boundaries.
+                 .order_by(Meal.eaten_at.asc(), Meal.id.asc())
                  .all())
         buckets: list[list[float]] = [[] for _ in range(n)]
         for m in meals:
@@ -994,6 +1011,10 @@ def trends_bucketed(
                  .filter(Meal.user_id == user.id,
                          Meal.eaten_at >= start_dt, Meal.eaten_at < end_dt,
                          Meal.status != "deleted")
+                 # Deterministic order: the calorie and macro branches must sum the
+                 # same floats in the same order or the two charts can disagree by
+                 # a rounding step at .x5 boundaries.
+                 .order_by(Meal.eaten_at.asc(), Meal.id.asc())
                  .all())
         acc: list[dict] = [{"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0,
                             "fat_g": 0.0, "meals_count": 0} for _ in range(n)]
@@ -1250,12 +1271,18 @@ def liquids_bucketed(
             end = date_type(y + 1, 1, 1)
         else:
             end = date_type(y, qm + 3, 1)
-        n = 13
+        # The window is a CALENDAR quarter, but the buckets are ISO weeks counted
+        # from the Monday of the quarter's first day. When the quarter's last day
+        # is not a Sunday, its final ISO week spills past bucket 12 and those days
+        # were silently dropped even though they sit inside the window — Q3 2026
+        # lost Sep 28-30, Q4 2026 loses Dec 28-31. Widen n to cover the window.
+        base_m, _ = _iso_week_bounds(start)
+        last_monday, _ = _iso_week_bounds(end - timedelta(days=1))
+        n = (last_monday - base_m).days // 7 + 1
         def bucket_of(dt):
             monday0, _ = _iso_week_bounds(dt.date())
-            base_m, _ = _iso_week_bounds(start)
             idx = (monday0 - base_m).days // 7
-            if idx < 0 or idx >= 13:
+            if idx < 0 or idx >= n:
                 return None, None
             return idx, f"W{dt.date().isocalendar()[1]}"
         period_label = f"Q{((qm-1)//3)+1} {y}"

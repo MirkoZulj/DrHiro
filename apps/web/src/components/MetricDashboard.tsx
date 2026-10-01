@@ -236,6 +236,7 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
         <div className="modal-content">
           {isCalories ? (
             <CalorieDashboard bucketed={bucketed} macroBuckets={macroBuckets} nutrition={nutrition} goal={dailyGoal}
+              requestedGran={tf === 'D' ? 'day' : tf === 'W' ? 'week' : 'month'}
               todayIntake={todayIntake} balanceVal={balanceVal} balanceContext={balanceContext} />
           ) : isLiquid ? (
             <LiquidDashboard liquids={liquids} />
@@ -350,8 +351,9 @@ function MetricChartView({ points, config, goal, goalLabel, granularity}: {
 }
 
 /* ---- Calories view (two charts) ---- */
-function CalorieDashboard({ bucketed, macroBuckets, nutrition, goal, todayIntake, balanceVal, balanceContext }: {
+function CalorieDashboard({ bucketed, macroBuckets, nutrition, goal, requestedGran, todayIntake, balanceVal, balanceContext }: {
   bucketed: Bucketed | null; macroBuckets: BucketedMacros | null; nutrition: NutritionTrend | null; goal: number | null
+  requestedGran: string
   todayIntake: number | null; balanceVal: number | null; balanceContext?: boolean
 }) {
   const points = bucketed?.points ?? []
@@ -377,7 +379,7 @@ function CalorieDashboard({ bucketed, macroBuckets, nutrition, goal, todayIntake
   const cS = mbPoints.map((p) => share(p)?.c ?? null)
   const fS = mbPoints.map((p) => share(p)?.f ?? null)
   const macroLabels = mbPoints.map((p) => p.label)
-  const macroTitle = granularity === 'day'
+  const macroTitle = requestedGran === 'day'
     ? 'Macro distribution · % of daily intake'
     : 'Macro distribution · % of intake in the bucket'
 

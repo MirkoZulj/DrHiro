@@ -6,7 +6,7 @@ empty buckets, local-midnight bucketing, and per-bucket summation.
 """
 from __future__ import annotations
 
-from datetime import datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 from drhiro_api.models import Meal
@@ -14,6 +14,11 @@ from drhiro_api.models import Meal
 from tests.conftest import auth_headers
 
 TZ = ZoneInfo("Europe/Zagreb")
+
+
+def _monday_of(d):
+    """Monday of the ISO week containing d (mirrors the endpoint's bucketing)."""
+    return d - timedelta(days=d.weekday())
 
 
 def _meal(db, user, when, kcal, protein, carbs, fat, status="confirmed"):
@@ -55,10 +60,19 @@ def test_day_has_seven_buckets_with_mon_sun_labels(client, db, user_a):
     assert out["period_label"].startswith("Week of ")
 
 
-def test_week_has_thirteen_buckets(client, user_a):
+def test_week_covers_the_whole_quarter(client, user_a):
+    """A calendar quarter is 13 or 14 ISO weeks — never fewer than it needs."""
     out = _get(client, user_a, "week")
-    assert len(out["points"]) == 13
+    assert 13 <= len(out["points"]) <= 14
     assert out["period_label"].startswith("Q")
+    # every bucket is a real ISO week label, and the first one covers the
+    # quarter's opening days (bucket 0 may start before the 1st; the SQL window
+    # keeps only in-quarter meals)
+    assert all(p["label"].startswith("W") for p in out["points"])
+    start, end = _current_quarter_bounds()
+    base = _monday_of(start)
+    last = _monday_of(end - timedelta(days=1))
+    assert len(out["points"]) == (last - base).days // 7 + 1
 
 
 def test_month_has_twelve_buckets(client, user_a):
@@ -152,3 +166,128 @@ def test_calorie_and_macro_values_agree_per_bucket(client, db, user_a):
     cal = _get(client, user_a, "day", metric="calories")
     mac = _get(client, user_a, "day", metric="macros")
     assert [p["value"] for p in cal["points"]] == [p["kcal"] for p in mac["points"]]
+
+
+# ---------------------------------------------------------------------------
+# Offset navigation — the back-navigation math was previously unexercised.
+# ---------------------------------------------------------------------------
+
+def test_day_offset_moves_one_week_back_in_both_charts(client, user_a):
+    cur = _get(client, user_a, "day", offset=0)
+    prev = _get(client, user_a, "day", offset=1)
+    cal_prev = _get(client, user_a, "day", offset=1, metric="calories")
+    assert prev["period_key"] != cur["period_key"]
+    assert prev["period_label"] == cal_prev["period_label"]
+    assert prev["period_key"] == cal_prev["period_key"]
+    assert [p["date"] for p in prev["points"]] == [p["date"] for p in cal_prev["points"]]
+    # one week earlier, to the day
+    first = datetime.fromisoformat(cur["points"][0]["date"]).date()
+    first_prev = datetime.fromisoformat(prev["points"][0]["date"]).date()
+    assert (first - first_prev).days == 7
+
+
+def test_week_offset_moves_one_quarter_back_in_both_charts(client, user_a):
+    cur = _get(client, user_a, "week", offset=0)
+    prev = _get(client, user_a, "week", offset=1)
+    cal_prev = _get(client, user_a, "week", offset=1, metric="calories")
+    assert prev["period_label"] != cur["period_label"]
+    assert prev["period_label"] == cal_prev["period_label"]
+    assert prev["period_key"] == cal_prev["period_key"]
+    assert [p["label"] for p in prev["points"]] == [p["label"] for p in cal_prev["points"]]
+    # the previous quarter must start before the current one and be a real date
+    assert prev["period_key"] < cur["period_key"]
+    assert datetime.fromisoformat(prev["period_key"]).date() < datetime.fromisoformat(cur["period_key"]).date()
+
+
+# ---------------------------------------------------------------------------
+# Quarter boundary — a calendar quarter is not a whole number of ISO weeks, so
+# its final days used to fall outside the 13 buckets and vanish from the chart.
+# ---------------------------------------------------------------------------
+
+def _current_quarter_bounds():
+    today = datetime.now(TZ).date()
+    qm = (today.month - 1) // 3 * 3 + 1
+    start = date(today.year, qm, 1)
+    end = date(today.year + 1, 1, 1) if qm + 3 > 12 else date(today.year, qm + 3, 1)
+    return start, end
+
+
+def test_quarter_tail_days_are_not_dropped(client, db, user_a):
+    """The last days of a quarter are inside the window and must be bucketed."""
+    start, end = _current_quarter_bounds()
+    tail = end - timedelta(days=2)  # inside the quarter's final ISO week
+    assert start <= tail < end
+    _meal(db, user_a, _local_day_at(tail, 12), 900, 50, 60, 30)
+
+    mac = _get(client, user_a, "week", offset=0)
+    cal = _get(client, user_a, "week", offset=0, metric="calories")
+
+    assert len(mac["points"]) >= 13
+    assert sum(p["kcal"] or 0 for p in mac["points"]) == 900.0, "meal on a quarter tail day vanished from the macro chart"
+    assert sum(p["value"] or 0 for p in cal["points"]) == 900.0, "meal on a quarter tail day vanished from the calorie chart"
+    # and the two charts still agree bucket for bucket
+    assert [p["kcal"] for p in mac["points"]] == [p["value"] for p in cal["points"]]
+    # no in-window day may be left without a bucket
+    labels = [p["label"] for p in mac["points"]]
+    assert labels[-1].startswith("W")
+
+
+def test_week_bucket_indexes_the_meal_correctly(client, db, user_a):
+    """A meal in week k of the quarter lands in bucket k (not merely len==13)."""
+    start, end = _current_quarter_bounds()
+    base_monday = _monday_of(start)
+    meal_day = start + timedelta(days=8)  # second week of the quarter
+    _meal(db, user_a, _local_day_at(meal_day, 12), 640, 30, 40, 20)
+
+    out = _get(client, user_a, "week", offset=0)
+    expected = (_monday_of(meal_day) - base_monday).days // 7
+    assert out["points"][expected]["kcal"] == 640.0
+    assert out["points"][expected]["label"] == f"W{meal_day.isocalendar()[1]}"
+    others = [p["kcal"] for i, p in enumerate(out["points"]) if i != expected]
+    assert all(v is None for v in others)
+
+
+# ---------------------------------------------------------------------------
+# Month window boundary
+# ---------------------------------------------------------------------------
+
+def test_month_window_boundary(client, db, user_a):
+    """The oldest month is included; a meal just before the window is not."""
+    today = datetime.now(TZ).date()
+    start = date(today.year - 1, today.month, 1)  # matches the endpoint's month window
+
+    _meal(db, user_a, _local_day_at(start, 12), 500, 30, 40, 20)          # in window
+    _meal(db, user_a, _local_day_at(start - timedelta(days=1), 12), 777, 1, 1, 1)  # out
+
+    out = _get(client, user_a, "month", offset=0)
+    assert out["points"][0]["kcal"] == 500.0
+    assert all(p["kcal"] != 777.0 for p in out["points"])
+
+
+# ---------------------------------------------------------------------------
+# /trends daily nutrition must use the same local day as the bucketed charts
+# ---------------------------------------------------------------------------
+
+def _get_trends(client, user, period="7d", metric="calories"):
+    return client.get(
+        f"/api/v1/trends?metric={metric}&period={period}",
+        headers=auth_headers(user),
+    ).json()
+
+
+def test_daily_nutrition_uses_local_day_not_utc(client, db, user_a):
+    """A meal at local 00:30 belongs to the local day, as it does in the charts."""
+    monday = _this_monday()
+    late = _local_day_at(monday, 0, 30)  # 22:30 the previous day in UTC
+    _meal(db, user_a, late, 100, 5, 10, 4)
+
+    trend = _get_trends(client, user_a, "7d")
+    assert trend["points"], "meal missing from the daily nutrition trend"
+    assert trend["points"][-1]["date"] == monday.isoformat(), (
+        "daily nutrition keyed the meal to the UTC day while the charts use the local day"
+    )
+
+    # and the bucketed charts agree with it
+    mac = _get(client, user_a, "day", metric="macros")
+    assert mac["points"][0]["kcal"] == 100.0
+    assert mac["points"][0]["date"] == monday.isoformat()
