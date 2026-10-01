@@ -966,7 +966,11 @@ def trends_bucketed(
                  .all())
         buckets: list[list[float]] = [[] for _ in range(n)]
         for m in meals:
-            idx, _ = bucket_of(m.eaten_at)
+            # Local-timezone bucketing (Rule 1): a meal at local midnight is
+            # 22:00 UTC the PREVIOUS day, so `.date()` would drop it from this
+            # window entirely (idx < 0) and shift every late-evening meal back a
+            # day. Must match the macros branch below.
+            idx, _ = bucket_of(m.eaten_at.astimezone(tz))
             if idx is None:
                 continue
             buckets[idx].append(float((m.totals_json or {}).get("kcal") or 0))
@@ -976,6 +980,49 @@ def trends_bucketed(
             d = day_at(i)
             lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
             points.append({"date": d.isoformat(), "value": v, "label": lab})
+        return {"granularity": granularity, "metric": metric, "period_label": period_label,
+                "period_key": period_key, "points": points}
+
+    # ---- macros: same windows/buckets/labels as calories, full macro split ----
+    # Reuses the window resolution above verbatim so the macro distribution chart
+    # shares the calorie chart's timeframe (labels/period_label/period_key are
+    # byte-identical for the same granularity+offset). Each bucket sums every
+    # non-deleted meal whose eaten_at falls in it; a bucket with no meals returns
+    # null for every nutrition field (never 0), so the chart renders a gap.
+    if metric in ("macros", "macro_distribution"):
+        meals = (db.query(Meal)
+                 .filter(Meal.user_id == user.id,
+                         Meal.eaten_at >= start_dt, Meal.eaten_at < end_dt,
+                         Meal.status != "deleted")
+                 .all())
+        acc: list[dict] = [{"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0,
+                            "fat_g": 0.0, "meals_count": 0} for _ in range(n)]
+        for m in meals:
+            idx, _ = bucket_of(m.eaten_at.astimezone(tz))
+            if idx is None:
+                continue
+            t = m.totals_json or {}
+            acc[idx]["kcal"] += float(t.get("kcal") or 0)
+            acc[idx]["protein_g"] += float(t.get("protein_g") or 0)
+            acc[idx]["carbs_g"] += float(t.get("carbs_g") or 0)
+            acc[idx]["fat_g"] += float(t.get("fat_g") or 0)
+            acc[idx]["meals_count"] += 1
+        points = []
+        for i in range(n):
+            d = day_at(i)
+            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+            a = acc[i]
+            if a["meals_count"] == 0:
+                points.append({"date": d.isoformat(), "label": lab,
+                               "kcal": None, "protein_g": None, "carbs_g": None,
+                               "fat_g": None, "meals_count": 0})
+            else:
+                points.append({"date": d.isoformat(), "label": lab,
+                               "kcal": round(a["kcal"], 1),
+                               "protein_g": round(a["protein_g"], 1),
+                               "carbs_g": round(a["carbs_g"], 1),
+                               "fat_g": round(a["fat_g"], 1),
+                               "meals_count": a["meals_count"]})
         return {"granularity": granularity, "metric": metric, "period_label": period_label,
                 "period_key": period_key, "points": points}
 
