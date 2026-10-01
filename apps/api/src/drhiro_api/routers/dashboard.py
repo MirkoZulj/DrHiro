@@ -1103,6 +1103,42 @@ def trends_bucketed(
         return {"granularity": granularity, "metric": metric, "period_label": period_label,
                 "period_key": period_key, "points": points}
 
+    # ---- blood pressure: mean of the readings inside each bucket ----
+    # The Blood-pressure tile's `trendKey` is `blood_pressure_systolic`, but this
+    # endpoint never served it, so the BP popup chart returned 400
+    # "Unsupported metric" and rendered empty. Both keys are served here (the
+    # reading lives in value_json, not in a scalar `value`, which is why the
+    # generic metric_map below cannot handle it). Buckets with no reading stay
+    # null, like every other metric.
+    if metric in ("blood_pressure_systolic", "blood_pressure_diastolic", "blood_pressure"):
+        field = "diastolic_mmhg" if metric == "blood_pressure_diastolic" else "systolic_mmhg"
+        bp_query = (db.query(Measurement)
+                    .filter(Measurement.user_id == user.id,
+                            Measurement.metric_type == MetricType.BLOOD_PRESSURE,
+                            Measurement.start_at >= start_dt, Measurement.start_at < end_dt))
+        if _ledger_soft_delete_available(db):
+            bp_query = bp_query.filter(text("measurements.deleted_at IS NULL"))
+        bp_rows = bp_query.order_by(Measurement.start_at.asc()).all()
+        buckets: list[list[float]] = [[] for _ in range(n)]
+        for m in bp_rows:
+            idx, _ = bucket_of(m.start_at.astimezone(tz))
+            if idx is None:
+                continue
+            v = (m.value_json or {}).get(field)
+            if v is None:
+                continue
+            buckets[idx].append(float(v))
+        points = []
+        for i in range(n):
+            vals = buckets[i]
+            d = day_at(i)
+            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+            points.append({"date": d.isoformat(),
+                           "value": round(sum(vals) / len(vals), 1) if vals else None,
+                           "label": lab})
+        return {"granularity": granularity, "metric": metric, "period_label": period_label,
+                "period_key": period_key, "points": points}
+
     # ---- measurement metrics ----
     metric_map = {
         "steps": (MetricType.STEPS, "sum"),

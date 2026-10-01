@@ -9,7 +9,8 @@ from __future__ import annotations
 from datetime import date, datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
-from drhiro_api.models import Meal
+from drhiro_api.models import Meal, Measurement
+from drhiro_schema.metrics import MetricType
 
 from tests.conftest import auth_headers
 
@@ -291,3 +292,66 @@ def test_daily_nutrition_uses_local_day_not_utc(client, db, user_a):
     mac = _get(client, user_a, "day", metric="macros")
     assert mac["points"][0]["kcal"] == 100.0
     assert mac["points"][0]["date"] == monday.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Blood pressure — the tile's trendKey had no backend at all (400), so the BP
+# popup chart rendered empty.
+# ---------------------------------------------------------------------------
+
+def _bp(db, user, when, systolic, diastolic, pulse=None):
+    import uuid as _uuid
+
+    m = Measurement(
+        user_id=user.id,
+        metric_type=MetricType.BLOOD_PRESSURE,
+        start_at=when,
+        end_at=when,
+        value_json={"systolic_mmhg": systolic, "diastolic_mmhg": diastolic, "pulse_bpm": pulse},
+        unit="mmHg",
+        source_provider="manual",
+        source_record_id=str(_uuid.uuid4()),
+    )
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return m
+
+
+def test_blood_pressure_systolic_is_served(client, user_a):
+    """The metric the BP tile actually asks for must not 400."""
+    r = client.get(
+        "/api/v1/trends/bucketed?metric=blood_pressure_systolic&granularity=day&offset=0",
+        headers=auth_headers(user_a),
+    )
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["metric"] == "blood_pressure_systolic"
+    assert len(out["points"]) == 7
+
+
+def test_blood_pressure_buckets_and_averages(client, db, user_a):
+    monday = _this_monday()
+    _bp(db, user_a, _local_day_at(monday, 8), 120, 80)
+    _bp(db, user_a, _local_day_at(monday, 20), 140, 90)
+    _bp(db, user_a, _local_day_at(monday + timedelta(days=2), 12), 118, 76)
+
+    sys_ = _get(client, user_a, "day", metric="blood_pressure_systolic")
+    dia = _get(client, user_a, "day", metric="blood_pressure_diastolic")
+
+    assert sys_["points"][0]["label"] == "Mon"
+    assert sys_["points"][0]["value"] == 130.0, "two readings in one bucket must be averaged"
+    assert dia["points"][0]["value"] == 85.0
+    assert sys_["points"][2]["value"] == 118.0
+    # no reading -> null (a gap), never 0
+    for p in sys_["points"][1:2] + sys_["points"][3:]:
+        assert p["value"] is None
+
+
+def test_blood_pressure_uses_local_day(client, db, user_a):
+    """A reading at local 00:30 belongs to the local day, as everywhere else."""
+    monday = _this_monday()
+    _bp(db, user_a, _local_day_at(monday, 0, 30), 118, 89)
+    out = _get(client, user_a, "day", metric="blood_pressure_systolic")
+    assert out["points"][0]["value"] == 118.0
+    assert all(p["value"] is None for p in out["points"][1:])
