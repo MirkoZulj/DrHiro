@@ -579,3 +579,39 @@ class BeverageMeasurement(Base, TimestampMixin):
     meal_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     measurement_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     consumption_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
+class LogWriteFingerprint(Base, TimestampMixin):
+    """Server-side content fingerprint for a free-text logging write.
+
+    The MCP bridge forwards NO per-message Telegram identity, so every
+    model-initiated ``create_meal_from_text`` call writes an ``anon-<uuid>``
+    order and nothing can recognise a repeat: a looping agent wrote the same
+    26-character water line four times and produced 3000 ml where the truth was
+    750 ml. This table is the dedupe memory for that path.
+
+    Key = (user_id, source, sha256(normalised text + meal_type + local date)).
+    A row is written after a successful ledger write; a later identical call
+    inside ``WINDOW_SECONDS`` finds it and is suppressed instead of writing.
+    Unlike ``consumption_operations`` (which needs a real per-message id) this
+    key is derived ONLY from content the server itself parsed, so it trusts
+    nothing from the model.
+    """
+
+    __tablename__ = "log_write_fingerprints"
+    __table_args__ = (
+        Index("ix_log_fingerprints_user_source_fp", "user_id", "source", "fingerprint"),
+        Index("ix_log_fingerprints_user_seen", "user_id", "seen_at"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The resolved write instant the fingerprint was formed against. Kept
+    # explicit so the window comparison uses the same clock the write used and
+    # is testable without freezing wall time.
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    result_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)

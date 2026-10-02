@@ -74,6 +74,11 @@ class TestActivitiesSoftDeleteColumn:
         assert found_activities, "activities-table not in chain"
 
     def test_activities_is_head(self):
-        """a0b1c2d3e4f5 is the head (creates activities last)."""
+        """a0b1c2d3e4f5 creates activities last before the fingerprint table.
+
+        The single head moved to b1c2d3e4f5a6 (log_write_fingerprints); the
+        activities migration must remain in the chain as its ancestor.
+        """
         heads = _script().get_heads()
-        assert heads[0] == "a0b1c2d3e4f5"
+        assert len(heads) == 1, f"expected single head, got {heads}"
+        assert heads[0] == "b1c2d3e4f5a6"

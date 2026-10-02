@@ -46,7 +46,9 @@ class TestR4MigrationChain:
         # a0b1c2d3e4f5 creates the activities table for fresh databases
         # (Qodo #3). e1f2a3b4c5d6 adds the partial unique index
         # uq_meals_user_source_op for meal-confirmation idempotency.
-        assert heads[0] == "a0b1c2d3e4f5"
+        # b1c2d3e4f5a6 (log_write_fingerprints) chains off it for the
+        # free-text write dedupe guard.
+        assert heads[0] == "b1c2d3e4f5a6"
 
     def test_activities_adoption_revision_is_deferred(self):
         """b7c8d9e0f1a2 (the `activities` adoption) is DEFERRED, not in the chain.
