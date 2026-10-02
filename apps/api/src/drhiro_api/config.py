@@ -85,12 +85,14 @@ class Settings(BaseSettings):
     jev_api_key: str = ""       # env DRHIRO_JEV_API_KEY ("" disables the feature)
     jev_model: str = "jev-latest"
 
-    # Two thresholds, both configurable. score >= jev_accept_threshold => the
-    # candidate is accepted silently. jev_threshold <= score < accept threshold
-    # => surfaced but NOT auto-accepted; the user is asked. score below
-    # jev_threshold => rejected, the cascade falls through to the next source.
-    jev_threshold: float = 0.5
-    jev_accept_threshold: float = 0.88
+    # Two thresholds. Names and defaults deliberately mirror the production
+    # deployment, so an operator moving DRHIRO_JEV_* values between the two
+    # cannot set the wrong bound:
+    #   score >= jev_threshold                 -> accept and log        (0.88)
+    #   jev_review_floor <= score < threshold  -> surface, ask the user (0.5)
+    #   score <  jev_review_floor              -> reject, next candidate
+    jev_threshold: float = 0.88       # env DRHIRO_JEV_THRESHOLD (the accept bar)
+    jev_review_floor: float = 0.5     # env DRHIRO_JEV_REVIEW_FLOOR (lower bound)
 
     @property
     def jev_enabled(self) -> bool:

@@ -131,8 +131,8 @@ def jev_decision(raw_input: str, candidate: str) -> tuple[str, float | None]:
     score = jev_verify(raw_input, candidate)
     if score is None:
         return DECISION_UNVERIFIED, None
-    if score >= s.jev_accept_threshold:
-        return DECISION_ACCEPT, score
     if score >= s.jev_threshold:
+        return DECISION_ACCEPT, score
+    if score >= s.jev_review_floor:
         return DECISION_ASK, score
     return DECISION_REJECT, score
