@@ -213,9 +213,16 @@ def tool_meal_from_text(req: MealFromTextTool, request: Request, user: User = De
     )
     _tool_audit(db, user, "tools.log_text", "meal", result.get("meal_id"))
     db.commit()
+    # When the content-fingerprint guard suppressed a repeat, say so in the
+    # message the model reads. Without this the agent reports "Logged." for a
+    # write that never happened, and a legitimate repeat inside the window
+    # would be silent data loss instead of a visible outcome.
+    suppressed = bool(result.get("duplicate_suppressed"))
     return ToolResponse(
         ok=True,
-        message="Logged.",
+        message=("Already logged moments ago — nothing was written twice. "
+                 "Tell the user it was already recorded, do not log it again."
+                 if suppressed else "Logged."),
         data=result,
     )
 
