@@ -720,6 +720,22 @@ def commit_intents(db: Session, user, parsed: "ParsedLog", *, eaten_at=None,
     op = None
     existing = None
     if has_identity:
+        # Serialise two concurrent submits carrying the SAME identity tuple.
+        # The SELECT ... FOR UPDATE below only locks a row that already exists,
+        # so on a FIRST submit two simultaneous callers both miss the lookup,
+        # both insert, and the loser dies on the unique constraint -- surfacing
+        # to the user as a bare 500 for a write that actually succeeded. Take
+        # the same transaction-scoped advisory lock the fingerprint path uses,
+        # keyed on the identity tuple, so the second caller waits, then sees the
+        # committed row and takes the replay path (same ids, no writes).
+        # Best-effort: a lock failure must not block a legitimate log.
+        try:
+            db.execute(
+                _sql("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                {"k": f"drhiro:logid:{user.id}:{source}:"
+                      f"{telegram_chat_id}:{telegram_message_id}"})
+        except Exception:
+            pass
         op = (db.query(ConsumptionOperation)
               .filter(ConsumptionOperation.user_id == user.id,
                       ConsumptionOperation.source == source,
