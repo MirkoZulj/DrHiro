@@ -24,11 +24,32 @@ class Settings(BaseSettings):
             _sys.argv[0].endswith(("pytest", "py.test"))
             or "PYTEST_CURRENT_TEST" in os.environ
             or os.environ.get("DRHIRO_ENV") == "test"
+            # `python -m pytest` leaves argv[0] pointing at the pytest package, so
+            # the argv test above misses it and the guard fires during COLLECTION,
+            # before PYTEST_CURRENT_TEST exists. Checking the imported module is
+            # reliable at import time and costs nothing in production, where
+            # pytest is never imported.
+            or "pytest" in _sys.modules
         )
         if not in_test and not self.jwt_secret:
             raise RuntimeError(
                 "DRHIRO_JWT_SECRET is required in non-test environments. "
                 "An empty/default secret would allow token forgery."
+            )
+        if not in_test and (
+            len(self.jwt_secret) < 32 or self.jwt_secret.startswith("change-me")
+        ):
+            # Filling only the five installer inputs from .env.example leaves the
+            # documented placeholder in place, and the API would otherwise boot
+            # happily signing tokens with a value published in this repository.
+            # Refuse anything short or placeholder-shaped: fail loudly rather
+            # than run insecurely.
+            raise RuntimeError(
+                f"DRHIRO_JWT_SECRET is too weak ({len(self.jwt_secret)} chars; 32 "
+                "minimum) or is still the .env.example placeholder. A publicly "
+                "known secret allows token forgery. install.sh generates a strong "
+                "one; otherwise set a random value, e.g. "
+                "head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \\n'"
             )
 
     app_name: str = "drHiro Core API"

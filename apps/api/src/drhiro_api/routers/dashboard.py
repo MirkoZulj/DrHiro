@@ -1192,7 +1192,7 @@ def trends_bucketed(
                 v = vj.get("bpm") or vj.get("heart_rate")
         if v is None:
             continue
-        idx, _ = bucket_of(m.start_at)
+        idx, _ = bucket_of(m.start_at.astimezone(tz))
         if idx is None:
             continue
         buckets[idx].append(float(v))
@@ -1359,7 +1359,7 @@ def liquids_bucketed(
         amt = vj.get("amount_ml") or vj.get("volume_ml") or vj.get("water_ml")
         if amt is None:
             continue
-        idx, _ = bucket_of(m.start_at)
+        idx, _ = bucket_of(m.start_at.astimezone(tz))
         if idx is None:
             continue
         # Canonical + legacy, explicitly. Previously an unrecognised category

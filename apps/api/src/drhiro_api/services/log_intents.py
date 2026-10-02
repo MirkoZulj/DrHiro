@@ -803,6 +803,13 @@ def commit_intents(db: Session, user, parsed: "ParsedLog", *, eaten_at=None,
                     return original
         except Exception:
             # Any failure of the guard must never block a legitimate write.
+            # ROLL BACK first: a failed query (the classic case is the
+            # fingerprint table not existing on an older schema) leaves the
+            # PostgreSQL transaction aborted, so every subsequent statement --
+            # including the INSERT in _write_ledgers -- fails with
+            # InFailedSqlTransaction. Without this the guard fails CLOSED with a
+            # 500 instead of falling through, losing the user's log line.
+            db.rollback()
             fingerprint = None
 
     order_id = (f"{source}-{telegram_chat_id}-{telegram_message_id}"

@@ -87,7 +87,23 @@ def jev_verify(raw_input: str, candidate: str, timeout: float = 20.0) -> float |
     except Exception:
         log.exception("Jev verification call failed")
         return None
-    ans = (data.get("answers") or {}).get("match") or {}
+    # The response must be a JSON OBJECT. A proxy error page, a bare list, a
+    # string or a null all parse as valid JSON yet carry no `answers`; calling
+    # .get() on them raises AttributeError, which escapes this function and
+    # takes down the caller's food search. Every unusable shape degrades to
+    # UNVERIFIED (None) -- a Jev quirk must never break food logging.
+    if not isinstance(data, dict):
+        log.warning("Jev response is not a JSON object (%s); treating as unverified",
+                    type(data).__name__)
+        return None
+    answers = data.get("answers")
+    if not isinstance(answers, dict):
+        log.warning("unexpected Jev answer shape: %r", data)
+        return None
+    ans = answers.get("match")
+    if not isinstance(ans, dict):
+        log.warning("unexpected Jev answer shape: %r", data)
+        return None
     if ans.get("type") != "noul":
         log.warning("unexpected Jev answer shape: %r", data)
         return None

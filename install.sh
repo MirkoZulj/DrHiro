@@ -230,6 +230,21 @@ fi
 # ---------------------------------------------------------------------------
 # Generate strong random secrets for services that need them if not already set.
 gen_secret() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+# Preserve secrets that already exist in an .env. Every generation below is
+# ${VAR:-...}, so without this a RE-RUN of install.sh would silently rotate each
+# secret -- invalidating every issued JWT and orphaning the existing database's
+# credentials -- while the script tells the user it will not overwrite them.
+if [[ -f "$ENV_FILE" ]]; then
+  for _k in POSTGRES_PASSWORD TF_POSTGRES_PASSWORD MINIO_ROOT_PASSWORD \
+            OPENCLAW_GATEWAY_TOKEN DRHIRO_OPENCLAW_SERVICE_TOKEN DRHIRO_JWT_SECRET; do
+    if grep -q "^${_k}=.\+" "$ENV_FILE"; then
+      printf -v "$_k" '%s' "$(grep "^${_k}=" "$ENV_FILE" | head -1 | cut -d= -f2-)"
+      export "${_k?}"
+    fi
+  done
+  unset _k
+fi
+
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(gen_secret)}"
 TF_POSTGRES_PASSWORD="${TF_POSTGRES_PASSWORD:-$(gen_secret)}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$(gen_secret)}"
