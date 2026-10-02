@@ -70,6 +70,25 @@ services:
     expose: ["9000", "9001"]
     networks: [drhiro-net]
 
+  # --- One-shot schema migration (idempotent; runs on every `up`) ----------
+  # Applies the Alembic chain before api/worker/scheduler start. `alembic
+  # upgrade head` is a no-op once the DB is at head, so this doubles as the
+  # upgrade path and is safe to re-run on every `docker compose up`. It uses
+  # the api image so the migration source always matches the running code.
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+    image: drhiro-api:${DRHIRO_VERSION:-0.1.0}
+    restart: "no"
+    env_file: .env
+    environment:
+      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [drhiro-net]
+
   # --- drHiro Core (the full app logic) -----------------------------------
   api:
     build:
@@ -92,6 +111,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -112,6 +132,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
     networks: [drhiro-net]
 
   scheduler:
@@ -127,6 +148,7 @@ services:
       DRHIRO_REDIS_URL: redis://redis:6379/0
     depends_on:
       redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
     networks: [drhiro-net]
 
   web:
@@ -309,6 +331,10 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       OPENCLAW_MODEL: ${OPENCLAW_MODEL:-trueforge-drhiro}
       NOUS_API_KEY: ${NOUS_API_KEY:-}
+      # qwen-local fallback provider (see openclaw/openclaw.json). Base URL and
+      # key are env-driven so no personal host is baked into the shipped config.
+      QWEN_LOCAL_BASE_URL: ${QWEN_LOCAL_BASE_URL:-http://localhost:8000/v1}
+      QWEN_LOCAL_API_KEY: ${QWEN_LOCAL_API_KEY:-local}
       OPENCLAW_DRHIRO_API: http://api:8000/api/v1
       DRHIRO_OPENCLAW_SERVICE_TOKEN: ${DRHIRO_OPENCLAW_SERVICE_TOKEN:-}
       DRHIRO_TELEGRAM_ID: ${DRHIRO_TELEGRAM_ID:-}

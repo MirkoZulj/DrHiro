@@ -23,7 +23,7 @@
       },
       "qwen-local": {
         "api": "openai-completions",
-        "baseUrl": "http://desktop-33cidmi:8000/v1",
+        "baseUrl": "${QWEN_LOCAL_BASE_URL}",
         "apiKey": "${QWEN_LOCAL_API_KEY}",
         "models": [
           {
