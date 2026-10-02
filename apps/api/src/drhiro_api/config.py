@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,11 +24,32 @@ class Settings(BaseSettings):
             _sys.argv[0].endswith(("pytest", "py.test"))
             or "PYTEST_CURRENT_TEST" in os.environ
             or os.environ.get("DRHIRO_ENV") == "test"
+            # `python -m pytest` leaves argv[0] pointing at the pytest package, so
+            # the argv test above misses it and the guard fires during COLLECTION,
+            # before PYTEST_CURRENT_TEST exists. Checking the imported module is
+            # reliable at import time and costs nothing in production, where
+            # pytest is never imported.
+            or "pytest" in _sys.modules
         )
         if not in_test and not self.jwt_secret:
             raise RuntimeError(
                 "DRHIRO_JWT_SECRET is required in non-test environments. "
                 "An empty/default secret would allow token forgery."
+            )
+        if not in_test and (
+            len(self.jwt_secret) < 32 or self.jwt_secret.startswith("change-me")
+        ):
+            # Filling only the five installer inputs from .env.example leaves the
+            # documented placeholder in place, and the API would otherwise boot
+            # happily signing tokens with a value published in this repository.
+            # Refuse anything short or placeholder-shaped: fail loudly rather
+            # than run insecurely.
+            raise RuntimeError(
+                f"DRHIRO_JWT_SECRET is too weak ({len(self.jwt_secret)} chars; 32 "
+                "minimum) or is still the .env.example placeholder. A publicly "
+                "known secret allows token forgery. install.sh generates a strong "
+                "one; otherwise set a random value, e.g. "
+                "head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \\n'"
             )
 
     app_name: str = "drHiro Core API"
@@ -69,6 +91,34 @@ class Settings(BaseSettings):
     llm_model: str = "qwen/qwen-2.5-72b-instruct"
 
     miniapp_allowed_origins: list[str] = ["https://t.me"]
+
+    # --- Jev (TypeSafe System One) food-match verification ------------------
+    # English-first equivalence model answering ONE bounded `noul` question:
+    # does candidate name X refer to the same food as the user's input Y?
+    # Empty url or key => verification disabled, and food search behaves
+    # exactly as if Jev were never configured (no translation, no HTTP call).
+    jev_api_url: str = Field(
+        "",
+        # Required env name is DRHIRO_JEV_URL; accept the field-derived
+        # DRHIRO_JEV_API_URL too so either spelling works.
+        validation_alias=AliasChoices("DRHIRO_JEV_URL", "DRHIRO_JEV_API_URL"),
+    )
+    jev_api_key: str = ""       # env DRHIRO_JEV_API_KEY ("" disables the feature)
+    jev_model: str = "jev-latest"
+
+    # Two thresholds. Names and defaults deliberately mirror the production
+    # deployment, so an operator moving DRHIRO_JEV_* values between the two
+    # cannot set the wrong bound:
+    #   score >= jev_threshold                 -> accept and log        (0.88)
+    #   jev_review_floor <= score < threshold  -> surface, ask the user (0.5)
+    #   score <  jev_review_floor              -> reject, next candidate
+    jev_threshold: float = 0.88       # env DRHIRO_JEV_THRESHOLD (the accept bar)
+    jev_review_floor: float = 0.5     # env DRHIRO_JEV_REVIEW_FLOOR (lower bound)
+
+    @property
+    def jev_enabled(self) -> bool:
+        """True when both the Jev URL and key are configured."""
+        return bool(self.jev_api_url and self.jev_api_key)
 
 
 @lru_cache

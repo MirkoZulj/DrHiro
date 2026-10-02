@@ -15,12 +15,16 @@ downstream, which makes this the worst kind of failure.
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass, field
 
 from sqlalchemy import and_, case, func, literal, or_
 from sqlalchemy.orm import Session, selectinload
 
 from drhiro_api.models import Food, FoodResolutionRule
+
+log = logging.getLogger(__name__)
 
 # Ranking tiers, lower sorts first.
 TIER_EXACT = 0      # display_name == query (case-insensitive)
@@ -294,4 +298,98 @@ def nutrient_map(food: Food, code_by_id: dict) -> dict:
         code = code_by_id.get(fn.nutrient_id)
         if code is not None:
             out[code] = fn.amount_per_100g
+    return out
+
+
+def online_food_candidates(query: str, limit: int = 5, source: str = "auto") -> list[dict]:
+    """Online nutrition lookup: USDA FoodData Central, then DuckDuckGo.
+
+    `source` selects the tier: "auto" (USDA, then DDG only if USDA is empty),
+    "usda" (USDA only) or "ddg" (DuckDuckGo only). The split exists so the
+    Jev-verified cascade can try USDA first and fall through to DuckDuckGo
+    when every USDA candidate fails verification.
+
+    Returns a list of candidate dicts with keys: external_id, display_name,
+    kcal_per_100g, protein_g_per_100g, carbs_g_per_100g, fat_per_100g,
+    fiber_per_100g, sodium_mg_per_100g, source.
+
+    All configuration is environment-driven; no hardcoded hosts or
+    credentials. The DuckDuckGo endpoint comes from DDG_HTTP_URL; when it is
+    unset the DDG tier is skipped rather than hitting a baked-in address.
+    """
+    import json as _j
+    import os as _os
+    import re as _re
+    import urllib.request as _ur
+
+    out = []
+
+    # --- USDA FoodData Central ---
+    key = _os.environ.get("USDA_API_KEY") or ""
+    if key and source in ("auto", "usda"):
+        try:
+            from drhiro_nutrition.usda import USDACatalog
+            cat = USDACatalog(api_key=key, timeout=8.0)
+            try:
+                items = cat.search(query, limit=limit)
+            finally:
+                cat.close()
+            for it in items:
+                out.append({
+                    "external_id": it.external_id,
+                    "display_name": it.display_name,
+                    "kcal_per_100g": it.kcal_per_100g,
+                    "protein_g_per_100g": it.protein_g_per_100g,
+                    "carbs_g_per_100g": it.carbs_g_per_100g,
+                    "fat_g_per_100g": it.fat_g_per_100g,
+                    "fiber_g_per_100g": it.fiber_g_per_100g,
+                    "sodium_mg_per_100g": it.sodium_mg_per_100g,
+                    "source": "usda-online",
+                })
+        except Exception:
+            log.exception("USDA online lookup failed for %r", query)
+
+    # --- DuckDuckGo web fallback ---
+    ddg_url = (_os.environ.get("DDG_HTTP_URL") or "").rstrip("/")
+    if ddg_url and (source == "ddg" or (source == "auto" and not out)):
+        def _fetch(q):
+            try:
+                body = _ur.urlopen(
+                    _ur.Request(
+                        ddg_url + "/lookup",
+                        data=_j.dumps({"query": q}).encode(),
+                        headers={"Content-Type": "application/json"},
+                    ),
+                    timeout=75,
+                ).read()
+                return _j.loads(body or b"{}")
+            except Exception:
+                log.exception("DuckDuckGo lookup failed for %r", q)
+                return {}
+
+        data = _fetch(query)
+        if not data.get("candidates"):
+            data = _fetch(query + " nutrition per 100g")
+        for c in (data.get("candidates") or [])[:limit]:
+            if c.get("kcal_per_100g") is None and c.get("protein_g_per_100g") is None:
+                continue
+            # Scraped page titles look like "Riza Nutrition Per 100G"; keep the
+            # food name so the candidate is comparable and storable.
+            _raw_name = (c.get("display_name") or query).strip()
+            _clean_name = _re.sub(
+                r"\s*[-\u2013\u2014|]?\s*nutrition\s*(per\s*100\s*g|facts|information|data)?\s*$",
+                "", _raw_name, flags=_re.IGNORECASE).strip() or _raw_name
+            slug = _re.sub(r"[^a-z0-9]+", "-", _clean_name.lower().strip())[:60]
+            out.append({
+                "external_id": "ddg:" + slug,
+                "display_name": _clean_name,
+                "kcal_per_100g": c.get("kcal_per_100g"),
+                "protein_g_per_100g": c.get("protein_g_per_100g"),
+                "carbs_g_per_100g": c.get("carbs_g_per_100g"),
+                "fat_g_per_100g": c.get("fat_g_per_100g"),
+                "fiber_per_100g": None,
+                "sodium_mg_per_100g": None,
+                "source": "duckduckgo",
+            })
+
     return out

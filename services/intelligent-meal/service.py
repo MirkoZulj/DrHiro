@@ -64,9 +64,9 @@ if not DB_URL:
 
 # Camoufox / Pi SSH config
 PI_HOST = os.environ.get("PI_HOST", "")
-PI_USER = os.environ.get("PI_USER", "mirko")
+PI_USER = os.environ.get("PI_USER", "")
 PI_PASS = os.environ.get("PI_PASS", "")
-CAMOUFOX_SCRIPT = "/home/mirko/camoufox_nutrition.py"
+CAMOUFOX_SCRIPT = os.environ.get("CAMOUFOX_SCRIPT", "")
 
 # ---------------------------------------------------------------------------
 # DB + Redis
@@ -877,15 +877,19 @@ def usda_search(query: str, limit: int = 3) -> list[dict]:
             desc = f.get("description", "")
             if not desc:
                 continue
-            nuts = {n.get("nutrientName"): n.get("value") for n in f.get("foodNutrients", [])}
+            # Key by nutrientId, NOT nutrientName: USDA search returns TWO
+            # 'Energy' rows per food — kcal (1008) and kJ (1062) — and a
+            # name-keyed dict keeps the kJ row, inflating calories ~4.2x.
+            # Same convention as drhiro_nutrition.usda (NUTRIENT_IDS).
+            nuts = {n.get("nutrientId"): n.get("value") for n in f.get("foodNutrients", [])}
             out.append({
                 "display_name": desc.title(),
-                "kcal_per_100g": _norm_nutrient(nuts.get("Energy")),
-                "protein_g_per_100g": _norm_nutrient(nuts.get("Protein")),
-                "carbs_g_per_100g": _norm_nutrient(nuts.get("Carbohydrate, by difference")),
-                "fat_g_per_100g": _norm_nutrient(nuts.get("Total lipid (fat)")),
-                "fiber_g_per_100g": _norm_nutrient(nuts.get("Fiber, total dietary")),
-                "sodium_mg_per_100g": _norm_nutrient(nuts.get("Sodium, Na")),
+                "kcal_per_100g": _norm_nutrient(nuts.get(1008)),
+                "protein_g_per_100g": _norm_nutrient(nuts.get(1003)),
+                "carbs_g_per_100g": _norm_nutrient(nuts.get(1005)),
+                "fat_g_per_100g": _norm_nutrient(nuts.get(1004)),
+                "fiber_g_per_100g": _norm_nutrient(nuts.get(1079)),
+                "sodium_mg_per_100g": _norm_nutrient(nuts.get(1093)),
                 "source": "USDA API",
                 "confidence": 0.85,
             })

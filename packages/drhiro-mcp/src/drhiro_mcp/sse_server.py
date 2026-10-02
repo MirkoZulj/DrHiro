@@ -11,8 +11,8 @@ from starlette.requests import Request
 from starlette.middleware.cors import CORSMiddleware
 
 API_BASE = os.environ.get("DRHIRO_API_URL", "http://localhost:8010/api/v1")
-VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "http://desktop-33cidmi:8000")
-VISION_MODEL = os.environ.get("VISION_MODEL", 'E:\\Models\\Qwen3.8-27B-UD-Q4_K_M.gguf')
+VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "")
+VISION_MODEL = os.environ.get("VISION_MODEL", "")
 MEDIA_ROOT = "/openclaw-state/workspace/drhiro/media/inbound"
 
 INTELLIGENT_MEAL_URL = os.environ.get("INTELLIGENT_MEAL_URL", "http://intelligent-meal:8090")
@@ -1169,6 +1169,9 @@ async def handle_mcp(request: Request):
                 if not candidates or not __import__("os").path.exists(candidates[0]):
                     text = json.dumps({"ok": False, "error": "no_photo",
                                        "message": "I could not find the photo file. Please resend the image."})
+                elif not (VISION_BASE_URL and VISION_MODEL):
+                    text = json.dumps({"ok": False, "error": "vision_not_configured",
+                                       "message": "Photo analysis is not configured on this deployment."})
                 else:
                     photo = candidates[0]
                     try:

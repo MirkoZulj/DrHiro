@@ -80,7 +80,7 @@ def _import_service():
     # Ensure the service module uses our test DB and fake Redis
     os.environ.setdefault("DATABASE_URL", TEST_DB_URL)
     os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
-    os.environ.setdefault("DRHIRO_JWT_SECRET", "pytest-dummy-not-a-real-secret")
+    os.environ.setdefault("DRHIRO_JWT_SECRET", "pytest-dummy-not-a-real-secret-0123456789ab")
     os.environ.setdefault("DRHIRO_SERVICE_TOKEN", "")
     os.environ.setdefault("DRHIRO_TELEGRAM_ID", "")
 

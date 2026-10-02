@@ -40,12 +40,28 @@ The installer will:
 5. **Detect webhook conflicts.** If a webhook is set on this token, it asks you to type
    `CONFIRM` before deleting it — long polling and a webhook are never run together.
 6. **Validate the AI backend** (`GET /models`) and model availability (best-effort).
-7. **Clone TrueForge** (MIT, pinned tag) and **build + start** the full stack.
+7. **Clone TrueForge** (MIT, pinned tag) and **build + start** the full stack. A one-shot
+   `migrate` service runs `alembic upgrade head` before the API, worker and scheduler start.
 8. **Health-check** every service.
 9. **Provision TrueForge** (model provider, tools MCP server, `drhiro` agent) and print safe
    operational commands.
 
 First build can take several minutes (TrueForge is built from source once).
+
+### Database migrations
+
+The database schema is created and updated by **Alembic**. The compose file ships a one-shot
+`migrate` service (an `api`-image container running `alembic upgrade head`) that
+`api`/`worker`/`scheduler` wait on (`service_completed_successfully`), so nothing starts
+against an unmigrated database. `alembic upgrade head` is a no-op once the database is at
+head, so the service is safe to re-run on every `docker compose up`.
+
+To run migrations manually (e.g. during troubleshooting):
+
+```bash
+docker compose run --rm migrate          # apply all pending migrations
+docker compose run --rm migrate alembic current   # show the applied revision
+```
 
 ## Step 3 — Confirm it is running
 
@@ -76,6 +92,11 @@ values are collected by the installer.
 ```bash
 ./scripts/update.sh
 ```
+
+Upgrades apply any new database migrations automatically: `docker compose up -d` re-runs the
+one-shot `migrate` service (`alembic upgrade head`) before the API, worker and scheduler
+start. No separate migration command is required. To apply migrations without restarting the
+stack, run `docker compose run --rm migrate`.
 
 ## Backup / restore
 

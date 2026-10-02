@@ -10,7 +10,7 @@ import pytest
 # Ensure tests can run without a real DRHIRO_JWT_SECRET in the environment.
 # The production config requires this to be set; tests use a dummy value.
 import os
-os.environ.setdefault("DRHIRO_JWT_SECRET", "pytest-dummy-not-a-real-secret")
+os.environ.setdefault("DRHIRO_JWT_SECRET", "pytest-dummy-not-a-real-secret-0123456789ab")
 
 # Allow importing test helpers as top-level modules.
 TESTS_DIR = Path(__file__).parent

@@ -115,7 +115,7 @@ def _user_rows_count(db, model, user_id) -> int:
 
 class TestAccountDeletionPurgesActivity:
     def test_activity_rows_purged_on_deletion(self, client, db):
-        from apps.api.tests.conftest import make_user
+        from conftest import make_user
 
         user = make_user(db, "TestUser", telegram_id="99001")
         _seed_activity_data(db, user)
@@ -137,7 +137,7 @@ class TestAccountDeletionPurgesActivity:
         assert _user_activities_count(db, user.id) == 0
 
     def test_all_user_owned_models_purged(self, client, db):
-        from apps.api.tests.conftest import make_user
+        from conftest import make_user
 
         user = make_user(db, "PurgeAllUser", telegram_id="99002")
         _seed_activity_data(db, user)
@@ -244,7 +244,7 @@ class TestAccountDeletionPurgesActivity:
         assert _user_rows_count(db, ExternalIdentity, user.id) == 0
 
     def test_consent_grants_purged_both_directions(self, client, db):
-        from apps.api.tests.conftest import make_user
+        from conftest import make_user
 
         user_a = make_user(db, "Granter", telegram_id="99003")
         user_b = make_user(db, "Grantee", telegram_id="99004")
@@ -285,7 +285,7 @@ class TestAccountDeletionPurgesActivity:
         )
 
     def test_deletion_without_confirm_is_noop(self, client, db):
-        from apps.api.tests.conftest import make_user
+        from conftest import make_user
 
         user = make_user(db, "NoopUser", telegram_id="99005")
         _seed_activity_data(db, user)
@@ -306,7 +306,7 @@ class TestAccountDeletionPurgesActivity:
 
     def test_meal_items_purged_via_meal_join(self, client, db):
         """MealItem has no user_id — verify it is purged via the Meal join."""
-        from apps.api.tests.conftest import make_user
+        from conftest import make_user
 
         user = make_user(db, "MealItemUser", telegram_id="99006")
         meal = Meal(

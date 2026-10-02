@@ -16,6 +16,15 @@ function todayLocalISO(): string {
 interface Point { date: string; value: number | null; label: string }
 interface Bucketed { granularity: string; metric: string; period_label: string; period_key: string; points: Point[] }
 
+/** One bucket of the bucketed macros series. Nutrition fields are null when the
+ *  bucket has no meals (never 0), so the chart shows a gap like the calorie one. */
+interface MacroBucketPoint {
+  date: string; label: string
+  kcal: number | null; protein_g: number | null; carbs_g: number | null
+  fat_g: number | null; meals_count: number
+}
+interface BucketedMacros { granularity: string; metric: string; period_label: string; period_key: string; points: MacroBucketPoint[] }
+
 interface NutritionPoint {
   date: string; kcal: number; protein_g: number; carbs_g: number; fat_g: number; meals_count: number
 }
@@ -63,6 +72,7 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
   const [tf, setTf] = useState<TF>('D')
   const [offset, setOffset] = useState(0)
   const [bucketed, setBucketed] = useState<Bucketed | null>(null)
+  const [macroBuckets, setMacroBuckets] = useState<BucketedMacros | null>(null)
   const [nutrition, setNutrition] = useState<NutritionTrend | null>(null)
   const [liquids, setLiquids] = useState<LiquidsTrend | null>(null)
   const [dailyGoal, setDailyGoal] = useState<number | null>(null)
@@ -109,8 +119,10 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
       jobs.push(authClient.api(`/trends/bucketed?metric=${metric}&granularity=${gran}&offset=${offset}`).catch(() => null))
     }
     if (isCalories) {
-      jobs.push(authClient.api('/trends?metric=calories&period=90d').catch(() => null))
+      jobs.push(authClient.api('/trends?metric=calories&period=7d').catch(() => null))
       jobs.push(authClient.api('/energy-balance?days=1').catch(() => null))
+      // Macro split for the SAME window as the calorie chart (same gran+offset).
+      jobs.push(authClient.api(`/trends/bucketed?metric=macros&granularity=${gran}&offset=${offset}`).catch(() => null))
     } else {
       jobs.push(authClient.api('/dashboard/today').catch(() => null))
       
@@ -130,6 +142,7 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
             setTodayIntake(last.intake_kcal ?? null)
             setBalanceVal(last.balance_kcal ?? null)
           }
+          setMacroBuckets(r[3] ?? null)
           setSource('Meals')
         } else {
           const t = r[1]
@@ -222,7 +235,8 @@ export default function MetricDashboard({ config, onClose, balanceContext = fals
 
         <div className="modal-content">
           {isCalories ? (
-            <CalorieDashboard bucketed={bucketed} nutrition={nutrition} goal={dailyGoal}
+            <CalorieDashboard bucketed={bucketed} macroBuckets={macroBuckets} nutrition={nutrition} goal={dailyGoal}
+              requestedGran={tf === 'D' ? 'day' : tf === 'W' ? 'week' : 'month'}
               todayIntake={todayIntake} balanceVal={balanceVal} balanceContext={balanceContext} />
           ) : isLiquid ? (
             <LiquidDashboard liquids={liquids} />
@@ -337,8 +351,9 @@ function MetricChartView({ points, config, goal, goalLabel, granularity}: {
 }
 
 /* ---- Calories view (two charts) ---- */
-function CalorieDashboard({ bucketed, nutrition, goal, todayIntake, balanceVal, balanceContext }: {
-  bucketed: Bucketed | null; nutrition: NutritionTrend | null; goal: number | null
+function CalorieDashboard({ bucketed, macroBuckets, nutrition, goal, requestedGran, todayIntake, balanceVal, balanceContext }: {
+  bucketed: Bucketed | null; macroBuckets: BucketedMacros | null; nutrition: NutritionTrend | null; goal: number | null
+  requestedGran: string
   todayIntake: number | null; balanceVal: number | null; balanceContext?: boolean
 }) {
   const points = bucketed?.points ?? []
@@ -349,12 +364,31 @@ function CalorieDashboard({ bucketed, nutrition, goal, todayIntake, balanceVal, 
   const avg = present.length ? total / present.length : null
   const goalLine = granularity === 'month' ? null : (goal ?? 2200)
 
-  const macroPoints = nutrition?.points ?? []
-  const pS = macroPoints.map((p) => { const t = p.protein_g + p.carbs_g + p.fat_g; return t > 0 ? +(p.protein_g / t * 100).toFixed(1) : null })
-  const cS = macroPoints.map((p) => { const t = p.protein_g + p.carbs_g + p.fat_g; return t > 0 ? +(p.carbs_g / t * 100).toFixed(1) : null })
-  const fS = macroPoints.map((p) => { const t = p.protein_g + p.carbs_g + p.fat_g; return t > 0 ? +(p.fat_g / t * 100).toFixed(1) : null })
-  const macroLabels = macroPoints.map((p) => p.date.slice(5))
-  const today = macroPoints.length ? macroPoints[macroPoints.length - 1] : undefined
+  // Macro distribution shares the calorie chart's window: it is built from the
+  // bucketed macros series (same granularity/offset), using the bucket labels as
+  // the x-axis. A bucket with no meals is null so the line shows a gap.
+  const mbPoints = macroBuckets?.points ?? []
+  const share = (p: MacroBucketPoint) => {
+    const { protein_g, carbs_g, fat_g } = p
+    if (protein_g == null || carbs_g == null || fat_g == null) return null
+    const t = protein_g + carbs_g + fat_g
+    if (t <= 0) return null
+    return { p: +(protein_g / t * 100).toFixed(1), c: +(carbs_g / t * 100).toFixed(1), f: +(fat_g / t * 100).toFixed(1) }
+  }
+  const pS = mbPoints.map((p) => share(p)?.p ?? null)
+  const cS = mbPoints.map((p) => share(p)?.c ?? null)
+  const fS = mbPoints.map((p) => share(p)?.f ?? null)
+  const macroLabels = mbPoints.map((p) => p.label)
+  const macroTitle = requestedGran === 'day'
+    ? 'Macro distribution · % of daily intake'
+    : 'Macro distribution · % of intake in the bucket'
+
+  // "Today's split" bars come from a trailing DAILY source, and are shown only
+  // when the last daily point really is today — a stale point must never be
+  // presented as today's macros.
+  const dailyPoints = nutrition?.points ?? []
+  const lastDaily = dailyPoints.length ? dailyPoints[dailyPoints.length - 1] : undefined
+  const today = lastDaily && lastDaily.date === todayLocalISO() ? lastDaily : undefined
   const todayMacros = today && (today.protein_g + today.carbs_g + today.fat_g) > 0
     ? [
         { n: 'Protein', pct: +(today.protein_g / (today.protein_g + today.carbs_g + today.fat_g) * 100).toFixed(0), g: Math.round(today.protein_g), c: 'var(--color-macro-protein)' },
@@ -383,7 +417,7 @@ function CalorieDashboard({ bucketed, nutrition, goal, todayIntake, balanceVal, 
       </div>
 
       <div className="chart-card">
-        <div className="cs-label macro-title">Macro distribution · % of daily intake</div>
+        <div className="cs-label macro-title">{macroTitle}</div>
         <div className="legend">
           <span className="li"><span className="sw" style={{ background: 'var(--color-macro-protein)' }} />Protein</span>
           <span className="li"><span className="sw" style={{ background: 'var(--color-macro-carbs)' }} />Carbs</span>
@@ -395,17 +429,20 @@ function CalorieDashboard({ bucketed, nutrition, goal, todayIntake, balanceVal, 
           { data: fS, color: 'var(--color-macro-fat)', label: 'Fat' },
         ]} labels={macroLabels} fmtY={(v) => `${Math.round(v)}%`} />
         {todayMacros.length > 0 && (
-          <div className="macro-bars">
-            {todayMacros.map((m) => (
-              <div key={m.n} className="mbar-row">
-                <span className="mbar-label">{m.n}</span>
-                <span className="mbar-track"><span className="mbar-fill" style={{ width: `${m.pct}%`, background: m.c }} /></span>
-                <span className="mbar-val tabular">{m.pct}% · {m.g} g</span>
-              </div>
-            ))}
-          </div>
+          <>
+            <div className="cs-label macro-title">Today&apos;s split</div>
+            <div className="macro-bars">
+              {todayMacros.map((m) => (
+                <div key={m.n} className="mbar-row">
+                  <span className="mbar-label">{m.n}</span>
+                  <span className="mbar-track"><span className="mbar-fill" style={{ width: `${m.pct}%`, background: m.c }} /></span>
+                  <span className="mbar-val tabular">{m.pct}% · {m.g} g</span>
+                </div>
+              ))}
+            </div>
+          </>
         )}
-        {macroPoints.length === 0 && <div className="empty">No meal data yet for macro distribution.</div>}
+        {mbPoints.length === 0 && <div className="empty">No meal data yet for macro distribution.</div>}
       </div>
     </>
   )

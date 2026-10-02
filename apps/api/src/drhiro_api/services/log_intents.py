@@ -22,14 +22,14 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text as _sql
 from sqlalchemy.orm import Session
 
-from drhiro_api.models import Activity, BeverageMeasurement, Meal, MealItem, Measurement, Nutrient
+from drhiro_api.models import Activity, BeverageMeasurement, LogWriteFingerprint, Meal, MealItem, Measurement, Nutrient
 from drhiro_api.services.consumption import _delete_beverage_projection_for_meal_items
 from drhiro_api.food_search import resolve_food, nutrient_map
 
@@ -345,6 +345,52 @@ def _payload_hash(parsed: "ParsedLog") -> str:
     }
     return hashlib.sha256(
         _json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+#: A repeated identical free-text write inside this window is treated as an
+#: agent retry, not a fresh human log. The OpenClaw agent's duplicate
+#: create_meal_from_text calls in production (2026-10-02) arrived 4.7-5.8 s
+#: apart; a human deliberately logging the same line again does so minutes or
+#: hours later. 120 s separates the two with a wide margin while staying short
+#: enough that a genuine repeat log is never swallowed.
+FINGERPRINT_WINDOW_SECONDS = 120
+
+
+def _normalise_fingerprint_text(raw: str | None) -> str:
+    """Case-fold and collapse whitespace ONLY.
+
+    Deliberately minimal: "1 glass of water" and "2 glasses of water" must stay
+    distinct, so digits and words are never dropped. This removes only the
+    trivial case/spacing rephrasing that an LLM can produce for the same line.
+    """
+    return re.sub(r"\s+", " ", (raw or "").strip().lower())
+
+
+def _log_fingerprint(user, source: str, raw_text: str | None,
+                     meal_slot: str | None, when) -> str | None:
+    """Stable content fingerprint, or None when it cannot be computed.
+
+    Keyed on user + source + normalised text + meal_type + resolved local date.
+    Returns None on ANY failure so the caller falls through to a normal write
+    instead of blocking a legitimate log (conservative by contract).
+    """
+    try:
+        import hashlib
+        import json as _json
+        text = _normalise_fingerprint_text(raw_text)
+        if not text:
+            return None
+        payload = {
+            "user": str(getattr(user, "id", "")),
+            "source": source or "",
+            "text": text,
+            "slot": meal_slot or "",
+            "date": _local_date(user, when).isoformat() if when else "",
+        }
+        return hashlib.sha256(
+            _json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    except Exception:
+        return None
 
 
 _CAPS_CACHE: dict = {}
@@ -674,6 +720,22 @@ def commit_intents(db: Session, user, parsed: "ParsedLog", *, eaten_at=None,
     op = None
     existing = None
     if has_identity:
+        # Serialise two concurrent submits carrying the SAME identity tuple.
+        # The SELECT ... FOR UPDATE below only locks a row that already exists,
+        # so on a FIRST submit two simultaneous callers both miss the lookup,
+        # both insert, and the loser dies on the unique constraint -- surfacing
+        # to the user as a bare 500 for a write that actually succeeded. Take
+        # the same transaction-scoped advisory lock the fingerprint path uses,
+        # keyed on the identity tuple, so the second caller waits, then sees the
+        # committed row and takes the replay path (same ids, no writes).
+        # Best-effort: a lock failure must not block a legitimate log.
+        try:
+            db.execute(
+                _sql("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                {"k": f"drhiro:logid:{user.id}:{source}:"
+                      f"{telegram_chat_id}:{telegram_message_id}"})
+        except Exception:
+            pass
         op = (db.query(ConsumptionOperation)
               .filter(ConsumptionOperation.user_id == user.id,
                       ConsumptionOperation.source == source,
@@ -693,10 +755,75 @@ def commit_intents(db: Session, user, parsed: "ParsedLog", *, eaten_at=None,
             except Exception:
                 existing = None
 
+    # ---- content-fingerprint guard (server-side, model-agnostic) ----
+    # Only when no verified per-message identity resolved the write. With a real
+    # idempotency key the code above already suppresses the retry; routing an
+    # identity-bearing write through the fingerprint would be redundant and
+    # could suppress a legitimate distinct message that happens to repeat the
+    # same text. Applicable to the whole logging path (meal/liquid/activity).
+    fingerprint = None
+    if not has_identity:
+        try:
+            fingerprint = _log_fingerprint(user, source, raw_text,
+                                           parsed.meal_slot, now)
+            if fingerprint:
+                # Serialise concurrent identical calls on the fingerprint key so
+                # two simultaneous retries cannot both miss the SELECT and both
+                # write. Best-effort: a lock failure falls through to the
+                # normal write rather than blocking a legitimate log.
+                try:
+                    db.execute(
+                        _sql("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                        {"k": f"drhiro:logfp:{user.id}:{source}:{fingerprint}"})
+                except Exception:
+                    pass
+                hit = (db.query(LogWriteFingerprint)
+                       .filter(LogWriteFingerprint.user_id == user.id,
+                               LogWriteFingerprint.source == source,
+                               LogWriteFingerprint.fingerprint == fingerprint,
+                               LogWriteFingerprint.seen_at
+                               >= now - timedelta(seconds=FINGERPRINT_WINDOW_SECONDS))
+                       .order_by(LogWriteFingerprint.seen_at.desc())
+                       .first())
+                if hit is not None:
+                    original = dict(hit.result_json or {})
+                    original["duplicate_suppressed"] = True
+                    try:
+                        from drhiro_api.security import audit as _audit
+                        _audit(db, "system", None, user.id, "log.duplicate_suppressed",
+                               "log_fingerprint", fingerprint,
+                               {"source": source, "text": raw_text,
+                                "window_seconds": FINGERPRINT_WINDOW_SECONDS,
+                                "suppressed_ids": {
+                                    k: original.get(k) for k in
+                                    ("meal_id", "item_ids", "liquid_ids",
+                                     "activity_ids")}})
+                    except Exception:
+                        pass
+                    return original
+        except Exception:
+            # Any failure of the guard must never block a legitimate write.
+            # ROLL BACK first: a failed query (the classic case is the
+            # fingerprint table not existing on an older schema) leaves the
+            # PostgreSQL transaction aborted, so every subsequent statement --
+            # including the INSERT in _write_ledgers -- fails with
+            # InFailedSqlTransaction. Without this the guard fails CLOSED with a
+            # 500 instead of falling through, losing the user's log line.
+            db.rollback()
+            fingerprint = None
+
     order_id = (f"{source}-{telegram_chat_id}-{telegram_message_id}"
                 if has_identity else f"anon-{uuid.uuid4().hex}")
 
     result = _write_ledgers(db, user, parsed, now, existing, source, order_id)
+
+    if fingerprint is not None:
+        try:
+            db.add(LogWriteFingerprint(
+                user_id=user.id, source=source, fingerprint=fingerprint,
+                seen_at=now, result_json=dict(result)))
+        except Exception:
+            pass
 
     if has_identity:
         if op is None:

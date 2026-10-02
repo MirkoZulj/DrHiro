@@ -1,5 +1,6 @@
-"""Test fixtures: real Postgres (DRHIRO_TEST_DATABASE_URL or dev default),
-ephemeral schema per run, TestClient with auth helpers."""
+"""Test fixtures: real Postgres, target named EXPLICITLY via
+DRHIRO_TEST_DATABASE_URL (preferred) or DRHIRO_DATABASE_URL, ephemeral schema per
+run, TestClient with auth helpers."""
 
 from __future__ import annotations
 
@@ -11,12 +12,26 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-os.environ.setdefault(
-    "DRHIRO_DATABASE_URL",
-    "postgresql+psycopg://drhiro:drhiro@localhost:5435/drhiro",
-)
+# The db_engine fixture below DROP AND RECREATE the whole `public` schema of the
+# target database. That is deliberate for isolation, but it must never happen by
+# accident against the shared development database, so the target has to be named
+# explicitly. Point this at a disposable database only.
+_DB_URL = (os.environ.get("DRHIRO_TEST_DATABASE_URL")
+           or os.environ.get("DRHIRO_DATABASE_URL"))
+if not _DB_URL:
+    raise RuntimeError(
+        "Refusing to run: these tests wipe the ENTIRE schema of whichever database "
+        "they are pointed at, and no target was given. There is no safe default.\n"
+        "Create a disposable database and name it explicitly, e.g.\n"
+        "  docker exec <pg-container> psql -U drhiro -d postgres "
+        "-c 'CREATE DATABASE drhiro_test_run;'\n"
+        "  DRHIRO_TEST_DATABASE_URL="
+        "postgresql+psycopg://drhiro:drhiro@localhost:5435/drhiro_test_run \\\n"
+        "    pytest tests/ -q"
+    )
+os.environ["DRHIRO_DATABASE_URL"] = _DB_URL
 os.environ.setdefault("DRHIRO_REDIS_URL", "redis://localhost:6382/0")
-os.environ.setdefault("DRHIRO_JWT_SECRET", "pytest-dummy-not-a-real-secret")
+os.environ.setdefault("DRHIRO_JWT_SECRET", "pytest-dummy-not-a-real-secret-0123456789ab")
 os.environ.setdefault("DRHIRO_TELEGRAM_BOT_TOKEN", "000000:TESTONLYnotarealbottoken")
 
 from drhiro_api.db import Base, engine, SessionLocal  # noqa: E402
@@ -27,8 +42,20 @@ from drhiro_api.security import create_access_token, validate_telegram_init_data
 
 @pytest.fixture(scope="session")
 def db_engine():
-    # Drop + recreate all tables for a clean run against the real DB.
-    Base.metadata.drop_all(engine)
+    # Reset the WHOLE schema, not just the tables this metadata declares.
+    #
+    # The CI job runs `alembic upgrade head` before pytest, so the database also
+    # holds tables the ORM metadata does not define -- alerts, daily_aggregates,
+    # food_brands, food_resolution_rules, recipes, rule_definitions, ... Their
+    # foreign keys reach into the ORM's tables, so Base.metadata.drop_all() then
+    # fails to drop `users` with DependentObjectsStillExist and EVERY test in
+    # the run reports an error. That is why the ci/python-tests job has never
+    # passed. Dropping the schema is indifferent to what the ORM knows about and
+    # leaves a clean slate for create_all below.
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
     Base.metadata.create_all(engine)
     yield engine
     # Leave the schema in place for inspection; tests use unique users.

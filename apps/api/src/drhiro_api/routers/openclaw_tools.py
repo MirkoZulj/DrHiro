@@ -10,6 +10,7 @@ Each tool maps 1:1 to a function the drHiro skill exposes to the agent.
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,8 @@ from drhiro_rules.calculations import weight_trend
 from drhiro_schema.metrics import MetricType
 
 router = APIRouter(prefix="/tools", tags=["openclaw-tools"])
+
+log = logging.getLogger(__name__)
 
 
 def _resolve_user(
@@ -210,9 +213,16 @@ def tool_meal_from_text(req: MealFromTextTool, request: Request, user: User = De
     )
     _tool_audit(db, user, "tools.log_text", "meal", result.get("meal_id"))
     db.commit()
+    # When the content-fingerprint guard suppressed a repeat, say so in the
+    # message the model reads. Without this the agent reports "Logged." for a
+    # write that never happened, and a legitimate repeat inside the window
+    # would be silent data loss instead of a visible outcome.
+    suppressed = bool(result.get("duplicate_suppressed"))
     return ToolResponse(
         ok=True,
-        message="Logged.",
+        message=("Already logged moments ago — nothing was written twice. "
+                 "Tell the user it was already recorded, do not log it again."
+                 if suppressed else "Logged."),
         data=result,
     )
 
@@ -275,6 +285,23 @@ class MealItemPatchTool(BaseModel):
     quantity: float | None = None
     unit: str | None = None
     grams: float | None = None
+    # Explicit food re-pointing: same identifier shape search_food / the foods
+    # search endpoint returns ("external_id"); "food_catalog_item_id" accepted
+    # as alias so a search result can be piped straight in. Forwarded to
+    # meals.MealItemPatch, which re-resolves nutrition FROM that food.
+    food_catalog_item_id: str | None = None
+    external_id: str | None = None
+    # Custom per-100g nutrition override — forwarded to meals.MealItemPatch so
+    # the agent can store exact values the user (or an online lookup) provides
+    # that no catalog food matches. Scaled by grams/100 on the server. When any
+    # of these is supplied, nutrients_json is written directly from them.
+    kcal_per_100g: float | None = None
+    protein_per_100g: float | None = None
+    carbs_per_100g: float | None = None
+    fat_per_100g: float | None = None
+    fiber_per_100g: float | None = None
+    sugar_per_100g: float | None = None
+    salt_g_per_100g: float | None = None
 
 
 class UpdateMealItemTool(BaseModel):
@@ -526,3 +553,261 @@ def tool_issue_web_login_link(
         message="Dashboard login link minted.",
         data={"url": url, "link_code": link_code, "expires_in": 1800},
     )
+
+
+class GetPendingMealTool(BaseModel):
+    meal_id: str
+
+
+@router.post("/get_pending_meal", response_model=ToolResponse)
+def tool_get_pending_meal(req: GetPendingMealTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Get the parsed items of a meal with status=needs_review for agent verification."""
+    meal = db.query(Meal).filter(Meal.id == uuid.UUID(req.meal_id), Meal.user_id == user.id).first()
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    items = []
+    for item in meal.items:
+        items.append({
+            "item_id": str(item.id),
+            "display_name": item.display_name,
+            "grams": item.grams,
+            "unit": item.unit,
+            "nutrients": item.nutrients_json,
+        })
+    return ToolResponse(
+        ok=True,
+        data={
+            "meal_id": str(meal.id),
+            "meal_type": meal.meal_type,
+            "status": meal.status,
+            "items": items,
+        },
+    )
+
+
+
+
+class SearchFoodTool(BaseModel):
+    query: str
+    limit: int = 5
+
+
+@router.post("/search_food", response_model=ToolResponse)
+def tool_search_food(req: SearchFoodTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Search for foods by name. Returns ranked candidates with nutrition per 100g.
+
+    Local database resolution first; if it is thin/absent, falls back to a live
+    USDA FoodData Central lookup (USDA_API_KEY env var) so the agent can verify
+    a parser match against real online values.
+    """
+    import os as _os
+    from drhiro_api.food_search import resolve_food, nutrient_map
+    from drhiro_api.models import Nutrient
+    result = resolve_food(db, req.query, limit=req.limit, user_id=user.id)
+    code_by_id = {n.id: n.nutrient_code for n in db.query(Nutrient).all()}
+    candidates = []
+    for match in result.matches:
+        f = match.food
+        nmap = nutrient_map(f, code_by_id)
+        candidates.append({
+            "external_id": str(f.external_id),
+            "display_name": f.display_name,
+            "kcal_per_100g": nmap.get("energy"),
+            "protein_g_per_100g": nmap.get("protein"),
+            "carbs_g_per_100g": nmap.get("carbs"),
+            "fat_g_per_100g": nmap.get("fat"),
+            "fiber_g_per_100g": nmap.get("fiber"),
+            "sodium_mg_per_100g": nmap.get("sodium"),
+            "match_tier": match.tier,
+            "is_generic": bool(f.is_generic),
+            "source": "local",
+        })
+    online = _usda_online_candidates(req.query, req.limit)
+    seen = {c["display_name"].lower() for c in candidates}
+    for c in online:
+        key = c["display_name"].lower()
+        if key not in seen:
+            candidates.append(c)
+            seen.add(key)
+    # Persist online hits (USDA + DuckDuckGo) into the local foods table so a
+    # later update_meal_item(display_name / external_id) can resolve them
+    # instead of falling back to 0 kcal. Best-effort: a persistence failure
+    # never fails the search itself.
+    for c in online:
+        try:
+            _persist_food(db, c)
+            db.commit()
+        except Exception:
+            db.rollback()
+    # DuckDuckGo web fallback only when nothing credible found yet.
+    if not candidates and not result.ambiguous:
+        ddg = _ddg_online_candidates(req.query, req.limit)
+        for c in ddg:
+            key = c["display_name"].lower()
+            if key not in seen:
+                candidates.append(c)
+                seen.add(key)
+                try:
+                    _persist_food(db, c)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+    return ToolResponse(ok=True, data={
+        "candidates": candidates,
+        "ambiguous": result.ambiguous,
+        "online_lookup": bool(online),
+        "ddg_lookup": any(c.get("source") == "duckduckgo" for c in candidates),
+    })
+
+
+
+
+def _usda_online_candidates(query: str, limit: int):
+    """Live USDA FoodData Central lookup. Returns list of candidate dicts."""
+    import os as _os
+    key = _os.environ.get("USDA_API_KEY") or ""
+    if not key:
+        return []
+    try:
+        from drhiro_nutrition.usda import USDACatalog
+    except Exception:
+        return []
+    try:
+        cat = USDACatalog(api_key=key, timeout=8.0)
+        try:
+            items = cat.search(query, limit=limit)
+        finally:
+            cat.close()
+    except Exception:
+        return []
+    out = []
+    for it in items:
+        out.append({
+            "external_id": it.external_id,
+            "display_name": it.display_name,
+            "kcal_per_100g": it.kcal_per_100g,
+            "protein_g_per_100g": it.protein_g_per_100g,
+            "carbs_g_per_100g": it.carbs_g_per_100g,
+            "fat_g_per_100g": it.fat_g_per_100g,
+            "fiber_g_per_100g": it.fiber_g_per_100g,
+            "sodium_mg_per_100g": it.sodium_mg_per_100g,
+            "alcohol_g_per_100g": it.alcohol_g_per_100g,
+            "source": "usda-online",
+        })
+    return out
+
+
+def _ddg_online_candidates(query: str, limit: int):
+    """DuckDuckGo nutrition fallback via the VPS ddg_http service.
+
+    A bare food name often returns no parseable nutrition, so if the first
+    query yields nothing we retry once with 'nutrition per 100g' appended.
+    """
+    import json as _j
+    import re as _re
+    import urllib.request as _ur
+
+    def _fetch(q):
+        try:
+            body = _ur.urlopen(
+                _ur.Request(
+                    "http://172.20.0.1:8098/lookup",
+                    data=_j.dumps({"query": q}).encode(),
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=75,
+            ).read()
+            return _j.loads(body or b"{}")
+        except Exception:
+            return {}
+
+    data = _fetch(query)
+    if not data.get("candidates"):
+        data = _fetch(query + " nutrition per 100g")
+    out = []
+    for c in (data.get("candidates") or [])[:limit]:
+        if c.get("kcal_per_100g") is None and c.get("protein_g_per_100g") is None:
+            continue
+        slug = _re.sub(r"[^a-z0-9]+", "-", (c.get("display_name") or query).lower().strip())[:60]
+        out.append({
+            "external_id": "ddg:" + slug,
+            "display_name": c.get("display_name") or query,
+            "kcal_per_100g": c.get("kcal_per_100g"),
+            "protein_g_per_100g": c.get("protein_g_per_100g"),
+            "carbs_g_per_100g": c.get("carbs_g_per_100g"),
+            "fat_g_per_100g": c.get("fat_g_per_100g"),
+            "fiber_g_per_100g": None,
+            "sodium_mg_per_100g": None,
+            "source": "duckduckgo",
+        })
+    return out
+
+
+
+def _persist_food(db: Session, c: dict):
+    """Save an online-found food locally (drhiro_private source) if new. Best-effort.
+
+    Handles both USDA-online and DuckDuckGo candidate dicts: the external_id
+    namespace is preserved (USDA keeps its real FDC id; DDG keeps 'ddg:<slug>').
+    Returns the existing food row if one already exists for the id.
+
+    Energy is Atwater-validated before storage: a published kcal that
+    contradicts the candidate's own macros is replaced by the Atwater value,
+    with an audit event recording the correction (never silently).
+    """
+    import uuid
+    from drhiro_api.models import Food, FoodNutrient, Nutrient, DataSource
+    from drhiro_api.security import audit as _audit
+    from drhiro_api.nutrition_validation import validate_candidate_energy
+    ds = db.query(DataSource).filter(DataSource.source_key == "drhiro_private").first()
+    if ds is None:
+        return None
+    ex = db.query(Food).filter(Food.data_source_id == ds.id, Food.external_id == c["external_id"]).first()
+    if ex is not None:
+        return ex
+    # Atwater gate: reject impossible published energy before it enters the
+    # catalog. Store the macro-implied value instead, with a visible marker.
+    # The dict is corrected IN PLACE: tool_search_food's candidate list holds
+    # the same objects, so the agent sees the corrected value + marker too.
+    check = validate_candidate_energy(c)
+    if check.corrected:
+        log.warning(
+            "Atwater-correcting energy for %s (%s): published %s kcal, macros imply %s",
+            c.get("display_name"), c.get("external_id"),
+            check.published_kcal, check.corrected_kcal,
+        )
+        c["kcal_per_100g"] = check.corrected_kcal
+        c["energy_atwater_corrected"] = True
+    f = Food(id=uuid.uuid4(), data_source_id=ds.id, external_id=c["external_id"],
+             display_name=c["display_name"], is_generic=True, is_liquid=False)
+    db.add(f)
+    db.flush()
+    # nutrient codes in this schema are the NAME strings search_food reads back.
+    vals = {
+        "energy": c.get("kcal_per_100g"),
+        "protein": c.get("protein_g_per_100g"),
+        "carbs": c.get("carbs_g_per_100g"),
+        "fat": c.get("fat_g_per_100g"),
+    }
+    rows = {n.nutrient_code: n for n in db.query(Nutrient).filter(Nutrient.nutrient_code.in_(list(vals))).all()}
+    for code, val in vals.items():
+        r = rows.get(code)
+        if r is None or val is None:
+            continue
+        db.add(FoodNutrient(food_id=f.id, nutrient_id=r.id, amount_per_100g=val, amount_per_serving=None))
+    db.flush()
+    if check.corrected:
+        # Provenance marker: the audit log keeps the USDA fdc id, the
+        # published value, and what was stored instead.
+        _audit(db, "system", None, None, "foods.energy_atwater_corrected", "food", str(f.id), {
+            "external_id": c["external_id"],
+            "display_name": c["display_name"],
+            "published_kcal_per_100g": check.published_kcal,
+            "stored_kcal_per_100g": check.corrected_kcal,
+            "atwater_kcal_per_100g": check.atwater_kcal,
+        })
+    return f
+
+
+
+

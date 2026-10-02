@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Import USDA FoodData Central JSON exports into drHiro's normalized schema.
 
-Reads the JSON files from ~/usda/ and populates:
+Reads the JSON files from $USDA_DATA_DIR (default: ./usda) and populates:
   - data_sources (ensures the 'usda' row exists)
   - nutrients (upserts all unique nutrient types from both files)
   - foods (one row per USDA food, linked to the 'usda' data source)
@@ -45,7 +45,7 @@ if str(API_SRC) not in sys.path:
 USDA_SOURCE_KEY = "usda"
 
 # ── USDA JSON file paths ───────────────────────────────────────────────────────
-DATA_DIR = Path("/home/mirko/usda")
+DATA_DIR = Path(os.environ.get("USDA_DATA_DIR", "usda"))
 FOUNDATION_FILE = DATA_DIR / "FoodData_Central_foundation_food_json_2026-04-30.json"
 SR_LEGACY_FILE = DATA_DIR / "FoodData_Central_sr_legacy_food_json_2018-04.json"
 
