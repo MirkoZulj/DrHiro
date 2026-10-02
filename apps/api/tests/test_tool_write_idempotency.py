@@ -167,3 +167,33 @@ def test_mcp_identity_gate_still_holds():
     )
     assert proc.returncode == 0, f"identity gate FAILED:\n{proc.stdout}\n{proc.stderr}"
     assert "PASS" in proc.stdout
+
+
+# --------------------------------------------------------------------------- #
+# 8. when a repeat IS suppressed, the model must be told — "Logged." for a write
+#    that never happened is silent data loss, not a guard
+# --------------------------------------------------------------------------- #
+def test_suppressed_repeat_is_announced_to_the_model(client, db, user_a):
+    t0 = datetime(2026, 10, 2, 10, 0, 0, tzinfo=timezone.utc)
+
+    first = client.post(
+        TOOL_URL, json={"text": PROD_TEXT, "eaten_at": t0.isoformat()},
+        headers=_headers()).json()
+    second = client.post(
+        TOOL_URL,
+        json={"text": PROD_TEXT, "eaten_at": (t0 + timedelta(seconds=10)).isoformat()},
+        headers=_headers()).json()
+
+    assert first["ok"] is True and first["data"].get("duplicate_suppressed") is None, first
+    assert first["message"] == "Logged.", first
+
+    assert second["ok"] is True, second
+    assert second["data"].get("duplicate_suppressed") is True, second
+    assert second["message"] != "Logged.", (
+        "a suppressed write still answered 'Logged.' — the agent would claim a "
+        "record that was never written")
+    assert "already" in second["message"].lower(), second["message"]
+
+    # and nothing extra was written
+    assert len(_water_rows(db, user_a)) == 1
+    assert _water_total(db, user_a) == PROD_TOTAL_ML
