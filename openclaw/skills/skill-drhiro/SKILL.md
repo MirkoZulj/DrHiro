@@ -38,22 +38,22 @@ exec drhiro_api.sh <telegram_id> <METHOD> <path> [json-body]
 
 Examples:
 ```
-exec drhiro_api.sh 984523234 GET  /tools/get_my_today_summary
-exec drhiro_api.sh 984523234 POST /tools/create_manual_weight '{"value": 82.4}'
-exec drhiro_api.sh 984523234 POST /tools/create_manual_bp '{"systolic":128,"diastolic":78,"pulse":64,"measured_at":"2026-08-10T08:00:00Z"}'
-exec drhiro_api.sh 984523234 POST /tools/create_meal_from_text '{"text":"2 eggs, toast","meal_type":"breakfast"}'
-exec drhiro_api.sh 984523234 POST /tools/get_pending_meal '{"meal_id":"..."}'
-exec drhiro_api.sh 984523234 POST /tools/search_food '{"query":"cheese","limit":5}'
-exec drhiro_api.sh 984523234 POST /tools/update_meal_item '{"meal_id":"...","item_id":"...","patch":{"display_name":"Cheese, cheddar"}}'
-exec drhiro_api.sh 984523234 POST /tools/confirm_meal '{"meal_id":"..."}'
-exec drhiro_api.sh 984523234 POST /tools/issue_device_code '{}'
-exec drhiro_api.sh 984523234 POST /tools/undo_last_user_action '{}'
-exec drhiro_api.sh 984523234 GET  /tools/list_my_reminders
-exec drhiro_api.sh 984523234 POST /tools/create_reminder '{"type":"bp","schedule_json":{"days":["mon"],"time":"08:00"},"timezone":"Europe/Zagreb"}'
-exec drhiro_api.sh 984523234 POST /tools/snooze_reminder '{"occurrence_id":"...","duration_minutes":15}'
-exec drhiro_api.sh 984523234 POST /tools/set_user_goal '{"goal_type":"steps","target_json":{"daily_steps":8000},"period":"30d"}'
-exec drhiro_api.sh 984523234 GET  /tools/get_my_active_alerts
-exec drhiro_api.sh 984523234 POST /tools/acknowledge_alert '{"alert_id":"..."}'
+exec drhiro_api.sh 123456789 GET  /tools/get_my_today_summary
+exec drhiro_api.sh 123456789 POST /tools/create_manual_weight '{"value": 82.4}'
+exec drhiro_api.sh 123456789 POST /tools/create_manual_bp '{"systolic":128,"diastolic":78,"pulse":64,"measured_at":"2026-08-10T08:00:00Z"}'
+exec drhiro_api.sh 123456789 POST /tools/create_meal_from_text '{"text":"2 eggs, toast","meal_type":"breakfast"}'
+exec drhiro_api.sh 123456789 POST /tools/get_pending_meal '{"meal_id":"..."}'
+exec drhiro_api.sh 123456789 POST /tools/search_food '{"query":"cheese","limit":5}'
+exec drhiro_api.sh 123456789 POST /tools/update_meal_item '{"meal_id":"...","item_id":"...","patch":{"display_name":"Cheese, cheddar"}}'
+exec drhiro_api.sh 123456789 POST /tools/confirm_meal '{"meal_id":"..."}'
+exec drhiro_api.sh 123456789 POST /tools/issue_device_code '{}'
+exec drhiro_api.sh 123456789 POST /tools/undo_last_user_action '{}'
+exec drhiro_api.sh 123456789 GET  /tools/list_my_reminders
+exec drhiro_api.sh 123456789 POST /tools/create_reminder '{"type":"bp","schedule_json":{"days":["mon"],"time":"08:00"},"timezone":"Europe/Zagreb"}'
+exec drhiro_api.sh 123456789 POST /tools/snooze_reminder '{"occurrence_id":"...","duration_minutes":15}'
+exec drhiro_api.sh 123456789 POST /tools/set_user_goal '{"goal_type":"steps","target_json":{"daily_steps":8000},"period":"30d"}'
+exec drhiro_api.sh 123456789 GET  /tools/get_my_active_alerts
+exec drhiro_api.sh 123456789 POST /tools/acknowledge_alert '{"alert_id":"..."}'
 ```
 
 Tool list:

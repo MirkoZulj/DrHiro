@@ -42,7 +42,7 @@ TELEGRAM_ID = os.environ.get("DRHIRO_TELEGRAM_ID", "<TELEGRAM_ID>")
 PI_HOST = os.environ.get("PI_HOST", "<pi-tailnet-ip>")
 PI_USER = os.environ.get("PI_USER", "<pi-user>")
 PI_PASS = os.environ.get("PI_PASS", "<PI_PASS>")
-CAMOUFOX_SCRIPT = "/home/mirko/camoufox_nutrition.py"
+CAMOUFOX_SCRIPT = os.environ.get("CAMOUFOX_SCRIPT", "<camoufox-script>")
 
 # ---------------------------------------------------------------------------
 # DB + Redis

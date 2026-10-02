@@ -82,7 +82,7 @@ No keystore or password appears in any tracked file or git history.
 
 ## Artifact location
 
-- `/home/mirko/projects/drhiro-trueforge/apk-build/drhiro-bridge-release.apk`
+- `<build-dir>/apk-build/drhiro-bridge-release.apk`
 - Build host: `C:\bridge-src\app\build\outputs\apk\release\app-release.apk`
 
 ## Boundary

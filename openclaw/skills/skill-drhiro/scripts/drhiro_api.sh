@@ -5,9 +5,9 @@
 #   drhiro_api.sh <telegram_id> <method> <path> [json-body]
 #
 # Examples:
-#   drhiro_api.sh 984523234 GET /tools/get_my_today_summary
-#   drhiro_api.sh 984523234 POST /tools/create_manual_weight '{"value": 82.4}'
-#   drhiro_api.sh 984523234 POST /tools/create_manual_bp '{"systolic":128,"diastolic":78,"pulse":64}'
+#   drhiro_api.sh 123456789 GET /tools/get_my_today_summary
+#   drhiro_api.sh 123456789 POST /tools/create_manual_weight '{"value": 82.4}'
+#   drhiro_api.sh 123456789 POST /tools/create_manual_bp '{"systolic":128,"diastolic":78,"pulse":64}'
 #
 # Auth:
 #   - X-Service-Token: signed gateway identity (DRHIRO_OPENCLAW_SERVICE_TOKEN env)

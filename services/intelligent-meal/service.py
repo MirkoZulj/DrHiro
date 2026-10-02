@@ -64,9 +64,9 @@ if not DB_URL:
 
 # Camoufox / Pi SSH config
 PI_HOST = os.environ.get("PI_HOST", "")
-PI_USER = os.environ.get("PI_USER", "mirko")
+PI_USER = os.environ.get("PI_USER", "")
 PI_PASS = os.environ.get("PI_PASS", "")
-CAMOUFOX_SCRIPT = "/home/mirko/camoufox_nutrition.py"
+CAMOUFOX_SCRIPT = os.environ.get("CAMOUFOX_SCRIPT", "")
 
 # ---------------------------------------------------------------------------
 # DB + Redis
