@@ -27,8 +27,20 @@ from drhiro_api.security import create_access_token, validate_telegram_init_data
 
 @pytest.fixture(scope="session")
 def db_engine():
-    # Drop + recreate all tables for a clean run against the real DB.
-    Base.metadata.drop_all(engine)
+    # Reset the WHOLE schema, not just the tables this metadata declares.
+    #
+    # The CI job runs `alembic upgrade head` before pytest, so the database also
+    # holds tables the ORM metadata does not define -- alerts, daily_aggregates,
+    # food_brands, food_resolution_rules, recipes, rule_definitions, ... Their
+    # foreign keys reach into the ORM's tables, so Base.metadata.drop_all() then
+    # fails to drop `users` with DependentObjectsStillExist and EVERY test in
+    # the run reports an error. That is why the ci/python-tests job has never
+    # passed. Dropping the schema is indifferent to what the ORM knows about and
+    # leaves a clean slate for create_all below.
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
     Base.metadata.create_all(engine)
     yield engine
     # Leave the schema in place for inspection; tests use unique users.
