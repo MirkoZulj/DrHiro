@@ -1,0 +1,172 @@
+"""Regression suite for food-name resolution (spec Tasks 3, 4, 6).
+
+Runs against the DEV database only (conftest points DRHIRO_DATABASE_URL at
+localhost:5435 and calls Base.metadata.drop_all()). The catalogue is built
+from fixtures here, so these tests exercise the RANKER and the rule handling,
+not the seeded production data.
+
+Run:
+    docker run --rm --network host \
+      -e DRHIRO_DATABASE_URL=postgresql+psycopg://drhiro:drhiro@localhost:5435/drhiro \
+      -e DRHIRO_TEST_DATABASE_URL=postgresql+psycopg://drhiro:drhiro@localhost:5435/drhiro \
+      drhiro-api:0.1.17-resolution-tf \
+      sh -c "pip install -q pytest httpx && cd /app/apps/api && python -m pytest tests/test_food_resolution.py -q"
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+
+from drhiro_api.food_search import (
+    _head_match,
+    _is_weak_head_match,
+    resolve_food,
+)
+from drhiro_api.models import (
+    DataSource,
+    Food,
+    FoodNutrient,
+    FoodResolutionRule,
+    Nutrient,
+    User,
+)
+
+NUTRIENT_CODES = ["energy", "protein", "carbs", "fat", "fiber", "sodium"]
+
+
+@pytest.fixture()
+def catalogue(db):
+    """A miniature catalogue with the real problem rows + the fixed staples."""
+    usda = DataSource(source_key="usda", source_label="USDA")
+    private = DataSource(source_key="drhiro_private", source_label="Private")
+    db.add_all([usda, private])
+    db.flush()
+
+    nut = {}
+    for code in NUTRIENT_CODES:
+        n = Nutrient(nutrient_code=code, nutrient_label=code, unit="g")
+        db.add(n)
+        db.flush()
+        nut[code] = n.id
+
+    def add(source, ext, name, energy, generic=True):
+        f = Food(id=uuid.uuid4(), data_source_id=source.id, external_id=ext,
+                 display_name=name, is_generic=generic, is_liquid=False)
+        db.add(f)
+        db.flush()
+        db.add(FoodNutrient(food_id=f.id, nutrient_id=nut["energy"],
+                            amount_per_100g=energy, amount_per_serving=None))
+        db.flush()
+        return f
+
+    # Problem rows (the "before" world) + the authoritative staples.
+    add(usda, "1", "Pepper, banana, raw", 27)
+    add(usda, "2", "Bananas, raw", 89)
+    add(private, "2", "Bananas, raw", 89)
+    add(usda, "3", "Bacon, meatless", 309)
+    add(usda, "4", "Bacon, cooked", 548)
+    add(usda, "5", "Water convolvulus, raw", 19)
+    add(usda, "6", "Water, bottled, generic", 0)
+    add(usda, "7", "Water, tap, drinking", 0)
+    add(private, "8", "Troyer Dist. Co beef", 129, generic=False)
+    add(usda, "9", "Beef, tenderloin steak, raw", 143)
+    add(usda, "10", "Beef, composite of trimmed retail cuts, separable lean and fat, raw", 250)
+    add(private, "11", "Giant Eagle, Inc chicken breast", 165, generic=False)
+    add(usda, "12", "Chicken breast, raw", 120)
+    add(usda, "13", "Egg, whole, raw, fresh", 143)
+    add(usda, "14", "Egg, white, raw, fresh", 52)
+    add(usda, "15", "Egg, yolk, raw, fresh", 322)
+    add(usda, "16", "Peach nectar, canned, with added ascorbic acid", 50)
+    add(usda, "17", "Peaches, yellow, raw", 39)
+    add(private, "18", "ICE CREAM CONE", 309)
+    add(usda, "19", "Ice creams, vanilla", 207)
+    add(usda, "20", "Beverages, carbonated, cola, regular", 42)
+    add(private, "21", "ESPRESSO COFFEE YOGOLITE, ESPRESSO COFFEE", 92)
+    add(usda, "22", "Espresso coffee, brewed", 9)
+    add(usda, "23", "Salt, table", 0)
+    add(usda, "24", "Salt, table, iodized", 0)
+    add(usda, "25", "Honey", 304)
+    add(usda, "26", "Honey roll sausage, beef", 182)
+    db.commit()
+    return {"usda": usda, "private": private}
+
+
+# (query, expected resolved name) -- expectations are exact for the fixture.
+ACCEPTANCE = [
+    ("banana", "Bananas, raw"),
+    ("bacon", "Bacon, cooked"),
+    ("water", "Water, bottled, generic"),
+    ("beef", "Beef, tenderloin steak, raw"),  # never the branded row
+    ("egg", "Egg, whole, raw, fresh"),
+    ("chicken breast", "Chicken breast, raw"),
+    ("ice cream", "Ice creams, vanilla"),
+    ("espresso coffee", "Espresso coffee, brewed"),
+    ("peach", "Peaches, yellow, raw"),
+    ("cola", "Beverages, carbonated, cola, regular"),
+    ("salt", "Salt, table"),
+    ("honey", "Honey"),
+]
+
+
+def test_bare_word_rejects_qualified_and_branded_rows(db, catalogue):
+    """bacon must not be 'Bacon, meatless'; water must not be 'Water convolvulus'."""
+    r = resolve_food(db, "bacon", limit=5)
+    assert r.best is not None
+    assert r.best.display_name != "Bacon, meatless"
+    assert r.best.display_name == "Bacon, cooked"
+
+    r = resolve_food(db, "water", limit=5)
+    assert r.best.display_name != "Water convolvulus, raw"
+    assert "water" in r.best.display_name.lower()
+
+
+def test_bare_generic_words_resolve_to_plain_rows(db, catalogue):
+    for query, expected in ACCEPTANCE:
+        r = resolve_food(db, query, limit=5)
+        assert r.best is not None, f"{query} unresolved"
+        assert r.best.display_name == expected, \
+            f"{query} -> {r.best.display_name!r}, expected {expected!r}"
+        # Never a branded row for a bare generic word.
+        assert r.best.is_generic is True, f"{query} -> branded {r.best.display_name!r}"
+
+
+def test_specific_name_is_not_collapsed_to_its_generic_word(db, catalogue):
+    """A deactivated (poisoned) rule must not collapse a specific name.
+
+    The production fix deactivates the bare-word rules that pointed at a
+    branded product; here we insert the same poisoned rule as INACTIVE and
+    assert it is not honoured, while a specific name still resolves to itself.
+    """
+    user_id = uuid.uuid4()
+    db.add(User(id=user_id, display_name="Mirko", timezone="Europe/Zagreb"))
+    db.flush()
+    troyer = db.query(Food).filter(Food.display_name == "Troyer Dist. Co beef").one()
+    db.add(FoodResolutionRule(user_id=user_id, original_pattern="beef",
+                              resolved_food_id=troyer.id, scope="user", active=False))
+    db.commit()
+
+    # The bare word does not collapse to the branded row.
+    r = resolve_food(db, "beef", limit=5, user_id=user_id)
+    assert r.best.display_name != "Troyer Dist. Co beef"
+    assert r.best.is_generic is True
+
+    # And a specific name keeps its specificity.
+    r = resolve_food(db, "Beef, tenderloin steak, raw", limit=5, user_id=user_id)
+    assert r.best.display_name == "Beef, tenderloin steak, raw"
+
+
+def test_head_match_plural_and_leading_tokens():
+    assert _head_match("banana", "Bananas, raw") is True
+    assert _head_match("banana", "Pepper, banana, raw") is False
+    assert _head_match("chicken breast", "Chicken, breast, boneless, skinless, raw") is True
+    assert _head_match("water", "Water, bottled, generic") is True
+    assert _is_weak_head_match("bacon", "Bacon, meatless") is True
+    assert _is_weak_head_match("bacon", "Bacon, cooked") is False
+
+
+def test_results_are_stable_over_five_calls(db, catalogue):
+    for query, _ in ACCEPTANCE:
+        names = [resolve_food(db, query, limit=5).best.display_name for _ in range(5)]
+        assert len(set(names)) == 1, f"{query} unstable: {names}"

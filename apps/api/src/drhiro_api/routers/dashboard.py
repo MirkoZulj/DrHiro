@@ -16,6 +16,19 @@ from drhiro_api.db import get_db
 from drhiro_api.deps import get_current_user
 from drhiro_api.models import Activity, Goal, Meal, Measurement, User
 from drhiro_api.security import audit
+from drhiro_api.services.day_boundary import (
+    day_start_hour,
+    local_calendar_date,
+    local_calendar_date_window,
+    local_calendar_day_start,
+    local_date_window,
+    local_now,
+    nutrition_date,
+    nutrition_day_start,
+    resolve_tz,
+    utc_offset_str,
+    wake_date,
+)
 from drhiro_rules.calculations import (
     bp_average_by_context,
     coverage_score,
@@ -178,28 +191,54 @@ def _dedup_steps(records: list[dict]) -> int:
 
 
 def _local_day_start(user: User) -> datetime:
-    """Start of the user's current LOCAL day, as tz-aware UTC datetime.
+    """Start of the user's current NUTRITION day, as a tz-aware UTC datetime.
 
-    Measurements are stored as tz-aware UTC. 'Today' must be computed in the
-    user's timezone (e.g. Europe/Zagreb), not UTC midnight — otherwise steps
-    between local midnight and 02:00 (for UTC+2) fall on 'yesterday' and the
-    daily total is under-counted.
+    Delegates to the canonical boundary helper: a day begins with the first
+    meal, not at local midnight, so a meal eaten at 00:01 local counts to the
+    previous day. Kept under its historical name so existing callers keep
+    working. With ``DRHIRO_DAY_START_HOUR=0`` this is plain local midnight.
     """
-    tz = ZoneInfo(user.timezone or "UTC")
-    local_now = datetime.now(tz)
-    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return local_midnight.astimezone(timezone.utc)
+    return nutrition_day_start(user)
+
+
+def _latest_available_measurement(db: Session, user_id, metric_types, value_keys):
+    """Newest measurement for a point-in-time metric, with NO time window.
+
+    The today endpoint answers "what is the latest known value", not "what was
+    recorded today". A weight or heart-rate entry from last week is still the
+    user's latest information and must appear on the tile rather than "no data".
+    """
+    metric_values = [m.value if hasattr(m, "value") else m for m in metric_types]
+    q = db.query(Measurement).filter(
+        Measurement.user_id == user_id,
+        Measurement.metric_type.in_(metric_values),
+    )
+    if _ledger_soft_delete_available(db):
+        q = q.filter(text("measurements.deleted_at IS NULL"))
+    for m in q.order_by(Measurement.start_at.desc()).limit(200).all():
+        value_json = m.value_json or {}
+        for key in value_keys:
+            value = value_json.get(key)
+            if value is not None:
+                return m, value
+    return None
 
 
 @router.get("/dashboard/today")
 def dashboard_today(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Today's summary: steps, weight, BP latest, water, meals, coverage."""
-    today_start = _local_day_start(user)
+    # TWO windows on purpose — the today tile legitimately mixes the two rules.
+    # Meals and water/consumption use the EATING day (04:00 boundary, so a
+    # 00:01 meal belongs to yesterday). Device MEASUREMENTS (steps, sleep, ...)
+    # use the LOCAL CALENDAR day, so the Bridge's daily step total stamped at
+    # local midnight counts as TODAY, not yesterday.
+    today_start = _local_day_start(user)          # eating day: meals, water
+    cal_start = local_calendar_day_start(user)    # calendar day: measurements
     measurements = _measurements_since(db, user.id, 30)
 
     steps_today = _dedup_steps(
         [m for m in measurements
-         if m["metric_type"] == MetricType.STEPS and m["start_at"] >= today_start]
+         if m["metric_type"] == MetricType.STEPS and m["start_at"] >= cal_start]
     )
     def _latest_point(metric_type, value_key=None):
         """Return the newest row for a point-in-time metric, with recency metadata."""
@@ -213,12 +252,12 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
                     v = v.get(value_key)
                 if v is None:
                     continue
-                local_dt = dt.astimezone(ZoneInfo(user.timezone))
+                local_dt = dt.astimezone(resolve_tz(user.timezone))
                 return {
                     "value": v,
                     "measured_at": local_dt.isoformat(),
-                    "days_old": (datetime.now(ZoneInfo(user.timezone)).date() - local_dt.date()).days,
-                    "is_stale": (datetime.now(ZoneInfo(user.timezone)).date() - local_dt.date()).days > 2,
+                    "days_old": (datetime.now(resolve_tz(user.timezone)).date() - local_dt.date()).days,
+                    "is_stale": (datetime.now(resolve_tz(user.timezone)).date() - local_dt.date()).days > 2,
                     "source_provider": m.get("source_provider"),
                     "recording_method": m.get("recording_method"),
                 }
@@ -230,21 +269,42 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
             dt = m.get("start_at") or m.get("recorded_at")
             if dt is None:
                 continue
-            local_dt = dt.astimezone(ZoneInfo(user.timezone))
+            local_dt = dt.astimezone(resolve_tz(user.timezone))
             latest_bp = {
                 "systolic_mmhg": m["value_json"].get("systolic_mmhg"),
                 "diastolic_mmhg": m["value_json"].get("diastolic_mmhg"),
                 "pulse_bpm": m["value_json"].get("pulse_bpm"),
                 "measured_at": local_dt.isoformat(),
-                "days_old": (datetime.now(ZoneInfo(user.timezone)).date() - local_dt.date()).days,
-                "is_stale": (datetime.now(ZoneInfo(user.timezone)).date() - local_dt.date()).days > 2,
+                "days_old": (datetime.now(resolve_tz(user.timezone)).date() - local_dt.date()).days,
+                "is_stale": (datetime.now(resolve_tz(user.timezone)).date() - local_dt.date()).days > 2,
                 "source_provider": m.get("source_provider"),
                 "recording_method": m.get("recording_method"),
             }
             break
-    latest_weight_kg = _latest_point(MetricType.WEIGHT, "weight_kg")
+    def _point_tile(metric_types, value_keys):
+        """Latest known value for a tile, regardless of how old the entry is."""
+        hit = _latest_available_measurement(db, user.id, metric_types, value_keys)
+        if hit is None:
+            return None
+        m, value = hit
+        local_dt = m.start_at.astimezone(resolve_tz(user.timezone))
+        days_old = (datetime.now(resolve_tz(user.timezone)).date() - local_dt.date()).days
+        return {
+            "value": value,
+            "measured_at": local_dt.isoformat(),
+            "days_old": days_old,
+            "is_stale": days_old > 2,
+            "source_provider": m.source_provider,
+            "recording_method": m.recording_method,
+        }
+
+    latest_weight_kg = _point_tile([MetricType.WEIGHT], ("weight_kg",))
+    latest_hr = _point_tile(
+        [MetricType.HEART_RATE, MetricType.RESTING_HEART_RATE],
+        ("bpm", "heart_rate"),
+    )
     water_today = sum(
-        m["value_json"].get("amount_ml", 0)
+        (m["value_json"].get("amount_ml") or 0)
         for m in measurements
         if m["metric_type"] == MetricType.WATER and m["start_at"] >= today_start
     )
@@ -289,17 +349,24 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
         if m["metric_type"] == MetricType.WATER:
             dt = m.get("start_at") or m.get("recorded_at")
             if dt is not None:
-                water_last = dt.astimezone(ZoneInfo(user.timezone)).isoformat()
+                water_last = dt.astimezone(resolve_tz(user.timezone)).isoformat()
             break
+    # Count CONFIRMED meals only: a needs_review draft (e.g. a failed parse
+    # left at 0 kcal) is not a logged meal and must not inflate the tile.
+    # Deleted rows are excluded by the same status filter.
     meals_today_rows = (
         db.query(Meal)
-        .filter(Meal.user_id == user.id, Meal.eaten_at >= today_start, Meal.status != "deleted")
+        .filter(
+            Meal.user_id == user.id,
+            Meal.eaten_at >= today_start,
+            Meal.status == "confirmed",
+        )
         .all()
     )
     meals_today = len(meals_today_rows)
     calories_kcal_today = sum(float((m.totals_json or {}).get("kcal") or 0) for m in meals_today_rows)
     calories_measured_at = (
-        max((m.eaten_at for m in meals_today_rows), default=None).astimezone(ZoneInfo(user.timezone)).isoformat()
+        max((m.eaten_at for m in meals_today_rows), default=None).astimezone(resolve_tz(user.timezone)).isoformat()
         if meals_today_rows else None
     )
     # Activity burn for today (the daily summary previously omitted it entirely).
@@ -307,8 +374,9 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
     try:
         from drhiro_api.models import Activity
         # `today_start` is tz-aware UTC, so .date() would yield the UTC date and
-        # miss the local day entirely. Compare the owner's LOCAL date.
-        local_today = datetime.now(ZoneInfo(user.timezone)).date()
+        # miss the local day entirely. Compare the owner's NUTRITION date, so an
+        # activity logged at 00:30 local counts to the previous day.
+        local_today = nutrition_date(datetime.now(timezone.utc), user.timezone)
         aq = db.query(Activity).filter(Activity.user_id == user.id,
                                        Activity.activity_date == local_today)
         if _ledger_soft_delete_available(db):
@@ -326,24 +394,44 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
         # night; pick the latest local date that has any sleep, then dedup its
         # records into a total.  The old "max by duration_min" returned a
         # 12-day-old value (546 min from Aug 20) instead of last night.
-        tz = ZoneInfo(user.timezone)
-        by_night: dict[str, list] = {}
-        for m in sleep_rows:
-            dt = m.get("start_at") or m.get("recorded_at")
-            if dt is None:
-                continue
-            local_d = dt.astimezone(tz).date().isoformat()
-            by_night.setdefault(local_d, []).append(m)
-        latest_night = max(by_night)
-        night_recs = [
-            {
-                "start_at": m.get("start_at") or m.get("recorded_at"),
-                "end_at": m.get("end_at") or (m.get("start_at") or m.get("recorded_at")),
-                "value_json": m.get("value_json") or {},
-            }
-            for m in by_night[latest_night]
-        ]
+        tz = resolve_tz(user.timezone)
+        # Group sleep records into nights by TIME GAP, not by calendar date of
+        # start_at. The date-keyed grouping merged two genuinely different
+        # sleeps that happen to share a start date (e.g. a 02:24 morning sleep
+        # and a 23:43 night sleep both keyed "2026-09-22") and double-counted
+        # them (450+294=744min). Records overlapping or within ~10h of each
+        # other are the same night; a larger gap starts a new one.
+        night_gap = timedelta(hours=10)
+        sleep_rows_sorted = sorted(
+            [
+                {
+                    "start_at": m.get("start_at") or m.get("recorded_at"),
+                    "end_at": m.get("end_at") or (m.get("start_at") or m.get("recorded_at")),
+                    "value_json": m.get("value_json") or {},
+                    "source_provider": m.get("source_provider"),
+                }
+                for m in sleep_rows
+                if (m.get("start_at") or m.get("recorded_at")) is not None
+            ],
+            key=lambda r: r["start_at"],
+        )
+        nights: list[list[dict]] = []
+        for rec in sleep_rows_sorted:
+            if not nights or (rec["start_at"] - nights[-1][-1]["end_at"]) > night_gap:
+                nights.append([rec])
+            else:
+                nights[-1].append(rec)
+
+        latest_night = max(nights, key=lambda ns: max(n["start_at"] for n in ns))
+        previous_nights = sorted(nights, key=lambda ns: max(n["start_at"] for n in ns))[:-1]
+
+        night_recs = latest_night
         duration_min = _dedup_sleep(night_recs)
+        if duration_min <= 0 and previous_nights:
+            # Fall back to the previous night if the newest bucket has no sleep.
+            night_recs = previous_nights[-1]
+            duration_min = _dedup_sleep(night_recs)
+
         if duration_min > 0:
             anchor = night_recs[0]["start_at"]
             local_dt = anchor.astimezone(tz)
@@ -352,9 +440,14 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
                 "measured_at": local_dt.isoformat(),
                 "days_old": (datetime.now(tz).date() - local_dt.date()).days,
                 "is_stale": (datetime.now(tz).date() - local_dt.date()).days > 2,
-                "source_provider": by_night[latest_night][0].get("source_provider"),
+                "source_provider": night_recs[0].get("source_provider"),
             }
 
+    # The user's DEVICE clock (from their stored timezone), so the bot can quote
+    # the wall-clock the user actually lives in instead of the gateway's UTC
+    # clock. `nutrition_date` stays the boundary-shifted day a meal belongs to;
+    # `local_date` is the plain local calendar date.
+    _now_local = local_now(user.timezone)
     return {
         "steps_today": steps_today,
         "steps_coverage_7d": coverage_score(
@@ -363,11 +456,30 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
         ),
         "latest_bp": latest_bp,
         "latest_weight_kg": latest_weight_kg,
+        # Flattened recency metadata for the deployed web tiles. The weight tile
+        # reads these directly; without them it cannot show when the value was
+        # measured or whether it is stale.
+        "latest_weight_measured_at": latest_weight_kg["measured_at"] if latest_weight_kg else None,
+        "latest_weight_is_stale": latest_weight_kg["is_stale"] if latest_weight_kg else None,
+        "latest_weight_days_old": latest_weight_kg["days_old"] if latest_weight_kg else None,
+        "latest_weight_source_provider": latest_weight_kg["source_provider"] if latest_weight_kg else None,
+        # Latest available heart rate, regardless of today's window.
+        "heart_rate_bpm": latest_hr["value"] if latest_hr else None,
+        "heart_rate_measured_at": latest_hr["measured_at"] if latest_hr else None,
+        "heart_rate_is_stale": latest_hr["is_stale"] if latest_hr else None,
+        "heart_rate_days_old": latest_hr["days_old"] if latest_hr else None,
+        "heart_rate_source_provider": latest_hr["source_provider"] if latest_hr else None,
         "water_ml_today": water_today,
         "liquids_today": liquids_today,
         "water_measured_at": water_last,
         "meals_logged_today": meals_today,
         "calories_kcal_today": round(calories_kcal_today, 1),
+        "nutrition_date": nutrition_date(datetime.now(timezone.utc), user.timezone).isoformat(),
+        "day_start_hour": day_start_hour(),
+        "timezone": user.timezone,
+        "local_date": _now_local.date().isoformat(),
+        "local_time": _now_local.strftime("%H:%M:%S"),
+        "utc_offset": utc_offset_str(_now_local),
         "calories_measured_at": calories_measured_at,
         "calories_is_stale": False,
         "activity_kcal_today": activity_kcal_today,
@@ -384,7 +496,7 @@ def trends(
     db: Session = Depends(get_db),
 ):
     days = int(period[:-1])
-    tz = ZoneInfo(user.timezone or "UTC")
+    tz = resolve_tz(user.timezone or "UTC")
     measurements = _measurements_since(db, user.id, days)
     if metric == "weight":
         return weight_trend(measurements, days)
@@ -435,7 +547,7 @@ def _nutrition_trend(db: Session, user_id: uuid.UUID, days: int, tz=None) -> dic
     from collections import defaultdict
     daily: dict[str, dict] = defaultdict(lambda: {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "meals_count": 0})
     for m in meals:
-        local_day = (m.eaten_at.astimezone(tz) if tz else m.eaten_at).date().isoformat()
+        local_day = nutrition_date(m.eaten_at, tz).isoformat()
         t = m.totals_json or {}
         daily[local_day]["kcal"] += t.get("kcal") or 0
         daily[local_day]["protein_g"] += t.get("protein_g") or 0
@@ -549,25 +661,93 @@ def update_activity_settings(req: BmrUpdate, user: User = Depends(get_current_us
 @router.get("/activities")
 def list_activities(date: str | None = Query(None), days: int = Query(30, ge=1, le=366),
                     user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Activities for a date (default: today, user tz) or an aggregate daily sum for N days."""
-    tz = ZoneInfo(user.timezone)
+    """Activities for a date (default: today, user tz) or an aggregate daily sum for N days.
+
+    UNION of the two sources the panel needs to see:
+
+      * the ``activities`` table — USER-LOGGED entries (``activity_date`` is a
+        nutrition-day date, kept on the 04:00 boundary);
+      * ``measurements`` rows with ``metric_type='exercise'`` — DEVICE sessions
+        the Bridge syncs from Health Connect, bucketed by their LOCAL CALENDAR
+        day.
+
+    The response keys are unchanged (``items``/``total_burned`` for ``date=``;
+    ``days``/``total_burned`` for ``days=``) so the deployed web bundle keeps
+    working. ``sessions_by_day`` is additive.
+    """
+    tz = resolve_tz(user.timezone)
     if date:
         d = date_type.fromisoformat(date)
         rows = (db.query(Activity)
                 .filter(Activity.user_id == user.id, Activity.activity_date == d)
                 .order_by(Activity.created_at).all())
+        items = [_activity_out(a) for a in rows]
+        ex_start, ex_end = local_calendar_date_window(d.isoformat(), tz)
+        items += [_exercise_out(m, tz) for m in _device_exercise_rows(db, user, ex_start, ex_end)]
         return {"date": d.isoformat(),
-                "items": [_activity_out(a) for a in rows],
-                "total_burned": sum(a.calories_burned for a in rows)}
-    end = datetime.now(tz).date()
+                "items": items,
+                "total_burned": round(sum(float(it["calories_burned"] or 0) for it in items), 1)}
+    end = nutrition_date(datetime.now(timezone.utc), tz)
     start = end - timedelta(days=days - 1)
     rows = (db.query(Activity)
             .filter(Activity.user_id == user.id, Activity.activity_date >= start, Activity.activity_date <= end)
             .all())
     by_day: dict[str, float] = {}
+    sessions_by_day: dict[str, int] = {}
     for a in rows:
-        by_day[a.activity_date.isoformat()] = by_day.get(a.activity_date.isoformat(), 0.0) + a.calories_burned
-    return {"days": by_day, "total_burned": sum(by_day.values())}
+        k = a.activity_date.isoformat()
+        by_day[k] = by_day.get(k, 0.0) + float(a.calories_burned or 0)
+        sessions_by_day[k] = sessions_by_day.get(k, 0) + 1
+    # Device exercise by LOCAL CALENDAR day (a session at 00:30 local is today's).
+    cal_end = local_calendar_date(datetime.now(timezone.utc), tz)
+    cal_start = cal_end - timedelta(days=days - 1)
+    ex_start, _ = local_calendar_date_window(cal_start.isoformat(), tz)
+    _, ex_end = local_calendar_date_window(cal_end.isoformat(), tz)
+    for m in _device_exercise_rows(db, user, ex_start, ex_end):
+        k = local_calendar_date(m.start_at, tz).isoformat()
+        by_day[k] = by_day.get(k, 0.0) + float((m.value_json or {}).get("calories_burned") or 0.0)
+        sessions_by_day[k] = sessions_by_day.get(k, 0) + 1
+    return {"days": by_day, "total_burned": round(sum(by_day.values()), 1),
+            "sessions_by_day": sessions_by_day}
+
+
+def _device_exercise_rows(db: Session, user: User, start_utc, end_utc) -> list:
+    """Exercise MEASUREMENTS (``metric_type='exercise'``) inside a UTC window.
+
+    The Bridge writes each Health Connect exercise session as a ``measurements``
+    row with ``value_json`` {"exercise_type", "duration_min"}; the ``activities``
+    table only ever held user-logged entries.
+    """
+    q = (db.query(Measurement)
+         .filter(Measurement.user_id == user.id,
+                 Measurement.metric_type == MetricType.EXERCISE,
+                 Measurement.start_at >= start_utc,
+                 Measurement.start_at < end_utc))
+    if _ledger_soft_delete_available(db):
+        q = q.filter(text("measurements.deleted_at IS NULL"))
+    return q.order_by(Measurement.start_at.asc()).all()
+
+
+def _exercise_out(m: Measurement, tz) -> dict:
+    """One device exercise session in the SAME shape the activity panel reads.
+
+    The panel renders ``title``, optional ``description``, ``calories_burned``
+    and deletes by ``id``; ``date``/``created_at`` mirror ``_activity_out``.
+    Health Connect sends no energy for these sessions, so ``calories_burned``
+    is 0.0 — never fabricated. ``source="device"`` marks the provenance.
+    """
+    vj = m.value_json or {}
+    dur = vj.get("duration_min")
+    start_local = m.start_at.astimezone(tz)
+    return {
+        "id": str(m.id),
+        "date": start_local.date().isoformat(),
+        "title": "Exercise",
+        "description": (f"{int(dur)} min" if dur not in (None, "") else None),
+        "calories_burned": float(vj.get("calories_burned") or 0.0),
+        "created_at": m.start_at.isoformat() if m.start_at else None,
+        "source": "device",
+    }
 
 
 def _activity_out(a: Activity) -> dict:
@@ -580,8 +760,8 @@ def _activity_out(a: Activity) -> dict:
 
 @router.post("/activities")
 def create_activity(req: ActivityCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    tz = ZoneInfo(user.timezone)
-    d = date_type.fromisoformat(req.activity_date) if req.activity_date else datetime.now(tz).date()
+    tz = resolve_tz(user.timezone)
+    d = date_type.fromisoformat(req.activity_date) if req.activity_date else nutrition_date(datetime.now(timezone.utc), tz)
     a = Activity(user_id=user.id, activity_date=d, title=req.title.strip(),
                  description=req.description, calories_burned=req.calories_burned)
     db.add(a)
@@ -612,8 +792,9 @@ def energy_balance(days: int = Query(30, ge=1, le=366),
     net of BMR contribution is NOT applied here — the tracker value is used
     as-is when present).
     """
-    tz = ZoneInfo(user.timezone)
-    end = datetime.now(tz).date()
+    tz = resolve_tz(user.timezone)
+    h = day_start_hour()
+    end = nutrition_date(datetime.now(timezone.utc), tz)
     start = end - timedelta(days=days - 1)
 
     bmr = user.basal_metabolism_kcal or 0.0
@@ -621,12 +802,12 @@ def energy_balance(days: int = Query(30, ge=1, le=366),
     # intake by day
     meals = (db.query(Meal)
              .filter(Meal.user_id == user.id,
-                     Meal.eaten_at >= datetime.combine(start, datetime.min.time(), tzinfo=tz),
-                     Meal.eaten_at < datetime.combine(end + timedelta(days=1), datetime.min.time(), tzinfo=tz))
+                     Meal.eaten_at >= datetime.combine(start, datetime.min.time(), tzinfo=tz) + timedelta(hours=h),
+                     Meal.eaten_at < datetime.combine(end + timedelta(days=1), datetime.min.time(), tzinfo=tz) + timedelta(hours=h))
              .all())
     intake: dict[str, float] = {}
     for m in meals:
-        day = m.eaten_at.astimezone(tz).date().isoformat()
+        day = nutrition_date(m.eaten_at, tz).isoformat()
         t = (m.totals_json or {})
         intake[day] = intake.get(day, 0.0) + float(t.get("kcal") or 0)
 
@@ -639,6 +820,8 @@ def energy_balance(days: int = Query(30, ge=1, le=366),
         sport[a.activity_date.isoformat()] = sport.get(a.activity_date.isoformat(), 0.0) + a.calories_burned
 
     # active energy (walking) by day — prefer tracker 'active_energy', else steps*0.04
+    # Measurements bucket by LOCAL CALENDAR day (the eating-day boundary is for
+    # meals only); the window therefore starts at local midnight, not 04:00.
     measurements = _measurements_since(db, user.id, days + 1)
     active_start = datetime.combine(start, datetime.min.time(), tzinfo=tz)
     walking: dict[str, float] = {}
@@ -646,7 +829,7 @@ def energy_balance(days: int = Query(30, ge=1, le=366),
         dt = m.get("start_at") or m.get("recorded_at")
         if dt is None or dt < active_start:
             continue
-        day = dt.astimezone(tz).date().isoformat()
+        day = local_calendar_date(dt, tz).isoformat()
         if m["metric_type"] == MetricType.ACTIVE_CALORIES:
             walking[day] = walking.get(day, 0.0) + float((m["value_json"] or {}).get("value") or 0)
     if not walking:
@@ -671,7 +854,7 @@ def energy_balance(days: int = Query(30, ge=1, le=366),
                 count = float((m.get("value_json") or {}).get("count") or
                               (m.get("value_json") or {}).get("value") or 0)
                 steps = count * ratio
-                day = dt.astimezone(tz).date().isoformat()
+                day = local_calendar_date(dt, tz).isoformat()
                 walking[day] = walking.get(day, 0.0) + steps * 0.04
 
     points = []
@@ -689,16 +872,28 @@ def energy_balance(days: int = Query(30, ge=1, le=366),
 
 @router.get("/summaries/daily/{local_date}")
 def daily_summary(local_date: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Daily summary for a local date (YYYY-MM-DD). Uses user timezone."""
+    """Daily summary for a nutrition date (YYYY-MM-DD). Uses user timezone.
+
+    Meals use the EATING-day window: it runs from the day-boundary hour on
+    `local_date` to the same hour the next day, so a meal at 00:01 local counts
+    to the previous day. Device MEASUREMENTS use the plain LOCAL CALENDAR day,
+    so a step total stamped at local midnight belongs to `local_date` itself.
+    The two windows differ by the boundary hour; that is intentional.
+    """
     from zoneinfo import ZoneInfo
-    tz = ZoneInfo(user.timezone)
-    start = datetime.fromisoformat(local_date).replace(tzinfo=tz)
-    end = start + timedelta(days=1)
+    tz = resolve_tz(user.timezone)
+    start, end = local_date_window(local_date, tz)                  # meals (eating day)
+    m_start, m_end = local_calendar_date_window(local_date, tz)     # measurements (calendar day)
     measurements = (
         db.query(Measurement)
-        .filter(Measurement.user_id == user.id, Measurement.start_at >= start, Measurement.start_at < end)
-        .all()
+        .filter(Measurement.user_id == user.id, Measurement.start_at >= m_start, Measurement.start_at < m_end)
     )
+    if _ledger_soft_delete_available(db):
+        # A soft-deleted liquid must not appear in any daily total. Expressed as
+        # guarded raw SQL because the column is not ORM-mapped (a schema without
+        # it must never see it referenced).
+        measurements = measurements.filter(text("measurements.deleted_at IS NULL"))
+    measurements = measurements.all()
     meals = (
         db.query(Meal)
         .filter(Meal.user_id == user.id, Meal.eaten_at >= start, Meal.eaten_at < end, Meal.status != "deleted")
@@ -728,7 +923,7 @@ def weekly_summary(week: str, user: User = Depends(get_current_user), db: Sessio
     from zoneinfo import ZoneInfo
     import datetime as dt
 
-    tz = ZoneInfo(user.timezone)
+    tz = resolve_tz(user.timezone)
     try:
         year, w = week.split("-W")
         first = dt.date.fromisocalendar(int(year), int(w), 1)
@@ -739,8 +934,13 @@ def weekly_summary(week: str, user: User = Depends(get_current_user), db: Sessio
     measurements = (
         db.query(Measurement)
         .filter(Measurement.user_id == user.id, Measurement.start_at >= start, Measurement.start_at < end)
-        .all()
     )
+    if _ledger_soft_delete_available(db):
+        # A soft-deleted liquid must not appear in any daily total. Expressed as
+        # guarded raw SQL because the column is not ORM-mapped (a schema without
+        # it must never see it referenced).
+        measurements = measurements.filter(text("measurements.deleted_at IS NULL"))
+    measurements = measurements.all()
     steps_raw = [
         {"metric_type": m.metric_type, "start_at": m.start_at, "end_at": m.end_at, "value_json": m.value_json}
         for m in measurements if m.metric_type == MetricType.STEPS
@@ -769,7 +969,7 @@ def steps_intraday(user: User = Depends(get_current_user), db: Session = Depends
     the chart renders a gap, per 'missing is never zero').
     """
     from collections import defaultdict
-    tz = ZoneInfo(user.timezone or "UTC")
+    tz = resolve_tz(user.timezone or "UTC")
     now_local = datetime.now(tz)
     day_start = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=tz)
     day_end = day_start + timedelta(days=1)
@@ -777,8 +977,13 @@ def steps_intraday(user: User = Depends(get_current_user), db: Session = Depends
             .filter(Measurement.user_id == user.id,
                     Measurement.metric_type == MetricType.STEPS,
                     Measurement.start_at >= day_start,
-                    Measurement.start_at < day_end)
-            .all())
+                    Measurement.start_at < day_end))
+    if _ledger_soft_delete_available(db):
+        # A soft-deleted liquid must not appear in any daily total. Expressed as
+        # guarded raw SQL because the column is not ORM-mapped (a schema without
+        # it must never see it referenced).
+        rows = rows.filter(text("measurements.deleted_at IS NULL"))
+    rows = rows.all()
     hourly: dict[int, float] = defaultdict(float)
     for m in rows:
         v = (m.value_json or {}).get("count")
@@ -798,7 +1003,7 @@ def trends_daily(metric: str, days: int = Query(7, ge=1, le=90),
     steps -> summed steps/day; water_ml -> summed; sleep_duration_min -> max;
     heart_rate_bpm -> avg; weight_kg -> last of day; calories_kcal -> meal kcal/day.
     """
-    tz = ZoneInfo(user.timezone)
+    tz = resolve_tz(user.timezone)
     end = datetime.now(tz).date()
     start = end - timedelta(days=days - 1)
     start_dt = datetime.combine(start, datetime.min.time(), tzinfo=tz)
@@ -806,9 +1011,13 @@ def trends_daily(metric: str, days: int = Query(7, ge=1, le=90),
 
     rows = (db.query(Measurement)
             .filter(Measurement.user_id == user.id,
-                    Measurement.start_at >= start_dt, Measurement.start_at < end_dt)
-            .order_by(Measurement.start_at.asc())
-            .all())
+                    Measurement.start_at >= start_dt, Measurement.start_at < end_dt))
+    if _ledger_soft_delete_available(db):
+        # A soft-deleted liquid must not appear in any daily total. Expressed as
+        # guarded raw SQL because the column is not ORM-mapped (a schema without
+        # it must never see it referenced).
+        rows = rows.filter(text("measurements.deleted_at IS NULL"))
+    rows = rows.order_by(Measurement.start_at.asc()).all()
 
     metric_map = {
         "steps": MetricType.STEPS,
@@ -825,7 +1034,16 @@ def trends_daily(metric: str, days: int = Query(7, ge=1, le=90),
     for m in rows:
         if m.metric_type != mt:
             continue
-        day = m.start_at.astimezone(tz).date().isoformat()
+        if mt == MetricType.SLEEP:
+            # Sleep is keyed to the WAKE-UP day (Xiaomi/Mi Fitness convention),
+            # not to the date the wearer went to bed.
+            wd = wake_date(m.start_at, (m.value_json or {}).get("duration_min"),
+                           getattr(m, "end_at", None), tz)
+            if wd is None:
+                continue
+            day = wd.isoformat()
+        else:
+            day = m.start_at.astimezone(tz).date().isoformat()
         vj = m.value_json or {}
         v = vj.get("value")
         if v is None:
@@ -867,7 +1085,18 @@ def trends_daily(metric: str, days: int = Query(7, ge=1, le=90),
         elif metric in ("weight_kg",):
             v = vals[-1]  # last reading of the day
         elif metric == "sleep_duration_min":
-            day_sleep_recs = [{"start_at": m.start_at, "end_at": getattr(m, "end_at", None) or m.start_at, "value_json": m.value_json or {}} for m in rows if m.metric_type == mt and m.start_at.astimezone(tz).date().isoformat() == d]
+            day_sleep_recs = []
+            for m in rows:
+                if m.metric_type != mt:
+                    continue
+                wd = wake_date(m.start_at, (m.value_json or {}).get("duration_min"),
+                               getattr(m, "end_at", None), tz)
+                if wd is not None and wd.isoformat() == d:
+                    day_sleep_recs.append({
+                        "start_at": m.start_at,
+                        "end_at": getattr(m, "end_at", None) or m.start_at,
+                        "value_json": m.value_json or {},
+                    })
             v = _dedup_sleep(day_sleep_recs)  # TOTAL sleep time (all sessions), not longest
         elif metric == "heart_rate_bpm":
             v = sum(vals) / len(vals)
@@ -903,8 +1132,9 @@ def trends_bucketed(
       month -> last 12 months, 12 monthly points; offset ignored (fixed window)
     Empty buckets render as null (missing), never zero.
     """
-    tz = ZoneInfo(user.timezone or "UTC")
-    today = datetime.now(tz).date()
+    tz = resolve_tz(user.timezone or "UTC")
+    h = day_start_hour()
+    today = nutrition_date(datetime.now(timezone.utc), tz)
 
     # ---- window resolution ----
     if granularity == "day":
@@ -913,10 +1143,11 @@ def trends_bucketed(
         end = start + timedelta(days=7)
         n = 7
         def bucket_of(dt):
-            idx = (dt.date() - start).days
+            d = nutrition_date(dt, tz)
+            idx = (d - start).days
             if idx < 0 or idx >= 7:
                 return None, None
-            return idx, dt.date().strftime("%a")
+            return idx, d.strftime("%a")
         period_label = f"Week of {start.strftime('%b %d, %Y')}"
         period_key = start.isoformat()
         def day_at(i):
@@ -935,18 +1166,19 @@ def trends_bucketed(
             end = date_type(y, qm + 3, 1)
         # The window is a CALENDAR quarter, but the buckets are ISO weeks counted
         # from the Monday of the quarter's first day. When the quarter's last day
-        # is not a Sunday, its final ISO week spills past bucket 12 and those days
-        # were silently dropped even though they sit inside the window — Q3 2026
-        # lost Sep 28-30, Q4 2026 loses Dec 28-31. Widen n to cover the window.
+        # is not a Sunday, its final ISO week spilled past bucket 12 and those
+        # days were silently dropped even though they sit inside the window:
+        # Q1 2026 lost Mar 30-31, Q2 Jun 29-30, Q3 Sep 28-30, Q4 Dec 28-31.
         base_m, _ = _iso_week_bounds(start)
         last_monday, _ = _iso_week_bounds(end - timedelta(days=1))
         n = (last_monday - base_m).days // 7 + 1
         def bucket_of(dt):
-            monday0, _ = _iso_week_bounds(dt.date())
+            d = nutrition_date(dt, tz)
+            monday0, _ = _iso_week_bounds(d)
             idx = (monday0 - base_m).days // 7
             if idx < 0 or idx >= n:
                 return None, None
-            return idx, f"W{dt.date().isocalendar()[1]}"
+            return idx, f"W{d.isocalendar()[1]}"
         period_label = f"Q{((qm-1)//3)+1} {y}"
         period_key = start.isoformat()
         def day_at(i):
@@ -956,7 +1188,7 @@ def trends_bucketed(
         end = date_type(today.year, today.month, 1)
         n = 12
         def bucket_of(dt):
-            d = dt.date()
+            d = nutrition_date(dt, tz)
             idx = (d.year - start.year) * 12 + (d.month - start.month)
             if idx < 0 or idx >= 12:
                 return None, None
@@ -967,8 +1199,26 @@ def trends_bucketed(
             m = start.month - 1 + i
             return date_type(start.year + m // 12, m % 12 + 1, 1)
 
-    start_dt = datetime.combine(start, datetime.min.time(), tzinfo=tz)
-    end_dt = datetime.combine(end, datetime.min.time(), tzinfo=tz)
+    start_dt = datetime.combine(start, datetime.min.time(), tzinfo=tz) + timedelta(hours=h)
+    end_dt = datetime.combine(end, datetime.min.time(), tzinfo=tz) + timedelta(hours=h)
+    # MEASUREMENT window: plain LOCAL CALENDAR day boundaries (no +h). Meals keep
+    # the eating-day window above; device readings use the calendar day.
+    cal_start_dt = datetime.combine(start, datetime.min.time(), tzinfo=tz)
+    cal_end_dt = datetime.combine(end, datetime.min.time(), tzinfo=tz)
+
+    def _as_noon(d):
+        return datetime.combine(d, datetime.min.time(), tzinfo=tz) + timedelta(hours=12)
+
+    def bucket_of_cal(dt):
+        """Bucket index/label for a MEASUREMENT's LOCAL CALENDAR day.
+
+        Reuses ``bucket_of`` (which applies the nutrition-day shift) by
+        evaluating it at local NOON of the calendar date — noon is always after
+        the 04:00 boundary, so the shift is a no-op and all three granularities
+        share one definition. Accepts a datetime or a ``date``.
+        """
+        d = dt if isinstance(dt, date_type) else local_calendar_date(dt, tz)
+        return bucket_of(_as_noon(d))
 
     # ---- calories come from meals ----
     if metric in ("calories", "calories_kcal"):
@@ -983,10 +1233,6 @@ def trends_bucketed(
                  .all())
         buckets: list[list[float]] = [[] for _ in range(n)]
         for m in meals:
-            # Local-timezone bucketing (Rule 1): a meal at local midnight is
-            # 22:00 UTC the PREVIOUS day, so `.date()` would drop it from this
-            # window entirely (idx < 0) and shift every late-evening meal back a
-            # day. Must match the macros branch below.
             idx, _ = bucket_of(m.eaten_at.astimezone(tz))
             if idx is None:
                 continue
@@ -995,17 +1241,19 @@ def trends_bucketed(
         for i in range(n):
             v = round(sum(buckets[i]), 1) if buckets[i] else None
             d = day_at(i)
-            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz) + timedelta(hours=h))[1]
             points.append({"date": d.isoformat(), "value": v, "label": lab})
         return {"granularity": granularity, "metric": metric, "period_label": period_label,
                 "period_key": period_key, "points": points}
 
     # ---- macros: same windows/buckets/labels as calories, full macro split ----
-    # Reuses the window resolution above verbatim so the macro distribution chart
-    # shares the calorie chart's timeframe (labels/period_label/period_key are
-    # byte-identical for the same granularity+offset). Each bucket sums every
-    # non-deleted meal whose eaten_at falls in it; a bucket with no meals returns
-    # null for every nutrition field (never 0), so the chart renders a gap.
+    # Reuses the window resolution above verbatim so the dashboard's macro
+    # distribution chart shares the calorie chart's timeframe: labels /
+    # period_label / period_key are byte-identical to the calories response for
+    # the same granularity+offset. Each bucket sums every non-deleted meal whose
+    # eaten_at falls in it; a bucket with no meals returns null for every
+    # nutrition field (never 0) so the chart renders a gap, exactly like the
+    # calorie chart.
     if metric in ("macros", "macro_distribution"):
         meals = (db.query(Meal)
                  .filter(Meal.user_id == user.id,
@@ -1031,7 +1279,7 @@ def trends_bucketed(
         points = []
         for i in range(n):
             d = day_at(i)
-            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz) + timedelta(hours=h))[1]
             a = acc[i]
             if a["meals_count"] == 0:
                 points.append({"date": d.isoformat(), "label": lab,
@@ -1063,13 +1311,18 @@ def trends_bucketed(
         # active/walking energy + steps by local day
         meas = (db.query(Measurement)
                 .filter(Measurement.user_id == user.id,
-                        Measurement.start_at >= start_dt, Measurement.start_at < end_dt)
-                .all())
+                        Measurement.start_at >= cal_start_dt, Measurement.start_at < cal_end_dt))
+        if _ledger_soft_delete_available(db):
+            # A soft-deleted liquid must not appear in any daily total. Expressed as
+            # guarded raw SQL because the column is not ORM-mapped (a schema without
+            # it must never see it referenced).
+            meas = meas.filter(text("measurements.deleted_at IS NULL"))
+            meas = meas.all()
         active: dict[date_type, float] = {}
         steps_by_day: dict[date_type, float] = {}
         active_avail = False
         for m in meas:
-            day = m.start_at.astimezone(tz).date()
+            day = local_calendar_date(m.start_at, tz)
             if m.metric_type == MetricType.ACTIVE_CALORIES:
                 v = float((m.value_json or {}).get("value") or (m.value_json or {}).get("count") or 0)
                 active[day] = active.get(day, 0.0) + v
@@ -1080,7 +1333,7 @@ def trends_bucketed(
         buckets: list[list[float]] = [[] for _ in range(n)]
         for i in range(n):
             d = day_at(i)
-            dt = datetime.combine(d, datetime.min.time(), tzinfo=tz)
+            dt = datetime.combine(d, datetime.min.time(), tzinfo=tz) + timedelta(hours=h)
             idx, _ = bucket_of(dt)
             if idx is None:
                 continue
@@ -1098,7 +1351,7 @@ def trends_bucketed(
                 continue
             v = present[-1]  # most recent day with data in the bucket
             d = day_at(i)
-            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz) + timedelta(hours=h))[1]
             points.append({"date": d.isoformat(), "value": round(v, 1), "label": lab})
         return {"granularity": granularity, "metric": metric, "period_label": period_label,
                 "period_key": period_key, "points": points}
@@ -1115,13 +1368,13 @@ def trends_bucketed(
         bp_query = (db.query(Measurement)
                     .filter(Measurement.user_id == user.id,
                             Measurement.metric_type == MetricType.BLOOD_PRESSURE,
-                            Measurement.start_at >= start_dt, Measurement.start_at < end_dt))
+                            Measurement.start_at >= cal_start_dt, Measurement.start_at < cal_end_dt))
         if _ledger_soft_delete_available(db):
             bp_query = bp_query.filter(text("measurements.deleted_at IS NULL"))
         bp_rows = bp_query.order_by(Measurement.start_at.asc()).all()
         buckets: list[list[float]] = [[] for _ in range(n)]
         for m in bp_rows:
-            idx, _ = bucket_of(m.start_at.astimezone(tz))
+            idx, _ = bucket_of_cal(m.start_at.astimezone(tz))
             if idx is None:
                 continue
             v = (m.value_json or {}).get(field)
@@ -1132,7 +1385,7 @@ def trends_bucketed(
         for i in range(n):
             vals = buckets[i]
             d = day_at(i)
-            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz) + timedelta(hours=h))[1]
             points.append({"date": d.isoformat(),
                            "value": round(sum(vals) / len(vals), 1) if vals else None,
                            "label": lab})
@@ -1151,34 +1404,47 @@ def trends_bucketed(
         raise HTTPException(status_code=400, detail=f"Unsupported metric: {metric}")
     mt, agg = metric_map[metric]
 
+    # WATER is consumption -> keeps the eating-day window/bucket. Every other
+    # metric here is a device MEASUREMENT -> LOCAL CALENDAR day (sleep is bucketed
+    # by its wake-up day, below).
+    _win_start, _win_end = (
+        (start_dt, end_dt) if mt == MetricType.WATER else (cal_start_dt, cal_end_dt)
+    )
     rows = (db.query(Measurement)
             .filter(Measurement.user_id == user.id,
                     Measurement.metric_type == mt,
-                    Measurement.start_at >= start_dt, Measurement.start_at < end_dt)
-            .order_by(Measurement.start_at.asc())
-            .all())
+                    Measurement.start_at >= _win_start, Measurement.start_at < _win_end))
+    if _ledger_soft_delete_available(db):
+        # A soft-deleted liquid must not appear in any daily total. Expressed as
+        # guarded raw SQL because the column is not ORM-mapped (a schema without
+        # it must never see it referenced).
+        rows = rows.filter(text("measurements.deleted_at IS NULL"))
+    rows = rows.order_by(Measurement.start_at.asc()).all()
 
-    step_ratio = 1.0
-    sleep_ratio = 1.0
-    if mt == MetricType.SLEEP and rows:
-        sleep_recs = [{'start_at': m.start_at, 'end_at': getattr(m, 'end_at', None) or m.start_at, 'value_json': m.value_json or {}} for m in rows]
-        sleep_ded = _dedup_sleep(sleep_recs)
-        sleep_raw = sum((m.value_json or {}).get('duration_min', 0) for m in rows)
-        sleep_ratio = sleep_ded / sleep_raw if sleep_raw > 0 else 1.0
-    if mt == MetricType.STEPS and rows:
-        step_records = [{"start_at": m.start_at, "end_at": getattr(m, "end_at", None) or m.start_at, "value_json": m.value_json or {}} for m in rows]
-        deduped_total = _dedup_steps(step_records)
-        raw_total = sum((m.value_json or {}).get("count", 0) for m in rows)
-        step_ratio = deduped_total / raw_total if raw_total > 0 else 1.0
-
-    buckets = [[] for _ in range(n)]
+    # Group records into per-bucket lists, then aggregate each bucket the way
+    # trends_daily does: steps/sleep get REAL dedup across that bucket's records
+    # (a global ratio applied to every row double/mis-counts overlapping sleep
+    # stages and shifts day boundaries). Weight/HR use last/avg of the bucket.
+    bucket_records: list[list[dict]] = [[] for _ in range(n)]
+    bucket_vals: list[list[float]] = [[] for _ in range(n)]
     for m in rows:
+        if mt == MetricType.SLEEP:
+            wd = wake_date(m.start_at, (m.value_json or {}).get("duration_min"),
+                           getattr(m, "end_at", None), tz)
+            idx = None if wd is None else bucket_of_cal(wd)[0]
+        elif mt == MetricType.WATER:
+            idx, _ = bucket_of(m.start_at.astimezone(tz))
+        else:
+            idx, _ = bucket_of_cal(m.start_at.astimezone(tz))
+        if idx is None:
+            continue
+        bucket_records[idx].append({
+            "start_at": m.start_at,
+            "end_at": getattr(m, "end_at", None) or m.start_at,
+            "value_json": m.value_json or {},
+        })
         vj = m.value_json or {}
         v = vj.get("value")
-        if v is None and mt == MetricType.STEPS:
-            v = (vj.get("count", 0)) * step_ratio
-        if v is None and mt == MetricType.SLEEP:
-            v = (vj.get("duration_min", 0)) * sleep_ratio
         if v is None:
             if mt == MetricType.STEPS:
                 v = vj.get("count")
@@ -1192,28 +1458,29 @@ def trends_bucketed(
                 v = vj.get("bpm") or vj.get("heart_rate")
         if v is None:
             continue
-        idx, _ = bucket_of(m.start_at.astimezone(tz))
-        if idx is None:
-            continue
-        buckets[idx].append(float(v))
+        bucket_vals[idx].append(float(v))
 
     points = []
     for i in range(n):
-        vals = buckets[i]
-        if not vals:
+        recs = bucket_records[i]
+        vals = bucket_vals[i]
+        if mt == MetricType.STEPS and recs:
+            v = _dedup_steps(recs)
+        elif mt == MetricType.SLEEP and recs:
+            v = _dedup_sleep(recs)
+        elif mt == MetricType.WEIGHT and vals:
+            v = vals[-1]
+        elif mt == MetricType.HEART_RATE and vals:
+            v = sum(vals) / len(vals)
+        elif vals:
+            v = sum(vals)
+        else:
             points.append({"date": day_at(i).isoformat(), "value": None, "label": ""})
             continue
-        if agg == "sum":
-            v = sum(vals)
-        elif agg == "avg":
-            v = sum(vals) / len(vals)
-        elif agg == "max":
-            v = max(vals)
-        else:
-            v = vals[-1]
         d = day_at(i)
-        lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz))[1]
+        lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz) + timedelta(hours=h))[1]
         points.append({"date": d.isoformat(), "value": round(v, 1), "label": lab})
+
 
     return {"granularity": granularity, "metric": metric, "period_label": period_label,
             "period_key": period_key, "points": points}
@@ -1277,8 +1544,9 @@ def liquids_bucketed(
       month -> last 12 months, 12 monthly points; offset ignored (fixed window)
     Empty buckets are null (missing), never zero.
     """
-    tz = ZoneInfo(user.timezone or "UTC")
-    today = datetime.now(tz).date()
+    tz = resolve_tz(user.timezone or "UTC")
+    h = day_start_hour()
+    today = nutrition_date(datetime.now(timezone.utc), tz)
     cats = LIQUID_LEGACY_CATS        # chart series (unchanged key names)
     canon_cats = LIQUID_CANONICAL_CATS  # drinks-list series
 
@@ -1288,10 +1556,11 @@ def liquids_bucketed(
         end = start + timedelta(days=7)
         n = 7
         def bucket_of(dt):
-            idx = (dt.date() - start).days
+            d = nutrition_date(dt, tz)
+            idx = (d - start).days
             if idx < 0 or idx >= 7:
                 return None, None
-            return idx, dt.date().strftime("%a")
+            return idx, d.strftime("%a")
         period_label = f"Week of {start.strftime('%b %d, %Y')}"
         period_key = start.isoformat()
         def day_at(i):
@@ -1309,18 +1578,19 @@ def liquids_bucketed(
             end = date_type(y, qm + 3, 1)
         # The window is a CALENDAR quarter, but the buckets are ISO weeks counted
         # from the Monday of the quarter's first day. When the quarter's last day
-        # is not a Sunday, its final ISO week spills past bucket 12 and those days
-        # were silently dropped even though they sit inside the window — Q3 2026
-        # lost Sep 28-30, Q4 2026 loses Dec 28-31. Widen n to cover the window.
+        # is not a Sunday, its final ISO week spilled past bucket 12 and those
+        # days were silently dropped even though they sit inside the window:
+        # Q1 2026 lost Mar 30-31, Q2 Jun 29-30, Q3 Sep 28-30, Q4 Dec 28-31.
         base_m, _ = _iso_week_bounds(start)
         last_monday, _ = _iso_week_bounds(end - timedelta(days=1))
         n = (last_monday - base_m).days // 7 + 1
         def bucket_of(dt):
-            monday0, _ = _iso_week_bounds(dt.date())
+            d = nutrition_date(dt, tz)
+            monday0, _ = _iso_week_bounds(d)
             idx = (monday0 - base_m).days // 7
             if idx < 0 or idx >= n:
                 return None, None
-            return idx, f"W{dt.date().isocalendar()[1]}"
+            return idx, f"W{d.isocalendar()[1]}"
         period_label = f"Q{((qm-1)//3)+1} {y}"
         period_key = start.isoformat()
         def day_at(i):
@@ -1330,7 +1600,7 @@ def liquids_bucketed(
         end = date_type(today.year, today.month, 1)
         n = 12
         def bucket_of(dt):
-            d = dt.date()
+            d = nutrition_date(dt, tz)
             idx = (d.year - start.year) * 12 + (d.month - start.month)
             if idx < 0 or idx >= 12:
                 return None, None
@@ -1341,15 +1611,19 @@ def liquids_bucketed(
             m = start.month - 1 + i
             return date_type(start.year + m // 12, m % 12 + 1, 1)
 
-    start_dt = datetime.combine(start, datetime.min.time(), tzinfo=tz)
-    end_dt = datetime.combine(end, datetime.min.time(), tzinfo=tz)
+    start_dt = datetime.combine(start, datetime.min.time(), tzinfo=tz) + timedelta(hours=h)
+    end_dt = datetime.combine(end, datetime.min.time(), tzinfo=tz) + timedelta(hours=h)
 
     rows = (db.query(Measurement)
             .filter(Measurement.user_id == user.id,
                     Measurement.metric_type == MetricType.WATER,
-                    Measurement.start_at >= start_dt, Measurement.start_at < end_dt)
-            .order_by(Measurement.start_at.asc())
-            .all())
+                    Measurement.start_at >= start_dt, Measurement.start_at < end_dt))
+    if _ledger_soft_delete_available(db):
+        # A soft-deleted liquid must not appear in any daily total. Expressed as
+        # guarded raw SQL because the column is not ORM-mapped (a schema without
+        # it must never see it referenced).
+        rows = rows.filter(text("measurements.deleted_at IS NULL"))
+    rows = rows.order_by(Measurement.start_at.asc()).all()
 
     # per-bucket per-category sums (legacy view + canonical view)
     buckets = [dict((c, 0) for c in cats) for _ in range(n)]
@@ -1377,7 +1651,7 @@ def liquids_bucketed(
         # total counts each millilitre once, from the canonical buckets
         has = any(v > 0 for v in crow.values())
         day = day_at(i)
-        lab = bucket_of(datetime.combine(day, datetime.min.time(), tzinfo=tz))[1]
+        lab = bucket_of(datetime.combine(day, datetime.min.time(), tzinfo=tz) + timedelta(hours=h))[1]
         points.append({
             "date": day.isoformat(),
             "label": lab,
@@ -1463,7 +1737,7 @@ def monthly_summary(month: str, user: User = Depends(get_current_user), db: Sess
     except ValueError:
         raise HTTPException(status_code=400, detail="Use month format YYYY-MM")
 
-    tz = ZoneInfo(user.timezone)
+    tz = resolve_tz(user.timezone)
     start = datetime(year, mon, 1, tzinfo=tz)
     if mon == 12:
         end = datetime(year + 1, 1, 1, tzinfo=tz)
@@ -1477,8 +1751,13 @@ def monthly_summary(month: str, user: User = Depends(get_current_user), db: Sess
             Measurement.start_at >= start,
             Measurement.start_at < end,
         )
-        .all()
     )
+    if _ledger_soft_delete_available(db):
+        # A soft-deleted liquid must not appear in any daily total. Expressed as
+        # guarded raw SQL because the column is not ORM-mapped (a schema without
+        # it must never see it referenced).
+        measurements = measurements.filter(text("measurements.deleted_at IS NULL"))
+    measurements = measurements.all()
     ms = [
         {"metric_type": m.metric_type, "value_json": m.value_json, "start_at": m.start_at}
         for m in measurements

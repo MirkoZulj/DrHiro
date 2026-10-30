@@ -24,7 +24,7 @@ import time
 import uuid
 
 import redis
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -138,6 +138,63 @@ def otp_verify(req: OtpVerify, db: Session = Depends(get_db)):
     audit(db, "web", str(user.id), user.id, "auth.web_otp_verify", "user", str(user.id))
     db.commit()
     return {"access_token": access, "refresh_token": refresh, "token_type": "bearer", "user_id": str(user.id)}
+
+
+# Headers nginx sets on the Google/htpasswd-gated location after oauth2-proxy passes.
+# Google OAuth sessions expose X-Auth-Request-Email; username/password (htpasswd)
+# sessions expose X-Auth-Request-User (we set the htpasswd username == the email).
+_GOOGLE_EMAIL_HEADER = "x-auth-request-email"
+_GOOGLE_USER_HEADER = "x-auth-request-user"
+# Defense-in-depth: shared secret header nginx injects; the API only trusts an
+# identity when BOTH this secret matches AND the header came through nginx.
+_GOOGLE_SECRET_HEADER = "x-drhiro-google-secret"
+
+
+class GoogleSessionResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    user_id: str
+
+
+@router.post("/google", response_model=GoogleSessionResponse)
+def google_session(request: Request, db: Session = Depends(get_db)):
+    """Issue tokens from an nginx-authenticated session (Google OAuth or
+    username/password).
+
+    Only callable through the nginx `location = /drhiro/api/v1/auth/web/google`
+    block, which (a) runs server-level `auth_request /oauth2/auth` (Google OAuth
+    or htpasswd) and (b) injects X-Auth-Request-Email/X-Auth-Request-User plus a
+    shared secret header. The API rejects the request unless the shared secret
+    matches, so a direct container-network call cannot forge an identity. The
+    resolved email maps to a `google` external identity bound to a drHiro user
+    during first pairing.
+    """
+    settings = get_settings()
+    secret = request.headers.get(_GOOGLE_SECRET_HEADER, "")
+    if not settings.web_google_secret or not _constant_time_eq(secret, settings.web_google_secret):
+        raise HTTPException(status_code=403, detail="Google session rejected (bad origin)")
+    # Google OAuth -> email header; htpasswd username/password -> user header.
+    email = (request.headers.get(_GOOGLE_EMAIL_HEADER) or request.headers.get(_GOOGLE_USER_HEADER) or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=401, detail="No Google identity in request")
+
+    ident = (
+        db.query(ExternalIdentity)
+        .filter(ExternalIdentity.provider == "google", ExternalIdentity.provider_subject == email)
+        .first()
+    )
+    if not ident:
+        raise HTTPException(status_code=403, detail="Google account not linked to drHiro")
+    user = db.get(User, ident.user_id)
+    if not user or user.status != "active":
+        raise HTTPException(status_code=403, detail="User inactive")
+
+    access = create_access_token(user.id)
+    refresh, _ = create_refresh_token(user.id)
+    audit(db, "google", email, user.id, "auth.google_session", "user", str(user.id))
+    db.commit()
+    return GoogleSessionResponse(access_token=access, refresh_token=refresh, user_id=str(user.id))
 
 
 def _find_user_by_identifier(db: Session, identifier: str) -> User | None:

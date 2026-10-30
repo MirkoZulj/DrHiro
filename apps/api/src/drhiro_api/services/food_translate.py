@@ -19,7 +19,6 @@ the food, not the words.
 from __future__ import annotations
 
 import logging
-import re
 from functools import lru_cache
 
 from drhiro_api.services.llm_client import chat_complete_sync
@@ -253,21 +252,15 @@ def _llm_translate(text: str) -> str:
 
 
 def _glossary_lookup(text: str) -> str | None:
-    """Exact match, then the longest glossary key present as a WHOLE WORD."""
+    """Exact match, then the longest glossary key contained in the phrase."""
     key = _norm(text)
     if not key:
         return None
     if key in _GLOSSARY:
         return _GLOSSARY[key]
-    # Longest key first so "bijelo vino" beats "vino" -- and match on word
-    # boundaries, never a bare substring. A plain `k in key` test maps
-    # "pileca juha" -> "lentils" ("leca" sits inside "piLECA") and
-    # "solata" -> "salt" ("sol" sits inside "SOLata"): it substitutes an
-    # unrelated food, which is the exact failure this module exists to prevent.
-    # Python's \w is Unicode-aware, so Croatian diacritics count as word
-    # characters and "sir" will not match inside "sirće".
+    # Longest key first so "bijelo vino" beats "vino".
     for k in sorted(_GLOSSARY, key=len, reverse=True):
-        if re.search(rf"(?<!\w){re.escape(k)}(?!\w)", key):
+        if k in key:
             return _GLOSSARY[k]
     return None
 

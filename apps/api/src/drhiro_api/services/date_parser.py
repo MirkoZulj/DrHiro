@@ -95,7 +95,13 @@ def _tz(tz_name):
     try:
         return ZoneInfo(tz_name or DEFAULT_TZ)
     except Exception:
-        return timezone.utc
+        # Fixed-offset spellings ("UTC+09:00") are not ZoneInfo-loadable; route
+        # them through the shared resolver so a traveller's zone still applies.
+        try:
+            from drhiro_api.services.day_boundary import resolve_tz
+            return resolve_tz(tz_name)
+        except Exception:
+            return timezone.utc
 
 
 def _now_local(tz_name, now=None):
@@ -230,6 +236,12 @@ def resolve_when(text: str, tz_name: str = DEFAULT_TZ, meal_type=None, now=None)
         target = now_local - timedelta(days=2)
         phrase = "day before yesterday"
 
+    # --- "last night" / "last evening" (a PAST evening, never tonight) ---
+    if target is None and re.search(
+            r"\b(?:last|yesterday)\s+(?:night|evening)\b", low):
+        target = now_local - timedelta(days=1)
+        phrase = "last night"
+
     # --- yesterday / today / tonight -------------------------------------
     if target is None:
         if re.search(r"\b(?:yesterday|yday|ystrday)\b", low):
@@ -296,6 +308,7 @@ def strip_when(text: str) -> str:
         r"\b\d+\s+(?:day|days|week|weeks)\s+ago\b",
         r"\bday before yesterday\b",
         r"\b(?:yesterday|yday|ystrday|today|tonight)\b",
+        r"\b(?:last|yesterday)\s+(?:night|evening)\b",
         r"\bthis (?:morning|afternoon|evening)\b",
         r"\blast week\b",
         r"\b(?:last|on)?\s*(?:" + "|".join(WEEKDAYS) + r")\b",

@@ -6,9 +6,7 @@ never become confirmed data without explicit user confirmation.
 
 from __future__ import annotations
 
-import logging
 import uuid
-from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 from typing import Literal
 
@@ -17,28 +15,29 @@ from sqlalchemy import or_
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload
 
+import logging
+
+log = logging.getLogger(__name__)
+
 from drhiro_api.db import get_db
-from drhiro_api.routers.telegram_ingress import require_model_writer_allowed
 from drhiro_api.deps import get_current_user
-from drhiro_api.food_search import nutrient_map, resolve_food
-from drhiro_api.models import Food, FoodCatalogItem, FoodNutrient, Meal, MealItem, Nutrient, User
-from drhiro_api.security import audit
-from drhiro_api.nutrition_validation import validate_energy
-from drhiro_api.services.consumption import (
-    create_beverage_projection,
-    propagate_beverage_patch,
-    delete_beverage_item,
-    _delete_beverage_projection_for_meal_items,
-    copy_beverage_link,
-    _classify_beverage,
+from drhiro_api.food_search import (
+    _is_bare_query,
+    _is_weak_head_match,
+    nutrient_map,
+    online_food_candidates,
+    resolve_food,
 )
-from drhiro_api.models import BeverageMeasurement, Measurement
+from drhiro_api.config import get_settings
+from drhiro_api.services.jev_client import jev_verify
+from drhiro_api.services.food_sanity import llm_values_plausible
+from drhiro_api.services.food_translate import translate_food_to_english
+from drhiro_api.models import DataSource, Food, FoodCatalogItem, FoodNutrient, Meal, MealItem, Nutrient, User
+from drhiro_api.security import audit
 from drhiro_nutrition.catalog import FoodItem, NutrientTotals, scale_nutrients
 from drhiro_nutrition.composite import CompositeCatalog
 
 router = APIRouter(prefix="/meals", tags=["meals"])
-
-log = logging.getLogger(__name__)
 
 
 class MealItemIn(BaseModel):
@@ -79,6 +78,21 @@ def _catalog() -> CompositeCatalog:
     return CompositeCatalog()
 
 
+def _unresolved_items(meal) -> list:
+    """Items whose nutrition could not be resolved.
+
+    `nutrients_json is None` catches the JSON literal `null` that the free-text
+    writer stores -- a raw SQL `IS NULL` does not, which is exactly why this went
+    unnoticed: the meal-level flag was computed but never acted on.
+    """
+    return [
+        i for i in meal.items
+        if i.source == "unresolved"
+        or (isinstance(i.nutrients_json, dict) and i.nutrients_json.get("unresolved"))
+        or i.nutrients_json is None
+    ]
+
+
 def _meal_to_out(meal: Meal) -> MealOut:
     return MealOut(
         id=str(meal.id),
@@ -91,12 +105,7 @@ def _meal_to_out(meal: Meal) -> MealOut:
         totals_json=meal.totals_json,
         confidence=meal.confidence,
         estimated=bool((meal.totals_json or {}).get("estimated")),
-        has_unresolved_items=any(
-            i.source == "unresolved"
-            or (isinstance(i.nutrients_json, dict) and i.nutrients_json.get("unresolved"))
-            or i.nutrients_json is None
-            for i in meal.items
-        ),
+        has_unresolved_items=bool(_unresolved_items(meal)),
         items=[
             {
                 "id": str(i.id),
@@ -120,91 +129,283 @@ def _meal_to_out(meal: Meal) -> MealOut:
     )
 
 
+def _is_poor_local_match(query: str, local_name: str) -> bool:
+    """True when a local DB match is too weak to trust over the online cascade.
+
+    Extracts distinctive words from the query (length > 4, not common food
+    words) and checks if ANY appear in the local match's display_name. If
+    none do, the match is a substring accident (e.g. "emmental cheese" ->
+    "Croissants, cheese") and the online cascade should take priority.
+    """
+    stop = {"white", "brown", "whole", "grain", "fresh", "raw", "cooked",
+            "large", "small", "green", "black", "sweet", "sour", "plain",
+            "bread", "cheese", "milk", "rice", "egg", "beef", "pork",
+            "chicken", "fish", "meat", "sauce", "soup", "salad", "fruit"}
+    qwords = [w for w in query.lower().split() if len(w) > 4 and w not in stop]
+    if not qwords:
+        return False
+    lname = local_name.lower()
+    return not any(w in lname for w in qwords)
+
+
+def _mass_basis(item) -> float:
+    """Grams to scale per-100 g values by.
+
+    A drink carries volume_ml and no grams; falling back to the 100.0 default
+    made 2 L of beer cost 40 kcal. Approximate 1 ml as 1 g -- exact for water and
+    within ~1% for beer and wine, and ~6% high for spirits. Far better than a
+    20x undercount.
+    """
+    return item.grams or item.volume_ml or 100.0
+
+
+def _online_payload(best: dict, item: MealItemIn) -> dict:
+    """Scale a verified online candidate to the item's grams."""
+    grams = _mass_basis(item)
+    factor = grams / 100.0
+    kcal = best.get("kcal_per_100g")
+    protein = best.get("protein_g_per_100g")
+    carbs = best.get("carbs_per_100g")
+    fat = best.get("fat_per_100g")
+    fiber = best.get("fiber_per_100g")
+    sodium = best.get("sodium_mg_per_100g")
+    # Atwater fallback if no explicit energy
+    if kcal is None and protein is not None:
+        kcal = 4.0 * (protein or 0) + 4.0 * (carbs or 0) + 9.0 * (fat or 0)
+    return {
+        "kcal": round(kcal * factor, 1) if kcal is not None else None,
+        "protein_g": round(protein * factor, 1) if protein is not None else None,
+        "carbs_g": round(carbs * factor, 1) if carbs is not None else None,
+        "fat_g": round(fat * factor, 1) if fat is not None else None,
+        "fiber_g": round(fiber * factor, 1) if fiber is not None else None,
+        "sodium_mg": round(sodium * factor, 1) if sodium is not None else None,
+        "sources": [best.get("source", "online")],
+        "resolved_food": best.get("display_name"),
+    }
+
+
+def _local_payload(food, item: MealItemIn, db: Session) -> dict:
+    """Build the nutrient payload for a local catalogue Food."""
+    code_by_id = {n.id: n.nutrient_code for n in db.query(Nutrient).all()}
+    nmap = nutrient_map(food, code_by_id)
+    grams = item.grams or item.volume_ml or food.serving_grams or 100.0
+    energy_per_100g = nmap.get("energy")
+    # `is None`, not falsy: a stored 0 is a REAL value (zero-calorie drinks such
+    # as ZEVIA cola or stevia powder) and must never be replaced by an Atwater
+    # estimate. The fallback below is only for rows with no energy nutrient.
+    if energy_per_100g is None:
+        # Most USDA rows in this catalogue lack an explicit energy nutrient but
+        # do carry macros. Derive kcal with Atwater factors rather than
+        # reporting a food as 0 kcal.
+        energy_per_100g = (
+            4.0 * (nmap.get("protein") or 0)
+            + 4.0 * (nmap.get("carbs") or 0)
+            + 9.0 * (nmap.get("fat") or 0)
+        )
+    totals = NutrientTotals(
+        kcal=(energy_per_100g or 0) * grams / 100,
+        protein_g=(nmap.get("protein") or 0) * grams / 100,
+        carbs_g=(nmap.get("carbs") or 0) * grams / 100,
+        fat_g=(nmap.get("fat") or 0) * grams / 100,
+        fiber_g=(nmap.get("fiber") or 0) * grams / 100,
+        sodium_mg=(nmap.get("sodium") or 0) * grams / 100,
+        sources=["usda:fdc-v1"],
+    )
+    payload = _totals_to_json(totals)
+    payload["resolved_food"] = food.display_name
+    return payload
+
+
+def _values_plausible(name: str, cand: dict) -> bool:
+    """LLM sanity check on an online candidate's per-100 g values."""
+    return llm_values_plausible(
+        name,
+        cand.get("kcal_per_100g"),
+        cand.get("protein_g_per_100g"),
+        cand.get("carbs_per_100g"),
+        cand.get("fat_per_100g"),
+    )
+
+
 def _lookup_nutrients(db: Session, item: MealItemIn, user: User) -> tuple[dict | None, float, str | None]:
-    """Resolve nutrients for a meal item. Tries local DB first, then composite catalog.
+    """Resolve nutrients through a Jev-verified cascade.
+
+    Order: translate to English -> local catalogue -> USDA -> DuckDuckGo
+    (original language) -> composite catalogue. Each candidate is scored by Jev:
+
+      score >= jev_threshold                 accept and log
+      jev_review_floor <= score < threshold  collect for a user question
+      score <  jev_review_floor              reject, try the next candidate
+
+    Online candidates must also pass an LLM plausibility check on their values,
+    because Jev judges names only. If nothing clears the bar, the best
+    review-band candidate is returned flagged `needs_confirmation` together
+    with its alternatives so the bot can ask; otherwise the item stays
+    unresolved and the bot asks rather than guessing.
 
     Confidence semantics:
       0.8  confident local match
-      0.5  ambiguous local match -- top candidate used, alternatives recorded
+      0.5  needs confirmation (review band / ambiguous)
       0.3  unresolved
-
-    Anything below 0.8 flips the meal's `totals_json.estimated` flag, which is
-    how the UI knows to prompt. An ambiguous match must never masquerade as
-    certain.
     """
-    # 1. Try local DB first, ranked.
-    result = resolve_food(db, item.display_name, limit=5, user_id=user.id)
-    local_food = result.best
-    if local_food is not None:
-        code_by_id = {n.id: n.nutrient_code for n in db.query(Nutrient).all()}
-        nmap = nutrient_map(local_food, code_by_id)
-        if nmap:
-            grams = item.grams or local_food.serving_grams or 100.0
-            energy_per_100g = nmap.get("energy")
-            if not energy_per_100g:
-                # Most USDA rows in this catalogue lack an explicit energy
-                # nutrient but do carry macros. Derive kcal with the standard
-                # Atwater factors rather than reporting a food as 0 kcal.
-                energy_per_100g = (
-                    4.0 * (nmap.get("protein") or 0)
-                    + 4.0 * (nmap.get("carbs") or 0)
-                    + 9.0 * (nmap.get("fat") or 0)
-                )
-            totals = NutrientTotals(
-                kcal=(energy_per_100g or 0) * grams / 100,
-                protein_g=(nmap.get("protein") or 0) * grams / 100,
-                carbs_g=(nmap.get("carbs") or 0) * grams / 100,
-                fat_g=(nmap.get("fat") or 0) * grams / 100,
-                fiber_g=(nmap.get("fiber") or 0) * grams / 100,
-                sodium_mg=(nmap.get("sodium") or 0) * grams / 100,
-                sources=["usda:fdc-v1"],
-            )
-            payload = _totals_to_json(totals)
-            payload["resolved_food"] = local_food.display_name
-            if result.ambiguous:
-                # Surface the alternatives instead of silently choosing.
-                payload["ambiguous"] = True
-                payload["candidates"] = result.candidate_names
-                return payload, 0.5, "usda"
-            return payload, 0.8, "usda"
+    settings = get_settings()
+    accept_at = settings.jev_threshold
+    review_floor = settings.jev_review_floor
 
-    # 2. Fall back to composite catalog
+    # 0. Normalise to English: the catalogue and Jev's model are English-first
+    #    (Jev scores Croatian "kava" vs "Coffee" at 0.01). The original text is
+    #    still used for DuckDuckGo and stays the stored display name.
+    raw_input = item.display_name
+    lookup_name = translate_food_to_english(raw_input)
+
+    # Identity-preserving lookup (spec Task 4): resolve the ORIGINAL name first,
+    # and only fall back to the translation when the original yields nothing
+    # usable. An already-corrected item ("Beef, tenderloin steak, raw") must not
+    # be collapsed to its generic word ("beef") by the translation step.
+    result = resolve_food(db, raw_input, limit=5, user_id=user.id)
+    if not result.matches or _is_weak_head_match(raw_input, result.best.display_name):
+        result_en = resolve_food(db, lookup_name, limit=5, user_id=user.id)
+        if result_en.matches:
+            result = result_en
+
+    review: list[dict] = []  # {"score", "name", "payload_fn", "source"}
+
+    def _review(score, name, payload_fn, source):
+        review.append({"score": score, "name": name,
+                       "payload_fn": payload_fn, "source": source})
+
+    # 1. Local catalogue, ranked, Jev-verified.
+    #
+    # Score every candidate that clears the bar and take the best, rather than
+    # the first -- a scraped private row ("ESPRESSO COFFEE", 30 kcal/100 g) must
+    # not beat the USDA canonical entry ("Beverages, coffee, brewed, espresso,
+    # restaurant-prepared", 9 kcal/100 g) that scores higher.
+    # `result` was resolved above (original name first, translation fallback).
+    _src_keys = {d.id: d.source_key for d in db.query(DataSource).all()}
+    local_food = None
+    local_ambiguous = False
+    local_candidates: list[str] = []
+    _cleared: list[tuple] = []  # (score, source_rank, food)
+    for _match in result.matches:
+        _cand = _match.food
+        if _is_poor_local_match(lookup_name, _cand.display_name):
+            continue
+        # Quality gate (spec Task 3 step 3): a qualified/branded near-miss must
+        # not answer a bare generic word -- fall through to the online cascade.
+        if _is_bare_query(lookup_name) and _is_weak_head_match(lookup_name, _cand.display_name):
+            log.info("weak local match for bare query %r -> %r; skipped",
+                     lookup_name, _cand.display_name)
+            continue
+        _score = jev_verify(lookup_name, _cand.display_name)
+        log.info("jev local %r -> %r score=%s", lookup_name, _cand.display_name, _score)
+        if _score is None:
+            # Jev unavailable: fall back to the ranked best (previous behaviour).
+            local_food = _cand
+            local_ambiguous = result.ambiguous
+            local_candidates = result.candidate_names
+            break
+        if _score >= accept_at:
+            # 0 ranks the USDA catalogue ahead of scraped private rows on a tie.
+            _rank = 0 if _src_keys.get(_cand.data_source_id) == "usda" else 1
+            _cleared.append((_score, _rank, _cand))
+        elif _score >= review_floor:
+            _review(_score, _cand.display_name,
+                    lambda f=_cand: _local_payload(f, item, db), "usda")
+    if local_food is None and _cleared:
+        _cleared.sort(key=lambda t: (-t[0], t[1]))
+        _best_score, _, local_food = _cleared[0]
+        local_ambiguous = result.ambiguous
+        local_candidates = result.candidate_names
+        log.info("local best: %r (score=%.3f)", local_food.display_name, _best_score)
+    if local_food is not None:
+        payload = _local_payload(local_food, item, db)
+        if local_ambiguous:
+            # Surface the alternatives instead of silently choosing.
+            payload["ambiguous"] = True
+            payload["candidates"] = local_candidates
+            return payload, 0.5, "usda"
+        return payload, 0.8, "usda"
+
+    # 2. USDA FoodData Central, Jev-verified (English query).
+    for _cand in online_food_candidates(lookup_name, limit=5, source="usda"):
+        _name = _cand.get("display_name") or ""
+        _score = jev_verify(lookup_name, _name)
+        log.info("jev usda %r -> %r score=%s", lookup_name, _name, _score)
+        if _score is None or _score < review_floor:
+            continue
+        if not _values_plausible(_name, _cand):
+            log.info("jev usda %r -> %r score=%s but values implausible; skipped",
+                     lookup_name, _name, _score)
+            continue
+        if _score >= accept_at:
+            return _online_payload(_cand, item), 0.7, _cand.get("source", "online")
+        _review(_score, _name, lambda c=_cand: _online_payload(c, item),
+                _cand.get("source", "online"))
+
+    # 3. DuckDuckGo, Jev-verified, queried in the ORIGINAL language so Croatian
+    #    sources with Croatian product names are reachable. The scraped name is
+    #    translated back to English before comparison.
+    for _cand in online_food_candidates(raw_input, limit=5, source="ddg"):
+        _ddg_name = _cand.get("display_name") or ""
+        _ddg_en = translate_food_to_english(_ddg_name)
+        _score = jev_verify(lookup_name, _ddg_en)
+        log.info("jev ddg %r -> %r (en: %r) score=%s",
+                 raw_input, _ddg_name, _ddg_en, _score)
+        if _score is None or _score < review_floor:
+            continue
+        if not _values_plausible(_ddg_en, _cand):
+            log.info("jev ddg %r -> %r score=%s but values implausible; skipped",
+                     raw_input, _ddg_name, _score)
+            continue
+        if _score >= accept_at:
+            return _online_payload(_cand, item), 0.7, _cand.get("source", "online")
+        _review(_score, _ddg_name, lambda c=_cand: _online_payload(c, item),
+                _cand.get("source", "online"))
+
+    # 4. Composite catalogue (local), still Jev-verified — name search only,
+    #    never by stale pin: by_id() would let a stale food_catalog_item_id
+    #    override the corrected display_name and re-pin the item to the old food.
     cat = _catalog()
     try:
-        food: FoodItem | None = None
-        if item.food_catalog_item_id:
-            food = cat.by_id(item.food_catalog_item_id)
-        if food is None:
-            food = cat.search(item.display_name, limit=1)[0] if cat.search(item.display_name, limit=1) else None
-        if food is None:
-            return _unresolved_payload(), 0.3, "unresolved"
-        grams = item.grams
-        if grams is None and food.serving_grams:
-            grams = food.serving_grams * item.quantity
-        if grams is None:
-            grams = 100.0
-        # Atwater gate: an online food whose published energy contradicts
-        # its own macros (e.g. a kJ value read as kcal) must not be logged.
-        # Replace with the macro-implied value, marked in sources.
-        check = validate_energy(
-            food.kcal_per_100g, food.protein_g_per_100g,
-            food.carbs_g_per_100g, food.fat_g_per_100g,
-            food.alcohol_g_per_100g,
-        )
-        if check.corrected:
-            log.warning(
-                "Atwater-correcting energy for %s (%s): published %s kcal, macros imply %s",
-                food.display_name, food.external_id,
-                check.published_kcal, check.corrected_kcal,
-            )
-            food = replace(food, kcal_per_100g=check.corrected_kcal)
-        totals = scale_nutrients(food, grams)
-        if check.corrected:
-            totals.sources.append("energy-atwater-corrected")
-            return _totals_to_json(totals), 0.5, food.source
-        return _totals_to_json(totals), 0.7, food.source
+        for _food in cat.search(lookup_name, limit=5):
+            _score = jev_verify(lookup_name, _food.display_name)
+            log.info("jev composite %r -> %r score=%s",
+                     lookup_name, _food.display_name, _score)
+            if _score is None or _score < review_floor:
+                continue
+
+            def _comp_payload(f=_food):
+                _g = item.grams
+                if _g is None and f.serving_grams:
+                    _g = f.serving_grams * item.quantity
+                if _g is None:
+                    _g = 100.0
+                return _totals_to_json(scale_nutrients(f, _g))
+
+            if _score >= accept_at:
+                return _comp_payload(), 0.7, _food.source
+            _review(_score, _food.display_name, _comp_payload, _food.source)
     finally:
         cat.close()
+
+    # 5. Nothing cleared the bar. If candidates landed in the review band, hand
+    #    the best one back flagged for confirmation, with the alternatives, so
+    #    the bot can ask the user a multiple-choice question.
+    if review:
+        review.sort(key=lambda r: r["score"], reverse=True)
+        best = review[0]
+        payload = best["payload_fn"]()
+        payload["resolved_food"] = best["name"]
+        payload["ambiguous"] = True
+        payload["needs_confirmation"] = True
+        payload["candidates"] = [r["name"] for r in review[:5]]
+        payload["match_scores"] = {r["name"]: round(r["score"], 3) for r in review[:5]}
+        log.info("review band: offering %d candidate(s) for %r",
+                 len(payload["candidates"]), raw_input)
+        return payload, 0.5, best["source"]
+
+    # 6. Genuinely nothing: leave unresolved so the bot asks rather than guesses.
+    return _unresolved_payload(), 0.3, "unresolved"
 
 
 def _unresolved_payload() -> dict:
@@ -247,7 +448,7 @@ def _recompute_totals(meal: Meal) -> dict:
     every item mutation (patch / add / delete) so the meal's kcal can never
     drift away from the sum of its items.
     """
-    kcal = protein = carbs = fat = fiber = sodium = 0.0
+    kcal = protein = carbs = fat = fiber = 0.0
     estimated = False
     for i in meal.items:
         if (i.confidence if i.confidence is not None else 0.0) < 0.8:
@@ -258,26 +459,30 @@ def _recompute_totals(meal: Meal) -> dict:
         carbs += n.get("carbs_g") or 0.0
         fat += n.get("fat_g") or 0.0
         fiber += n.get("fiber_g") or 0.0
-        sodium += n.get("sodium_mg") or 0.0
     return {
         "kcal": round(kcal, 1),
         "protein_g": round(protein, 1),
         "carbs_g": round(carbs, 1),
         "fat_g": round(fat, 1),
         "fiber_g": round(fiber, 1),
-        "sodium_mg": round(sodium, 1),
         "estimated": estimated,
     }
 
 
 def _item_spec(item: MealItem) -> MealItemIn:
-    """Build the MealItemIn that _lookup_nutrients expects from a stored row."""
+    """Build the MealItemIn that _lookup_nutrients expects from a stored row.
+
+    volume_ml MUST be carried: a drink has a volume and no grams, and
+    _mass_basis() scales per-100 g values by it. Dropping it here silently
+    priced a 2-litre drink as a 100 ml portion (29 kcal instead of ~580).
+    """
     return MealItemIn(
         food_catalog_item_id=(str(item.food_catalog_item_id) if item.food_catalog_item_id else None),
         display_name=item.display_name,
         quantity=item.quantity if item.quantity is not None else 1.0,
         unit=item.unit,
         grams=item.grams,
+        volume_ml=item.volume_ml,
     )
 
 
@@ -304,7 +509,8 @@ def _apply_local_food(db: Session, food: Food, grams: float) -> tuple[dict, str]
     code_by_id = {n.id: n.nutrient_code for n in db.query(Nutrient).all()}
     nmap = nutrient_map(food, code_by_id)
     energy_per_100g = nmap.get("energy")
-    if not energy_per_100g:
+    # See _local_payload: only a MISSING energy nutrient falls back to Atwater.
+    if energy_per_100g is None:
         energy_per_100g = (
             4.0 * (nmap.get("protein") or 0)
             + 4.0 * (nmap.get("carbs") or 0)
@@ -333,7 +539,7 @@ def _apply_explicit_food(db: Session, item: MealItem, food_ref: str) -> bool:
     nothing matches. Confidence is set to the confident tier (0.8): the user,
     not a ranker, chose this food.
     """
-    grams = item.grams or 100.0
+    grams = _mass_basis(item)
     food = None
     try:
         food_uuid = uuid.UUID(str(food_ref))
@@ -396,7 +602,7 @@ def _owned_meal(db: Session, meal_id: str, user: User) -> Meal:
     return meal
 
 
-@router.post("", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
+@router.post("", response_model=MealOut)
 def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     meal = Meal(
         user_id=user.id,
@@ -412,12 +618,9 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
 
     totals_kcal = totals_protein = totals_carbs = totals_fat = totals_fiber = 0.0
     estimated = False
-    bev_category = _classify_beverage
     for item in req.items:
         nutrients, conf, source = _lookup_nutrients(db, item, user)
         estimated = estimated or conf < 0.8
-        is_beverage = item.beverage_category is not None or bev_category(item.display_name) is not None
-        effective_volume = item.volume_ml if item.volume_ml else (item.grams if is_beverage else None)
         mi = MealItem(
             meal_id=meal.id,
             food_catalog_item_id=item.food_catalog_item_id,
@@ -425,20 +628,13 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
             quantity=item.quantity,
             unit=item.unit,
             grams=item.grams,
-            volume_ml=effective_volume if is_beverage else item.volume_ml,
-            beverage_category=item.beverage_category or (bev_category(item.display_name) if is_beverage else None),
+            volume_ml=item.volume_ml,
+            beverage_category=item.beverage_category,
             nutrients_json=nutrients,
             source=source or "manual",
             confidence=conf,
         )
         db.add(mi)
-        db.flush()
-        # For beverages, create the linked liquid projection via shared domain
-        # (same helper the add-item path uses) so created drinks count as hydration.
-        if is_beverage and effective_volume and effective_volume > 0:
-            create_beverage_projection(db, user.id, mi, float(effective_volume),
-                                      item.beverage_category or bev_category(item.display_name) or "water",
-                                      meal.eaten_at)
         if nutrients:
             totals_kcal += nutrients.get("kcal") or 0
             totals_protein += nutrients.get("protein_g") or 0
@@ -454,7 +650,7 @@ def create_meal(req: MealCreateRequest, user: User = Depends(get_current_user), 
     return _meal_to_out(meal)
 
 
-@router.post("/from-text", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
+@router.post("/from-text", response_model=MealOut)
 def create_meal_from_text(req: MealCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Natural-language meal logging.
 
@@ -472,7 +668,7 @@ class PhotoDraftOut(BaseModel):
     message: str = "Draft created. Confirm before this meal becomes official."
 
 
-@router.post("/from-photo", response_model=PhotoDraftOut, dependencies=[Depends(require_model_writer_allowed)])
+@router.post("/from-photo", response_model=PhotoDraftOut)
 async def create_meal_from_photo(
     file: UploadFile = File(...),
     caption: str | None = None,
@@ -514,7 +710,7 @@ class BarcodeRequest(BaseModel):
     quantity: float = Field(default=1.0, ge=0.1, le=100)
 
 
-@router.post("/from-barcode", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
+@router.post("/from-barcode", response_model=MealOut)
 def create_meal_from_barcode(req: BarcodeRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     cat = _catalog()
     try:
@@ -587,9 +783,369 @@ def list_meals(
     return [_meal_to_out(m) for m in meals]
 
 
-# Food-catalog search. Declared BEFORE the generic /{meal_id} route so the
-# literal "foods" segment is not captured as a meal_id (FastAPI matches routes
-# in declaration order; a UUID parse of "foods" would 500).
+@router.get("/{meal_id}", response_model=MealOut)
+def get_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    meal = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    return _meal_to_out(meal)
+
+
+class MealPatchRequest(BaseModel):
+    meal_type: str | None = None
+    notes: str | None = None
+    eaten_at: datetime | None = None
+
+
+@router.patch("/{meal_id}", response_model=MealOut)
+def patch_meal(meal_id: str, req: MealPatchRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    meal = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    if req.meal_type is not None:
+        meal.meal_type = req.meal_type
+    if req.notes is not None:
+        meal.notes = req.notes
+    if req.eaten_at is not None:
+        meal.eaten_at = req.eaten_at
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+class MealItemPatch(BaseModel):
+    display_name: str | None = None
+    quantity: float | None = None
+    unit: str | None = None
+    grams: float | None = None
+    # Explicit food re-pointing: same identifier shape GET /meals/foods/search
+    # returns ("external_id"); "food_catalog_item_id" accepted as alias so a UI
+    # can pipe search results straight in.
+    food_catalog_item_id: str | None = None
+    external_id: str | None = None
+    # Custom nutrition override. When ANY *_per_100g value is supplied, the item's
+    # nutrients_json is written DIRECTLY from these values (scaled by grams/100),
+    # skipping catalog resolution. Lets the agent store exact per-100g values the
+    # user provides (e.g. "100g bread = 281 kcal") that no database food matches.
+    kcal_per_100g: float | None = None
+    protein_per_100g: float | None = None
+    carbs_per_100g: float | None = None
+    fat_per_100g: float | None = None
+    fiber_per_100g: float | None = None
+    sugar_per_100g: float | None = None
+    salt_g_per_100g: float | None = None
+
+
+@router.patch("/{meal_id}/items/{item_id}", response_model=MealOut)
+def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Correct one item of a meal AND re-resolve its nutrition.
+
+    Editing grams/name/quantity without recalculating nutrients_json stored
+    silently-wrong calories (a 100g wine serving corrected to 150g kept the
+    100g kcal). We now re-run the same resolution create uses, then rewrite
+    the parent meal's totals from all items.
+    """
+    meal = _owned_meal(db, meal_id, user)
+    item = next((i for i in meal.items if str(i.id) == str(item_id)), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    old_display_name = item.display_name
+    if req.display_name is not None:
+        item.display_name = req.display_name
+    if req.quantity is not None:
+        item.quantity = req.quantity
+    if req.unit is not None:
+        item.unit = req.unit
+    if req.grams is not None:
+        item.grams = req.grams
+    # Custom nutrition override: if the user supplied any *_per_100g value,
+    # write nutrients_json DIRECTLY from those values (scaled by grams/100),
+    # skipping catalog resolution entirely. This lets the agent store exact
+    # nutrition (e.g. "100g bread = 281 kcal, fat 11.9g...") that no database
+    # food matches. Values a user did NOT provide are omitted so the canonical
+    # shape stays intact.
+    custom_nutrients = {
+        name: getattr(req, name)
+        for name in ("kcal_per_100g", "protein_per_100g", "carbs_per_100g",
+                     "fat_per_100g", "fiber_per_100g", "sugar_per_100g",
+                     "salt_g_per_100g")
+        if getattr(req, name) is not None
+    }
+    if custom_nutrients:
+        grams = item.grams if item.grams is not None else 100.0
+        factor = grams / 100.0
+        n = {
+            "kcal": custom_nutrients["kcal_per_100g"] * factor if "kcal_per_100g" in custom_nutrients else None,
+            "protein_g": custom_nutrients["protein_per_100g"] * factor if "protein_per_100g" in custom_nutrients else None,
+            "carbs_g": custom_nutrients["carbs_per_100g"] * factor if "carbs_per_100g" in custom_nutrients else None,
+            "fat_g": custom_nutrients["fat_per_100g"] * factor if "fat_per_100g" in custom_nutrients else None,
+            "fiber_g": custom_nutrients["fiber_per_100g"] * factor if "fiber_per_100g" in custom_nutrients else None,
+            "sugar_g": custom_nutrients["sugar_per_100g"] * factor if "sugar_per_100g" in custom_nutrients else None,
+            "salt_g": custom_nutrients["salt_g_per_100g"] * factor if "salt_g_per_100g" in custom_nutrients else None,
+            "sources": ["user-provided-per-100g"],
+        }
+        item.nutrients_json = n
+        item.confidence = 1.0
+        item.source = "user"
+    else:
+        food_ref = req.food_catalog_item_id or req.external_id
+        if food_ref:
+            # Explicit correction: re-point at the chosen food, re-resolve nutrition
+            # FROM THAT FOOD at the item's grams, adopt its canonical name.
+            if not _apply_explicit_food(db, item, food_ref):
+                raise HTTPException(status_code=404, detail=f"Food not found: {food_ref}")
+        else:
+            name_changed = (
+                req.display_name is not None
+                and req.display_name != old_display_name
+            )
+            stale_id = None
+            old_pinned_name = None
+            old_resolved = None
+            if name_changed:
+                # Capture EVERY anchor for "what was this item before this patch":
+                # (a) the pinned food's canonical name (from foods table), and
+                # (b) the prior resolved_food in nutrients_json (present when the
+                # item came from the parser/catalog; absent only after a per-100g
+                # override). Either one lets us detect the "keeps re-resolving to
+                # X" loop: the re-resolution returns the SAME food the item already
+                # was, meaning the name-correction made no progress.
+                if item.food_catalog_item_id:
+                    stale_id = item.food_catalog_item_id
+                    # food_catalog_item_id may be a catalog external_id (string,
+                    # e.g. "2512381") OR a local uuid. Match on EITHER, but never
+                    # put a non-uuid string against the uuid `id` column in one
+                    # query -- Postgres casts the literal before the OR can
+                    # short-circuit and 500s on the invalid uuid text. Per the
+                    # foods row that the pin actually refers to, foods.food
+                    # matches are stored by external_id for catalog foods and by
+                    # uuid id for local rows.
+                    curr = stale_id
+                    old_pinned_name = None
+                    try:
+                        uid = uuid.UUID(str(curr))
+                    except (ValueError, AttributeError, TypeError):
+                        uid = None
+                    if uid is not None:
+                        old_pinned_name = (
+                            db.query(Food.display_name).filter(Food.id == uid).scalar()
+                        )
+                    if old_pinned_name is None:
+                        old_pinned_name = (
+                            db.query(Food.display_name)
+                            .filter(Food.external_id == str(curr))
+                            .scalar()
+                        )
+                old_resolved = ((item.nutrients_json or {}).get("resolved_food") or None)
+                # Do not let the stale pinned id override the NEW name during
+                # re-resolution. Clear it locally; it is re-set only by the
+                # explicit-food branch above.
+                item.food_catalog_item_id = None
+            # Re-resolve nutrition for the NEW field values (scales per-100g by grams,
+            # keeps the Atwater kcal fallback).
+            _resolve_item_nutrition(db, item, user)
+            if name_changed:
+                new_resolved = ((item.nutrients_json or {}).get("resolved_food") or "").strip()
+                new_kcal = (item.nutrients_json or {}).get("kcal")
+                stuck_with = None
+                # Only fire when the item was ALREADY resolved to this food
+                # (old_resolved matches). Text-parsed items with no prior
+                # resolution should fall through to the online cascade.
+                if old_resolved and new_resolved == old_resolved.strip():
+                    stuck_with = old_resolved.strip()
+                if stuck_with and new_kcal is not None:
+                    # The name change did NOT move the food: the catalog re-resolved
+                    # onto the same entry, so the correction would silently persist
+                    # the OLD value (the "keeps re-resolving to X" loop). Refuse and
+                    # tell the caller exactly how to force it.
+                    if stale_id is not None:
+                        item.food_catalog_item_id = stale_id  # restore the pin on the uncommitted obj
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Display-name correction '{req.display_name}' re-resolved "
+                            f"to the same entry '{stuck_with}'. Pass explicit "
+                            "kcal_per_100g (and other *_per_100g) values, or an "
+                            "external_id / food_catalog_item_id from search_food, to "
+                            "force the correct nutrition.",
+                        ),
+                    )
+                # Correction moved the item to a NEW food: keep that new resolution.
+                # Leave food_catalog_item_id unset so it re-resolves by the new name
+                # on future edits rather than re-pinning to the old food.
+    item.user_corrected = True
+    _sync_totals(db, meal)
+    audit(db, "user", str(user.id), user.id, "meals.item_patch", "meal", str(meal.id), {"item_id": str(item_id)})
+    # Detect a display_name CORRECTION: remember the original text before the
+    # rename so the LLM can learn a general rule from it.
+    original_text = None
+    corrected_food_id = None
+    if req.display_name is not None and req.display_name != old_display_name:
+        original_text = old_display_name
+        corrected_food_id = (
+            item.food_catalog_item_id
+            or getattr(item, "food_id", None)
+        )
+    db.commit()
+    db.refresh(meal)
+    if original_text:
+        # Fire-and-forget: a failed enqueue/extraction never fails the PATCH.
+        from drhiro_api.services.task_queue import enqueue
+
+        enqueue(
+            "drhiro",
+            "drhiro_worker.jobs_extract_food_rule.extract_food_rule_job",
+            str(user.id),
+            original_text,
+            req.display_name,
+            str(corrected_food_id) if corrected_food_id else None,
+        )
+    return _meal_to_out(meal)
+
+
+@router.post("/{meal_id}/items", response_model=MealOut)
+def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Add one item to an existing meal, resolving nutrition like create does."""
+    meal = _owned_meal(db, meal_id, user)
+    nutrients, conf, source = _lookup_nutrients(db, req, user)
+    mi = MealItem(
+        meal_id=meal.id,
+        food_catalog_item_id=req.food_catalog_item_id,
+        display_name=req.display_name,
+        quantity=req.quantity,
+        unit=req.unit,
+        grams=req.grams,
+        nutrients_json=nutrients,
+        source=source or "manual",
+        confidence=conf,
+    )
+    db.add(mi)
+    _sync_totals(db, meal)
+    audit(db, "user", str(user.id), user.id, "meals.item_add", "meal", str(meal.id), {"display_name": req.display_name})
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+@router.delete("/{meal_id}/items/{item_id}", response_model=MealOut)
+def remove_meal_item(meal_id: str, item_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Remove one item from a meal and recompute the meal's totals."""
+    meal = _owned_meal(db, meal_id, user)
+    item = next((i for i in meal.items if str(i.id) == str(item_id)), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    db.delete(item)
+    _sync_totals(db, meal)
+    audit(db, "user", str(user.id), user.id, "meals.item_remove", "meal", str(meal.id), {"item_id": str(item_id)})
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+@router.post("/{meal_id}/confirm", response_model=MealOut)
+def confirm_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    meal = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    unresolved = _unresolved_items(meal)
+    if unresolved:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "unresolved_items",
+                "message": (
+                    "This meal still has items with no nutrition behind them. "
+                    "Resolve each one first -- name/grams for a catalogue match, or "
+                    "explicit kcal_per_100g values -- then confirm again. A meal is "
+                    "not confirmable at 0 kcal."
+                ),
+                "items": [
+                    {
+                        "item_id": str(i.id),
+                        "display_name": i.display_name,
+                        "grams": i.grams,
+                        "volume_ml": i.volume_ml,
+                    }
+                    for i in unresolved
+                ],
+            },
+        )
+    meal.status = "confirmed"
+    meal.confirmed_at = datetime.now()
+    meal.confidence = 1.0
+    audit(db, "user", str(user.id), user.id, "meals.confirm", "meal", str(meal.id))
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+@router.post("/{meal_id}/copy", response_model=MealOut)
+def copy_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    source = (
+        db.query(Meal)
+        .options(selectinload(Meal.items))
+        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
+        .first()
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    meal = Meal(
+        user_id=user.id,
+        eaten_at=datetime.now(),
+        meal_type=source.meal_type,
+        status="confirmed",
+        input_method="copy",
+        notes=source.notes,
+        totals_json=source.totals_json,
+        confidence=1.0,
+    )
+    db.add(meal)
+    db.flush()
+    for i in source.items:
+        db.add(
+            MealItem(
+                meal_id=meal.id,
+                food_catalog_item_id=i.food_catalog_item_id,
+                display_name=i.display_name,
+                quantity=i.quantity,
+                unit=i.unit,
+                grams=i.grams,
+                nutrients_json=i.nutrients_json,
+                source=i.source,
+                confidence=i.confidence,
+            )
+        )
+    db.commit()
+    db.refresh(meal)
+    return _meal_to_out(meal)
+
+
+@router.delete("/{meal_id}")
+def delete_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    meal = db.query(Meal).filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id).first()
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+    meal.status = "deleted"
+    audit(db, "user", str(user.id), user.id, "meals.delete", "meal", str(meal.id))
+    db.commit()
+    return {"ok": True}
+
+
 @router.get("/foods/search")
 def search_foods(q: str = Query(min_length=1), limit: int = 10, user: User = Depends(get_current_user)):
     cat = _catalog()
@@ -631,363 +1187,6 @@ def food_by_barcode(barcode: str, user: User = Depends(get_current_user)):
         "fat_g_per_100g": item.fat_g_per_100g,
         "barcode": item.barcode,
     }
-
-
-@router.get("/{meal_id}", response_model=MealOut)
-def get_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    meal = (
-        db.query(Meal)
-        .options(selectinload(Meal.items))
-        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
-        .first()
-    )
-    if not meal:
-        raise HTTPException(status_code=404, detail="Meal not found")
-    return _meal_to_out(meal)
-
-
-class MealPatchRequest(BaseModel):
-    meal_type: str | None = None
-    notes: str | None = None
-    eaten_at: datetime | None = None
-
-
-@router.patch("/{meal_id}", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
-def patch_meal(meal_id: str, req: MealPatchRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    meal = (
-        db.query(Meal)
-        .options(selectinload(Meal.items))
-        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
-        .first()
-    )
-    if not meal:
-        raise HTTPException(status_code=404, detail="Meal not found")
-    if req.meal_type is not None:
-        meal.meal_type = req.meal_type
-    if req.notes is not None:
-        meal.notes = req.notes
-    if req.eaten_at is not None:
-        meal.eaten_at = req.eaten_at
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-class MealItemPatch(BaseModel):
-    display_name: str | None = None
-    quantity: float | None = None
-    unit: str | None = None
-    grams: float | None = None
-    # Explicit food re-pointing: same identifier shape GET /meals/foods/search
-    # returns ("external_id"); "food_catalog_item_id" accepted as alias so a UI
-    # can pipe search results straight in.
-    food_catalog_item_id: str | None = None
-    external_id: str | None = None
-    # Custom nutrition override. When ANY *_per_100g value is supplied, the item's
-    # nutrients_json is written DIRECTLY from these values (scaled by grams/100),
-    # skipping catalog resolution. Lets the agent store exact per-100g values the
-    # user provides (or an online lookup returns) that no database food matches.
-    kcal_per_100g: float | None = None
-    protein_per_100g: float | None = None
-    carbs_per_100g: float | None = None
-    fat_per_100g: float | None = None
-    fiber_per_100g: float | None = None
-    sugar_per_100g: float | None = None
-    salt_g_per_100g: float | None = None
-
-
-@router.patch("/{meal_id}/items/{item_id}", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
-def patch_meal_item(meal_id: str, item_id: str, req: MealItemPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Correct one item of a meal AND re-resolve its nutrition.
-
-    Editing grams/name/quantity without recalculating nutrients_json stored
-    silently-wrong calories (a 100g wine serving corrected to 150g kept the
-    100g kcal). We now re-run the same resolution create uses, then rewrite
-    the parent meal's totals from all items.
-    """
-    meal = _owned_meal(db, meal_id, user)
-    item = next((i for i in meal.items if str(i.id) == str(item_id)), None)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    old_display_name = item.display_name
-    old_grams = item.grams
-    if req.display_name is not None:
-        item.display_name = req.display_name
-    if req.quantity is not None:
-        item.quantity = req.quantity
-    if req.unit is not None:
-        item.unit = req.unit
-    if req.grams is not None:
-        item.grams = req.grams
-    # Custom nutrition override: if the user supplied any *_per_100g value,
-    # write nutrients_json DIRECTLY from those values (scaled by grams/100),
-    # skipping catalog resolution entirely. This lets the agent store exact
-    # nutrition (e.g. "100g bread = 281 kcal, fat 11.9g..." or an online
-    # lookup's values) that no database food matches. Values a user did NOT
-    # provide are omitted so the canonical shape stays intact.
-    custom_nutrients = {
-        name: getattr(req, name)
-        for name in ("kcal_per_100g", "protein_per_100g", "carbs_per_100g",
-                     "fat_per_100g", "fiber_per_100g", "sugar_per_100g",
-                     "salt_g_per_100g")
-        if getattr(req, name) is not None
-    }
-    if custom_nutrients:
-        grams = item.grams if item.grams is not None else 100.0
-        factor = grams / 100.0
-        item.nutrients_json = {
-            "kcal": custom_nutrients["kcal_per_100g"] * factor if "kcal_per_100g" in custom_nutrients else None,
-            "protein_g": custom_nutrients["protein_per_100g"] * factor if "protein_per_100g" in custom_nutrients else None,
-            "carbs_g": custom_nutrients["carbs_per_100g"] * factor if "carbs_per_100g" in custom_nutrients else None,
-            "fat_g": custom_nutrients["fat_per_100g"] * factor if "fat_per_100g" in custom_nutrients else None,
-            "fiber_g": custom_nutrients["fiber_per_100g"] * factor if "fiber_per_100g" in custom_nutrients else None,
-            "sugar_g": custom_nutrients["sugar_per_100g"] * factor if "sugar_per_100g" in custom_nutrients else None,
-            "salt_g": custom_nutrients["salt_g_per_100g"] * factor if "salt_g_per_100g" in custom_nutrients else None,
-            "sources": ["user-provided-per-100g"],
-        }
-        item.confidence = 1.0
-        item.source = "user"
-    else:
-        food_ref = req.food_catalog_item_id or req.external_id
-        if food_ref:
-            # Explicit correction: re-point at the chosen food, re-resolve nutrition
-            # FROM THAT FOOD at the item's grams, adopt its canonical name.
-            if not _apply_explicit_food(db, item, food_ref):
-                raise HTTPException(status_code=404, detail=f"Food not found: {food_ref}")
-        else:
-            # Re-resolve nutrition for the NEW field values (scales per-100g by grams,
-            # keeps the Atwater kcal fallback).
-            _resolve_item_nutrition(db, item, user)
-    item.user_corrected = True
-
-    # Propagate beverage changes to linked Measurement (volume/category) via
-    # shared domain so the liquid projection stays consistent.
-    propagate_beverage_patch(db, user.id, meal_id, item, old_grams)
-
-    _sync_totals(db, meal)
-    audit(db, "user", str(user.id), user.id, "meals.item_patch", "meal", str(meal.id), {"item_id": str(item_id)})
-    # Detect a display_name CORRECTION: remember the original text before the
-    # rename so the LLM can learn a general rule from it.
-    original_text = None
-    corrected_food_id = None
-    if req.display_name is not None and req.display_name != old_display_name:
-        original_text = old_display_name
-        corrected_food_id = (
-            item.food_catalog_item_id
-            or getattr(item, "food_id", None)
-        )
-    db.commit()
-    db.refresh(meal)
-    if original_text:
-        # Fire-and-forget: a failed enqueue/extraction never fails the PATCH.
-        from drhiro_api.services.task_queue import enqueue
-
-        enqueue(
-            "drhiro",
-            "drhiro_worker.jobs_extract_food_rule.extract_food_rule_job",
-            str(user.id),
-            original_text,
-            req.display_name,
-            str(corrected_food_id) if corrected_food_id else None,
-        )
-    return _meal_to_out(meal)
-
-
-@router.post("/{meal_id}/items", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
-def add_meal_item(meal_id: str, req: MealItemIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Add one item to an existing meal, resolving nutrition like create does.
-
-    For beverages, also creates the liquid Measurement + BeverageMeasurement
-    projection so the drink contributes to the water tile and the meal
-    carries a consistent projection (delegates to ``create_beverage_projection``).
-    """
-    meal = _owned_meal(db, meal_id, user)
-    nutrients, conf, source = _lookup_nutrients(db, req, user)
-
-    # Detect beverage: explicit food_catalog_item_id won't classify, but if
-    # _lookup_nutrients matched a liquid food, the source is "usda" with
-    # is_liquid — we still rely on _classify_beverage on the display_name.
-    from drhiro_api.services.consumption import _classify_beverage
-    bev_category = _classify_beverage(req.display_name)
-    is_beverage = bev_category is not None
-
-    # For beverages, use the separately supplied volume_ml; only derive
-    # volume from grams when no explicit ml value is supplied.
-    effective_volume = req.volume_ml if req.volume_ml else (req.grams if is_beverage else None)
-    mi = MealItem(
-        meal_id=meal.id,
-        food_catalog_item_id=req.food_catalog_item_id,
-        display_name=req.display_name,
-        quantity=req.quantity,
-        unit=req.unit,
-        grams=req.grams,
-        nutrients_json=nutrients,
-        source=source or "manual",
-        confidence=conf,
-        beverage_category=bev_category,
-        volume_ml=effective_volume,
-    )
-    db.add(mi)
-    db.flush()
-
-    # For beverages, create the linked liquid projection via shared domain
-    if is_beverage and effective_volume and effective_volume > 0:
-        create_beverage_projection(db, user.id, mi, float(effective_volume), bev_category, meal.eaten_at)
-
-    _sync_totals(db, meal)
-    audit(db, "user", str(user.id), user.id, "meals.item_add", "meal", str(meal.id), {"display_name": req.display_name})
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-@router.delete("/{meal_id}/items/{item_id}", response_model=MealOut)
-def remove_meal_item(meal_id: str, item_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Remove one item from a meal, recomputing the meal's totals.
-
-    For beverages, delegates to ``delete_beverage_item`` which also removes
-    the linked BeverageMeasurement + Measurement so no liquid row is orphaned.
-    """
-    meal = _owned_meal(db, meal_id, user)
-    item = next((i for i in meal.items if str(i.id) == str(item_id)), None)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-
-    # If the item is a beverage, delegate to the shared domain so the linked
-    # BeverageMeasurement + Measurement are removed atomically (no orphan).
-    bev = None
-    from drhiro_api.services.consumption import _classify_beverage
-    if item.beverage_category or _classify_beverage(item.display_name):
-        bev = True
-    if bev:
-        delete_beverage_item(db, user.id, meal_id, item_id)
-        # delete_beverage_item already recomputes meal totals; refresh + return
-        db.flush()
-        db.expire(meal, ["items"])
-        _sync_totals(db, meal)
-        audit(db, "user", str(user.id), user.id, "meals.item_remove", "meal", str(meal.id), {"item_id": str(item_id)})
-        db.commit()
-        db.refresh(meal)
-        return _meal_to_out(meal)
-
-    db.delete(item)
-    _sync_totals(db, meal)
-    audit(db, "user", str(user.id), user.id, "meals.item_remove", "meal", str(meal.id), {"item_id": str(item_id)})
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-@router.post("/{meal_id}/confirm", response_model=MealOut, dependencies=[Depends(require_model_writer_allowed)])
-def confirm_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    meal = (
-        db.query(Meal)
-        .options(selectinload(Meal.items))
-        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
-        .first()
-    )
-    if not meal:
-        raise HTTPException(status_code=404, detail="Meal not found")
-    meal.status = "confirmed"
-    meal.confirmed_at = datetime.now()
-    meal.confidence = 1.0
-    audit(db, "user", str(user.id), user.id, "meals.confirm", "meal", str(meal.id))
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-@router.post("/{meal_id}/copy", response_model=MealOut)
-def copy_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Copy a meal, including beverage liquid projections.
-
-    For each source item that has a linked BeverageMeasurement + Measurement,
-    the copy replicates the link so the copied drink carries a consistent
-    liquid projection (delegates to ``copy_beverage_link``).
-    """
-    source = (
-        db.query(Meal)
-        .options(selectinload(Meal.items))
-        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
-        .first()
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="Meal not found")
-    meal = Meal(
-        user_id=user.id,
-        eaten_at=datetime.now(),
-        meal_type=source.meal_type,
-        status="confirmed",
-        input_method="copy",
-        notes=source.notes,
-        totals_json=source.totals_json,
-        confidence=1.0,
-    )
-    db.add(meal)
-    db.flush()
-    new_meal_id = meal.id
-    eaten_at = meal.eaten_at
-
-    for i in source.items:
-        new_mi = MealItem(
-            meal_id=new_meal_id,
-            food_catalog_item_id=i.food_catalog_item_id,
-            display_name=i.display_name,
-            quantity=i.quantity,
-            unit=i.unit,
-            grams=i.grams,
-            nutrients_json=i.nutrients_json,
-            source=i.source,
-            confidence=i.confidence,
-            beverage_category=i.beverage_category,
-            volume_ml=i.volume_ml,
-        )
-        db.add(new_mi)
-        db.flush()
-
-        # Replicate the BeverageMeasurement + Measurement for beverage items
-        if i.beverage_category or i.volume_ml:
-            copy_beverage_link(db, user.id, str(i.id), str(new_mi.id), eaten_at)
-
-    db.commit()
-    db.refresh(meal)
-    return _meal_to_out(meal)
-
-
-@router.delete("/{meal_id}")
-def delete_meal(meal_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    meal = (
-        db.query(Meal)
-        .options(selectinload(Meal.items))
-        .filter(Meal.id == uuid.UUID(meal_id), Meal.user_id == user.id)
-        .first()
-    )
-    if not meal:
-        raise HTTPException(status_code=404, detail="Meal not found")
-
-    # Cascade to beverage liquid projections: remove linked BeverageMeasurement + Measurement
-    # for all beverage items in this meal so no orphaned liquid remains in the dashboard sum.
-    item_ids = [mi.id for mi in meal.items]
-    if item_ids:
-        bevs = db.query(BeverageMeasurement).filter(
-            BeverageMeasurement.meal_item_id.in_(item_ids)
-        ).all()
-        for bev in bevs:
-            db.query(Measurement).filter(
-                Measurement.id == bev.measurement_id,
-                Measurement.user_id == user.id,
-            ).delete(synchronize_session=False)
-        db.query(BeverageMeasurement).filter(
-            BeverageMeasurement.meal_item_id.in_(item_ids)
-        ).delete(synchronize_session=False)
-
-    # Hard-delete the meal and its items (cascade="all, delete-orphan" handles items)
-    meal.status = "deleted"
-    db.flush()
-    db.delete(meal)
-    audit(db, "user", str(user.id), user.id, "meals.delete", "meal", str(meal.id))
-    db.commit()
-    return {"ok": True}
 
 
 class RecipeRequest(BaseModel):

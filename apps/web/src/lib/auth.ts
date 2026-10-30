@@ -17,6 +17,16 @@ export interface TelegramUser {
   first_name?: string
 }
 
+/** Error carrying the HTTP status so callers (e.g. the importer) can react to it. */
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 const ACCESS_KEY = 'drhiro_access_token'
 const REFRESH_KEY = 'drhiro_refresh_token'
 
@@ -98,6 +108,25 @@ export const authClient = {
     return { id: data.user_id, first_name: 'Telegram user' }
   },
 
+  /**
+   * Google-session login (no code entry). The SPA is served behind Google
+   * OAuth on nginx; this endpoint reads the authenticated identity nginx
+   * injected (X-Auth-Request-Email) after Google passes, and returns tokens.
+   * Returns null when Google auth has not gone through (e.g. direct API hit
+   * or no oauth2 session) — the caller falls back to the OTP code entry.
+   */
+  async googleSession(): Promise<TelegramUser | null> {
+    try {
+      const res = await fetch(`${API_BASE}/auth/web/google`, { method: 'POST' })
+      if (!res.ok) return null
+      const data = await res.json()
+      storeTokens(data)
+      return { id: data.user_id }
+    } catch {
+      return null
+    }
+  },
+
   async init(): Promise<TelegramUser | null> {
     // If we already hold an access token, return a session — a 401 on the
     // first API call triggers an automatic refresh.
@@ -110,6 +139,10 @@ export const authClient = {
       const ok = await this.refresh()
       return ok ? { id: 'session' } : null
     }
+    // Google OAuth session (primary web path, no code entry). Runs when the
+    // SPA was reached through nginx's Google gate.
+    const google = await this.googleSession()
+    if (google) return google
     // Telegram Mini App path.
     if (this.isTelegram()) {
       const tg = window.Telegram!.WebApp!
@@ -137,6 +170,27 @@ export const authClient = {
     storeTokens(data)
   },
 
+  /**
+   * Report the DEVICE's timezone to the server (POST /me/timezone) so meal
+   * dates, the nutrition-day boundary and reminders follow the clock the user
+   * actually lives in — Telegram cannot supply a timezone, and a user who
+   * travels must not keep being dated in a fixed zone. Best-effort: a failure
+   * never blocks the UI.
+   */
+  async reportTimezone(): Promise<boolean> {
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
+      if (!tz) return false
+      await this.api('/me/timezone', {
+        method: 'POST',
+        body: JSON.stringify({ timezone: tz }),
+      })
+      return true
+    } catch {
+      return false
+    }
+  },
+
   token(): string | null {
     return localStorage.getItem(ACCESS_KEY)
   },
@@ -152,11 +206,15 @@ export const authClient = {
 
   async api(path: string, options: RequestInit = {}): Promise<any> {
     const base = API_BASE
+    // A FormData body must NOT carry an explicit JSON content type: the browser
+    // has to set `multipart/form-data` itself so it can append the boundary.
+    // Only default to JSON when the caller is actually sending JSON.
+    const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
     const doFetch = (token: string | null) =>
       fetch(`${base}${path}`, {
         ...options,
         headers: {
-          'Content-Type': 'application/json',
+          ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
           ...(options.headers || {}),
         },
@@ -172,7 +230,19 @@ export const authClient = {
       }
     }
 
-    if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`)
+    if (!res.ok) {
+      const text = await res.text()
+      let detail = text
+      try {
+        const parsed = JSON.parse(text)
+        if (parsed && typeof parsed === 'object' && 'detail' in parsed) {
+          detail = String((parsed as { detail: unknown }).detail)
+        }
+      } catch {
+        /* body was not JSON — keep the raw text */
+      }
+      throw new ApiError(res.status, detail || `API ${res.status}`)
+    }
     return res.json()
   },
 }

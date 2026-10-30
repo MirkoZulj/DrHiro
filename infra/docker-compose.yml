@@ -19,12 +19,15 @@ services:
     build:
       context: ..
       dockerfile: infra/docker/Dockerfile.api
-    image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-api:${DRHIRO_VERSION:-0.1.0}
+    image: drhiro-api:0.1.34-listmeals
     restart: unless-stopped
     env_file: .env
     environment:
       DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DRHIRO_REDIS_URL: redis://redis:6379/0
+      DRHIRO_IMPORTS_INCOMING: /imports/incoming
+    volumes:
+    - ../imports/incoming:/imports/incoming:ro
     expose:
     - '8000'
     depends_on:
@@ -45,29 +48,6 @@ services:
     - drhiro-net
     ports:
     - 8010:8000
-  intelligent-meal:
-    build:
-      context: ../services/intelligent-meal
-    image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-intelligent-meal:${DRHIRO_VERSION:-0.1.0}
-    restart: unless-stopped
-    env_file: .env
-    expose: ['8090']
-    environment:
-      DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      REDIS_URL: redis://redis:6379/2
-      DRHIRO_JWT_SECRET: ${DRHIRO_JWT_SECRET}
-      DRHIRO_SERVICE_TOKEN: ${DRHIRO_SERVICE_TOKEN}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8090/healthz")']
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    networks: [drhiro-net]
   worker:
     build:
       context: ..
@@ -108,9 +88,9 @@ services:
     build:
       context: ../apps/web
       args:
-        VITE_API_BASE: /api/v1
+        VITE_API_BASE: /drhiro/api/v1
         VITE_BASE_PATH: /drhiro-app/
-    image: ghcr.io/${GHCR_OWNER:-your-org}/drhiro-web:${DRHIRO_VERSION:-0.1.0}
+    image: drhiro-web:0.1.5-mifitness-import-ui
     restart: unless-stopped
     expose:
     - '3000'
@@ -119,7 +99,7 @@ services:
     ports:
     - 3000:3000
   openclaw-gateway:
-    image: ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION:-2026.7.1-2}
+    image: ghcr.io/openclaw/openclaw:2026.9.5
     restart: unless-stopped
     env_file: .env
     environment:
@@ -130,7 +110,7 @@ services:
       NOUS_API_KEY: ${NOUS_API_KEY:-}
       OPENCLAW_DRHIRO_API: http://api:8000/api/v1
       DRHIRO_OPENCLAW_SERVICE_TOKEN: ${DRHIRO_OPENCLAW_SERVICE_TOKEN}
-      DRHIRO_TELEGRAM_ID: ${DRHIRO_TELEGRAM_ID:-}
+      DRHIRO_TELEGRAM_ID: ${DRHIRO_TELEGRAM_ID}
     volumes:
     - ../openclaw/openclaw.json:/seed/openclaw.json:ro
     - ../openclaw/skills:/seed/skills:ro

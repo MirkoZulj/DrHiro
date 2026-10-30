@@ -1,0 +1,150 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "~/.openclaw/workspace/drhiro",
+      "model": {
+        "primary": "${OPENCLAW_MODEL}"
+      },
+      "timeoutSeconds": 1200,
+      "heartbeat": {
+        "target": "none"
+      },
+      "experimental": {
+        "localModelLean": true
+      },
+      "compaction": {
+        "enabled": true,
+        "thinkingLevel": "off",
+        "maxActiveTranscriptBytes": 120000,
+        "timeoutSeconds": 300,
+        "memoryFlush": {
+          "enabled": false
+        },
+        "keepRecentTokens": 12000
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "qwen-local": {
+        "api": "openai-completions",
+        "baseUrl": "http://172.20.0.1:8099/v1",
+        "apiKey": "local-qwen-noauth",
+        "models": [
+          {
+            "id": "Qwen3.6-27B-Q4_K_M_MTP.gguf",
+            "name": "Qwen 27B MTP (Windows box)",
+            "contextWindow": 65536
+          },
+          {
+            "id": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+            "name": "Qwen 3.8 27B UD Q4_K_M (Windows box)",
+            "contextWindow": 65536,
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": true,
+            "compat": {
+              "supportedReasoningEfforts": [
+                "none",
+                "minimal",
+                "low"
+              ],
+              "reasoningEffortMap": {
+                "minimal": "none",
+                "low": "none",
+                "medium": "low",
+                "high": "low"
+              }
+            }
+          }
+        ],
+        "timeoutSeconds": 240
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "dmPolicy": "pairing",
+      "groupPolicy": "disabled"
+    }
+  },
+  "mcp": {
+    "servers": {
+      "drhiro": {
+        "command": "node",
+        "args": [
+          "/home/node/.openclaw/mcp/drhiro-mcp-server.js"
+        ],
+        "transport": "stdio",
+        "enabled": true,
+        "env": {
+          "DRHIRO_MCP_API": "${OPENCLAW_DRHIRO_API}",
+          "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}",
+          "DRHIRO_TELEGRAM_ID": "${DRHIRO_TELEGRAM_ID}"
+        }
+      }
+    }
+  },
+  "skills": {
+    "entries": {
+      "skill-drhiro": {
+        "enabled": true,
+        "env": {
+          "OPENCLAW_DRHIRO_API": "${OPENCLAW_DRHIRO_API}",
+          "DRHIRO_OPENCLAW_SERVICE_TOKEN": "${DRHIRO_OPENCLAW_SERVICE_TOKEN}",
+          "DRHIRO_TELEGRAM_ID": "${DRHIRO_TELEGRAM_ID}"
+        }
+      }
+    }
+  },
+  "commands": {
+    "ownerAllowFrom": [
+      "telegram:984523234"
+    ]
+  },
+  "meta": {
+    "migrations": {
+      "modelPolicyAllowlist": true,
+      "utilityModelSeparation": true
+    },
+    "lastTouchedVersion": "2026.9.5"
+  },
+  "session": {
+    "reset": {
+      "mode": "daily",
+      "atHour": 7
+    }
+  },
+  "tools": {
+    "allow": [
+      "drhiro__*",
+      "exec",
+      "read",
+      "ls",
+      "write",
+      "edit",
+      "skill_workshop",
+      "memory_search",
+      "memory_get",
+      "web_search",
+      "web_fetch"
+    ]
+  },
+  "plugins": {
+    "load": {
+      "paths": [
+        "/home/node/.openclaw/plugins/drhiro-msgid"
+      ]
+    },
+    "entries": {
+      "drhiro-msgid": {
+        "enabled": true
+      }
+    }
+  }
+}

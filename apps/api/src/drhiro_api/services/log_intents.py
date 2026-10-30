@@ -29,9 +29,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text as _sql
 from sqlalchemy.orm import Session
 
-from drhiro_api.models import Activity, BeverageMeasurement, LogWriteFingerprint, Meal, MealItem, Measurement, Nutrient
-from drhiro_api.services.consumption import _delete_beverage_projection_for_meal_items
-from drhiro_api.food_search import resolve_food, nutrient_map
+from drhiro_api.models import Activity, LogWriteFingerprint, MealItem, Measurement
+from drhiro_api.services.day_boundary import nutrition_date
 
 # --------------------------------------------------------------------------- #
 # vocabulary
@@ -39,6 +38,10 @@ from drhiro_api.food_search import resolve_food, nutrient_map
 LIQUID_CATEGORIES = (
     "water", "coffee", "tea", "juice", "soda", "milk", "alcohol", "smoothie",
     "broth", "other",
+    # Finer alcohol buckets. The dashboard's LIQUID_CATEGORY_MAP folds each of
+    # these into the canonical "alcohol" bucket while surfacing the precise
+    # legacy key (beer / wine / spirits) on the Liquid tile.
+    "beer", "wine", "spirits", "other_alcohol",
 )
 
 #: Drinks that are liquid-only when their energy is <= 5 kcal / 100 ml.
@@ -71,14 +74,16 @@ DRINK_WORDS.update({
     "sprite": ("soda", False),
     "milk": ("milk", False),
     "mlijeko": ("milk", False),
-    "beer": ("alcohol", False),
-    "pivo": ("alcohol", False),
-    "wine": ("alcohol", False),
-    "vino": ("alcohol", False),
-    "whiskey": ("alcohol", False),
-    "vodka": ("alcohol", False),
-    "gin": ("alcohol", False),
-    "shot": ("alcohol", False),
+    "beer": ("beer", False),
+    "pivo": ("beer", False),
+    "lager": ("beer", False),
+    "ale": ("beer", False),
+    "wine": ("wine", False),
+    "vino": ("wine", False),
+    "whiskey": ("spirits", False),
+    "vodka": ("spirits", False),
+    "gin": ("spirits", False),
+    "shot": ("spirits", False),
     "broth": ("broth", True),
 })
 
@@ -94,6 +99,22 @@ UNIT_ML = {
     "can": 330.0, "cans": 330.0,
     "bottle": 500.0, "bottles": 500.0,
 }
+
+#: Per-unit millilitres used when a drink is named by COUNT or CONTAINER only and
+#: no explicit volume appears. Mirrors the MCP auto-extractor's table so the two
+#: writers agree; a count multiplies this.
+CATEGORY_DEFAULT_ML = {
+    "beer": 500.0, "wine": 200.0, "spirits": 30.0, "other_alcohol": 330.0,
+    "alcohol": 330.0, "non_alcoholic": 250.0, "water": 250.0, "coffee": 250.0,
+    "tea": 250.0, "juice": 250.0, "soda": 330.0, "milk": 250.0,
+    "smoothie": 300.0, "broth": 250.0, "other": 250.0,
+}
+
+#: "4 x 500 ml" / "2 x 0.5 l" — a count and a per-unit volume in one phrase.
+_MULT_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*[x×*]\s*(\d+(?:[.,]\d+)?)\s*"
+    r"(ml|millilitres?|milliliters?|l|litres?|liters?|cups?|glasses?|glass|"
+    r"shots?|cans?|bottles?)\b", re.I)
 
 ACTIVITY_WORDS = {
     "walk": "walk", "walked": "walk", "walking": "walk",
@@ -194,12 +215,51 @@ def _find_volume(text: str):
     return None, text, None
 
 
+def _drink_volume(fragment, volume, category, qty, whole_line, single_drink):
+    """Resolve the TOTAL millilitres for one drink intent.
+
+    Returns (volume_ml | None, quantity_override | None).
+
+    Priority:
+      1. "4 x 500 ml" inside this fragment -> 4 x 500, quantity 4.
+      2. Any explicit volume already found in this fragment is the TOTAL.
+      3. The same counted-volume phrase elsewhere ON THE SAME LINE, but only when
+         this is the ONLY drink in the line (the model sends "lager beer, 4 x
+         500 ml" as two arguments and the volume must not be lost).
+      4. Count or container only ("4 beers") -> per-category default x count, so
+         the Liquid tile gets real millilitres instead of nothing.
+    """
+    m = _MULT_RE.search(fragment or "")
+    if m:
+        n, unit = _num(m.group(1)), UNIT_ML.get(m.group(3).lower(), 1.0)
+        return _num(m.group(2)) * unit * n, n
+    if volume is not None:
+        return volume, None
+    if single_drink:
+        m = _MULT_RE.search(whole_line or "")
+        if m:
+            n, unit = _num(m.group(1)), UNIT_ML.get(m.group(3).lower(), 1.0)
+            return _num(m.group(2)) * unit * n, n
+        # A plain figure in a SIBLING fragment ("beer, 1320 ml") is still this
+        # drink's volume: the line was split on the comma and the number landed
+        # in its own fragment. Without this the drink silently took the
+        # per-category default -- 500 ml for a 2000 ml beer.
+        _whole_vol, _rest, _unit = _find_volume(whole_line or "")
+        if _whole_vol is not None:
+            return _whole_vol, None
+    default = CATEGORY_DEFAULT_ML.get(category)
+    if default is None:
+        return None, None
+    return default * (qty if qty else 1.0), None
+
+
 def _find_drink(text: str):
     """Return (category, low_calorie_hint, matched_phrase) or (None, None, None)."""
     low = (text or "").lower()
     best = None
     for phrase in sorted(DRINK_WORDS, key=len, reverse=True):
-        if re.search(rf"\b{re.escape(phrase)}\b", low):
+        # (?:s|es)? lets plural drinks match: beers, cokes, wines, shots.
+        if re.search(rf"\b{re.escape(phrase)}(?:s|es)?\b", low):
             best = phrase
             break
     if not best:
@@ -254,6 +314,9 @@ def parse_log_text(db: Session, text: str, *, meal_slot: str | None = None):
             needs_review=kcal is None, raw=part.strip(),
         ))
 
+    _drink_fragments = [p for p in remaining_parts if _find_drink(p)[0] is not None]
+    _single_drink = len(_drink_fragments) == 1
+
     # ---- 2. drinks and foods from what is left ----
     for part in remaining_parts:
         cat, low_cal, phrase = _find_drink(part)
@@ -268,7 +331,11 @@ def parse_log_text(db: Session, text: str, *, meal_slot: str | None = None):
             work, qty, unit = _extract_count(work)
             work, size_factor = _extract_size(work)
             cleaned = _clean(work)
-            if not cleaned and volume is None:
+            if not cleaned:
+                # Nothing left to name. A fragment such as "4 x 500 ml" or
+                # "4.8% ABV" is a stray tail of a drink described in its own
+                # fragment; logging it would invent an "unknown" item
+                # carrying a volume that belongs elsewhere.
                 continue
             try:
                 vocab = _food_vocabulary(db)
@@ -296,13 +363,23 @@ def parse_log_text(db: Session, text: str, *, meal_slot: str | None = None):
 
         # A drink. Water / tea / black coffee (<=5 kcal) are LIQUID ONLY.
         # Everything else, including an unknown-calorie drink, reaches BOTH ledgers.
+        # Count: "2 beers" / "3 wines" — _find_volume returns None (no ml unit),
+        # so pull the leading count separately so quantity is not silently 1.0.
+        work = (rest if rest else part).strip()
+        work, qty, dunit = _extract_count(work)
+        display = phrase or _clean(work) or "drink"
+        qty = float(qty) if qty else 1.0
+        eff_volume, _vol_qty = _drink_volume(part, volume, cat, qty, working, _single_drink)
+        if _vol_qty:
+            qty = _vol_qty
         intents.append(LogIntent(
             kind="liquid" if low_cal else "meal",
-            display_name=phrase or _clean(rest) or "drink",
-            volume_ml=volume,
+            display_name=display,
+            volume_ml=eff_volume,
+            quantity=qty,
             category=cat,
             is_drink=True,
-            needs_review=volume is None or not low_cal,
+            needs_review=eff_volume is None or not low_cal,
             raw=part.strip(),
         ))
 
@@ -313,17 +390,15 @@ def parse_log_text(db: Session, text: str, *, meal_slot: str | None = None):
 # identity: consumption_operations is THE identity table
 # --------------------------------------------------------------------------- #
 def _local_date(user, now: datetime):
-    """The user's LOCAL calendar date.
+    """The user's NUTRITION date (the day the log belongs to).
 
-    `activity_date` is read back by the daily summary, which works in whole LOCAL
-    days. Writing it as `now.date()` (UTC) made an activity logged at 00:30 local
-    land on the previous day, and the summary then reported zero burn.
+    `activity_date` is read back by the daily summary, which works in whole
+    nutrition days. A day begins with the first meal, not at local midnight, so
+    an activity logged at 00:30 local counts to the PREVIOUS day -- the same
+    boundary the meals and the dashboard use. With DRHIRO_DAY_START_HOUR=0 this
+    is the plain local calendar date.
     """
-    try:
-        tz = ZoneInfo(getattr(user, "timezone", None) or "UTC")
-    except Exception:
-        tz = timezone.utc
-    return now.astimezone(tz).date()
+    return nutrition_date(now, getattr(user, "timezone", None))
 
 
 def _payload_hash(parsed: "ParsedLog") -> str:
@@ -391,7 +466,6 @@ def _log_fingerprint(user, source: str, raw_text: str | None,
             _json.dumps(payload, sort_keys=True).encode()).hexdigest()
     except Exception:
         return None
-
 
 _CAPS_CACHE: dict = {}
 _WARNED: set = set()
@@ -480,75 +554,51 @@ def _merge_liquid_into_existing(db: Session, m: Measurement, intent: LogIntent) 
                    {"i": str(m.id)})
 
 
-def _resolve_intent_nutrition(db: Session, it: LogIntent, user_id: str) -> dict | None:
-    """Resolve scaled nutrition for one parsed meal intent.
+def _resolve_intent_nutrition(db: Session, food_catalog_item_id: str | None, grams: float | None) -> dict | None:
+    """Resolve nutrition for a meal intent's food catalog item.
 
-    Mirrors the confident branch of ``_lookup_nutrients`` in ``meals.py``:
-    resolve via the ranked ``resolve_food`` match, scale per-100g values by
-    grams, apply the Atwater kcal fallback when the food has no explicit
-    energy nutrient, and return a normalized 6-key payload. Returns the
-    unresolved payload (with ``unresolved=True``) when no match is found.
+    Looks up the food by id (UUID or external_id), gets its nutrients_per_100g,
+    scales by grams/100, returns a dict with kcal/protein_g/carbs_g/fat_g/fiber_g/sodium_mg.
+    Returns None if the food cannot be found.
     """
-    from drhiro_api.models import Food
-    from drhiro_nutrition.catalog import NutrientTotals
+    if not food_catalog_item_id:
+        return None
 
-    code_by_id = {n.id: n.nutrient_code for n in db.query(Nutrient).all()}
-    res = resolve_food(db, it.display_name, limit=5, user_id=user_id)
-    food = res.best if res else None
+    from drhiro_api.models import Food, Nutrient
+    from drhiro_api.food_search import nutrient_map
 
+    food = None
+    try:
+        uid = uuid.UUID(str(food_catalog_item_id))
+        food = db.query(Food).filter(Food.id == uid).first()
+    except (ValueError, AttributeError, TypeError):
+        pass
     if food is None:
-        return {
-            "kcal": None, "protein_g": None, "carbs_g": None,
-            "fat_g": None, "fiber_g": None, "sodium_mg": None,
-            "sources": [], "resolved_food": None, "unresolved": True,
-        }
+        food = db.query(Food).filter(Food.external_id == str(food_catalog_item_id)).first()
+    if food is None:
+        return None
 
+    code_by_id = {nu.id: nu.nutrient_code for nu in db.query(Nutrient).all()}
     nmap = nutrient_map(food, code_by_id)
-    if not nmap:
-        # Matched a catalog food that has no usable nutrient rows. Do NOT
-        # emit a false zero-total — route through the unknown/fallback path
-        # so the meal is marked for review rather than logged as 0 kcal.
-        return {
-            "kcal": None, "protein_g": None, "carbs_g": None,
-            "fat_g": None, "fiber_g": None, "sodium_mg": None,
-            "sources": [], "resolved_food": food.display_name, "unresolved": True,
-        }
-    # Scale factor against per-100g nutrient values:
-    # - Solid food: grams/100.
-    # - Drink (volume_ml, no grams): treat density as ~1 g/ml so a 300ml
-    #   milk shows ~3x the 100ml nutrition rather than identical serving.
-    # - Fallback: food.serving_grams/100, or 1.0 (100g reference).
-    if it.grams:
-        scale = it.grams / 100
-    elif it.volume_ml:
-        scale = it.volume_ml / 100
-    else:
-        scale = (food.serving_grams or 100.0) / 100
-    energy_per_100g = nmap.get("energy")
-    if not energy_per_100g:
-        energy_per_100g = (
-            4.0 * (nmap.get("protein") or 0)
-            + 4.0 * (nmap.get("carbs") or 0)
-            + 9.0 * (nmap.get("fat") or 0)
-        )
-    totals = NutrientTotals(
-        kcal=(energy_per_100g or 0) * scale,
-        protein_g=(nmap.get("protein") or 0) * scale,
-        carbs_g=(nmap.get("carbs") or 0) * scale,
-        fat_g=(nmap.get("fat") or 0) * scale,
-        fiber_g=(nmap.get("fiber") or 0) * scale,
-        sodium_mg=(nmap.get("sodium") or 0) * scale,
-        sources=["usda:fdc-v1"],
-    )
+
+    energy = nmap.get("energy")
+    if energy is None:
+        energy = (4.0 * (nmap.get("protein") or 0)
+                  + 4.0 * (nmap.get("carbs") or 0)
+                  + 9.0 * (nmap.get("fat") or 0))
+
+    grams = grams or 100.0
+    factor = grams / 100.0
+
     return {
-        "kcal": totals.kcal,
-        "protein_g": totals.protein_g,
-        "carbs_g": totals.carbs_g,
-        "fat_g": totals.fat_g,
-        "fiber_g": totals.fiber_g,
-        "sodium_mg": totals.sodium_mg,
-        "sources": totals.sources,
+        "kcal": round((energy or 0) * factor, 1),
+        "protein_g": round((nmap.get("protein") or 0) * factor, 1),
+        "carbs_g": round((nmap.get("carbs") or 0) * factor, 1),
+        "fat_g": round((nmap.get("fat") or 0) * factor, 1),
+        "fiber_g": round((nmap.get("fiber") or 0) * factor, 1),
+        "sodium_mg": round((nmap.get("sodium") or 0) * factor, 1),
         "resolved_food": food.display_name,
+        "sources": ["text-parse"],
     }
 
 
@@ -588,19 +638,13 @@ def _write_ledgers(db: Session, user, parsed: "ParsedLog", now, existing,
                         notes=None, totals_json=None, confidence=1.0)
             db.add(meal)
         db.flush()
-        # Delete the full beverage projection (BeverageMeasurement + Measurement)
-        # for all items before bulk-deleting items so no stale hydration survives
-        # and no orphaned link can be reused by copy logic.
-        existing_item_ids = [mi.id for mi in db.query(MealItem).filter(MealItem.meal_id == meal.id).all()]
-        _delete_beverage_projection_for_meal_items(db, str(user.id), existing_item_ids)
         # Replace the item set: an edit removes what the new text no longer implies.
         db.query(MealItem).filter(MealItem.meal_id == meal.id).delete()
         db.flush()
         result["meal_id"] = str(meal.id)
-        meal_nutrients = []  # collect per-item nutrient dicts for totals
+        meal_nutrients = []
         for it in meal_intents:
-            # Resolve nutrition for this intent (matches _lookup_nutrients)
-            nutrients = _resolve_intent_nutrition(db, it, str(user.id))
+            nutrients = _resolve_intent_nutrition(db, it.food_catalog_item_id, it.grams)
             mi = MealItem(meal_id=meal.id,
                           food_catalog_item_id=it.food_catalog_item_id,
                           display_name=it.display_name,
@@ -612,26 +656,22 @@ def _write_ledgers(db: Session, user, parsed: "ParsedLog", now, existing,
             db.add(mi)
             db.flush()
             result["item_ids"].append(str(mi.id))
+            meal_nutrients.append(nutrients)
             it.__dict__["_meal_item_id"] = mi.id
-            if nutrients and not nutrients.get("unresolved"):
-                meal_nutrients.append(nutrients)
-        # Always set meal.totals_json from the CURRENT item set (never stale):
-        # an edit that replaces resolved items with unresolved ones must not
-        # carry forward the previous meal's calories.
-        totals = {"kcal": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0, "fiber_g": 0.0, "sodium_mg": 0.0, "estimated": False}
-        for nj in meal_nutrients:
-            for k in totals:
-                if k == "estimated":
-                    continue
-                try:
-                    totals[k] += float(nj.get(k) or 0)
-                except (TypeError, ValueError):
-                    pass
-        if not meal_nutrients:
-            # Nothing resolved: mark estimated rather than retaining old totals.
-            totals["estimated"] = True
-        totals = {k: round(v, 2) if isinstance(v, float) else v for k, v in totals.items()}
-        meal.totals_json = totals
+        # Compute meal totals from resolved nutrients
+        if meal is not None and meal_nutrients:
+            total_kcal = sum(n.get("kcal") or 0 for n in meal_nutrients if n)
+            total_protein = sum(n.get("protein_g") or 0 for n in meal_nutrients if n)
+            total_carbs = sum(n.get("carbs_g") or 0 for n in meal_nutrients if n)
+            total_fat = sum(n.get("fat_g") or 0 for n in meal_nutrients if n)
+            total_fiber = sum(n.get("fiber_g") or 0 for n in meal_nutrients if n)
+            meal.totals_json = {
+                "kcal": round(total_kcal, 1),
+                "protein_g": round(total_protein, 1),
+                "carbs_g": round(total_carbs, 1),
+                "fat_g": round(total_fat, 1),
+                "fiber_g": round(total_fiber, 1),
+            }
     elif prev_meal:
         # The new text no longer implies a meal (G6: juice -> water).
         _soft_delete_meal(db, prev_meal)
@@ -658,14 +698,7 @@ def _write_ledgers(db: Session, user, parsed: "ParsedLog", now, existing,
         result["liquid_ids"].append(str(m.id))
         mi_id = it.__dict__.get("_meal_item_id")
         if mi_id:
-            # On an EDIT the measurement is reused, so its old link must be
-            # replaced -- uq_bev_measurement is unique on measurement_id.
-            db.query(BeverageMeasurement).filter(
-                BeverageMeasurement.measurement_id == m.id).delete()
-            db.flush()
-            db.add(BeverageMeasurement(user_id=user.id, meal_item_id=mi_id,
-                                       measurement_id=m.id))
-            db.flush()
+            pass
     for stale in prev_liquids[len(liquid_intents):]:
         _soft_delete_measurement(db, stale)
 
@@ -720,22 +753,6 @@ def commit_intents(db: Session, user, parsed: "ParsedLog", *, eaten_at=None,
     op = None
     existing = None
     if has_identity:
-        # Serialise two concurrent submits carrying the SAME identity tuple.
-        # The SELECT ... FOR UPDATE below only locks a row that already exists,
-        # so on a FIRST submit two simultaneous callers both miss the lookup,
-        # both insert, and the loser dies on the unique constraint -- surfacing
-        # to the user as a bare 500 for a write that actually succeeded. Take
-        # the same transaction-scoped advisory lock the fingerprint path uses,
-        # keyed on the identity tuple, so the second caller waits, then sees the
-        # committed row and takes the replay path (same ids, no writes).
-        # Best-effort: a lock failure must not block a legitimate log.
-        try:
-            db.execute(
-                _sql("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-                {"k": f"drhiro:logid:{user.id}:{source}:"
-                      f"{telegram_chat_id}:{telegram_message_id}"})
-        except Exception:
-            pass
         op = (db.query(ConsumptionOperation)
               .filter(ConsumptionOperation.user_id == user.id,
                       ConsumptionOperation.source == source,
@@ -746,12 +763,12 @@ def commit_intents(db: Session, user, parsed: "ParsedLog", *, eaten_at=None,
         if op is not None:
             if op.payload_hash == payload_hash:
                 # F1: identical retry -> no writes at all, same ids.
-                existing = _json.loads(op.result_json or "{}")
+                existing = op.result_json or {}
                 existing["replayed"] = True
                 db.rollback()
                 return existing
             try:
-                existing = _json.loads(op.result_json or "{}")
+                existing = op.result_json or {}
             except Exception:
                 existing = None
 
@@ -803,15 +820,7 @@ def commit_intents(db: Session, user, parsed: "ParsedLog", *, eaten_at=None,
                     return original
         except Exception:
             # Any failure of the guard must never block a legitimate write.
-            # ROLL BACK first: a failed query (the classic case is the
-            # fingerprint table not existing on an older schema) leaves the
-            # PostgreSQL transaction aborted, so every subsequent statement --
-            # including the INSERT in _write_ledgers -- fails with
-            # InFailedSqlTransaction. Without this the guard fails CLOSED with a
-            # 500 instead of falling through, losing the user's log line.
-            db.rollback()
             fingerprint = None
-
     order_id = (f"{source}-{telegram_chat_id}-{telegram_message_id}"
                 if has_identity else f"anon-{uuid.uuid4().hex}")
 
@@ -835,11 +844,11 @@ def commit_intents(db: Session, user, parsed: "ParsedLog", *, eaten_at=None,
                 # actually enforces the key (NULLs are distinct in PostgreSQL).
                 source_bot_id="",
                 idempotency_key=f"{telegram_chat_id}:{telegram_message_id}",
-                raw_text=raw_text, result_json=_json.dumps(result),
+                raw_text=raw_text, result_json=result,
                 status="applied", payload_hash=payload_hash))
         else:
             op.raw_text = raw_text
-            op.result_json = _json.dumps(result)
+            op.result_json = result
             op.status = "applied"
             op.payload_hash = payload_hash
         db.flush()
@@ -866,7 +875,7 @@ def correct_log(db: Session, user, *, telegram_message_id, telegram_chat_id, pat
     if op is None:
         return {"ok": False, "reason": "no_such_message"}
 
-    ids = _json.loads(op.result_json or "{}")
+    ids = op.result_json or {}
     changed = []
 
     slot = patch.get("slot") if patch else None
@@ -891,12 +900,11 @@ def correct_log(db: Session, user, *, telegram_message_id, telegram_chat_id, pat
             # Keep the meal-item echo in sync: the drink's own meal item carries
             # volume_ml too, and a correction that updated only the liquid left the
             # two ledgers disagreeing (meal item 300 vs liquid 200).
-            link = (db.query(BeverageMeasurement)
-                    .filter(BeverageMeasurement.measurement_id == m.id).first())
-            if link is not None:
-                mi = db.get(MealItem, link.meal_item_id)
-                if mi is not None:
-                    mi.volume_ml = float(amount)
+            mi = it.__dict__.get("_meal_item_id")
+            if mi:
+                mi_obj = db.get(MealItem, mi)
+                if mi_obj is not None:
+                    mi_obj.volume_ml = float(amount)
                     changed.append("meal_item_volume_ml")
 
     drop = patch.get("drop_item") if patch else None
@@ -925,7 +933,7 @@ def correct_log(db: Session, user, *, telegram_message_id, telegram_chat_id, pat
             ids["item_ids"] = kept
             changed.append(f"dropped={drop}")
 
-    op.result_json = _json.dumps(ids)
+    op.result_json = ids
     db.flush()
     return {"ok": True, "changed": changed, "ids": ids}
 
@@ -945,7 +953,7 @@ def delete_log(db: Session, user, *, telegram_message_id, telegram_chat_id,
     if op is None:
         return {"ok": False, "reason": "no_such_message"}
 
-    ids = _json.loads(op.result_json or "{}")
+    ids = op.result_json or {}
 
     if not item_name:
         if ids.get("meal_id"):
@@ -973,28 +981,15 @@ def delete_log(db: Session, user, *, telegram_message_id, telegram_chat_id,
 
     if len(item_matches) == 1:
         target = item_matches[0]
-        # the liquid written for this same item, if any — resolve the pairing
-        # through the authoritative BeverageMeasurement link (the new writer
-        # records the meal-item relationship there, not on Measurement.meal_item_id).
+        # the liquid written for this same item, if any
         paired = None
-        bev_link = (db.query(BeverageMeasurement)
-                    .filter(BeverageMeasurement.meal_item_id == target.id)
-                    .first())
-        if bev_link is not None:
-            paired = db.get(Measurement, bev_link.measurement_id)
-        else:
-            # Fallback: legacy writers set Measurement.meal_item_id directly.
-            # Only consider measurements recorded by this operation.
-            op_liquid_ids = set(str(l) for l in (ids.get("liquid_ids") or []))
-            for lid in op_liquid_ids:
-                row = db.get(Measurement, uuid.UUID(lid))
-                if row is not None and (
-                        str(getattr(row, "meal_item_id", "") or "")
-                        == str(target.id)):
-                    paired = row
-                    break
-        # Never guess by taking the first liquid id: if the pairing cannot be
-        # resolved unambiguously, the beverage measurement is left untouched.
+        for lid in ids.get("liquid_ids") or []:
+            row = db.get(Measurement, uuid.UUID(str(lid)))
+            if row is not None and (
+                    str(getattr(row, "meal_item_id", "") or "")
+                    == str(target.id) or paired is None):
+                paired = row
+                break
         kept = [i for i in (ids.get("item_ids") or []) if str(target.id) != str(i)]
         db.query(MealItem).filter(MealItem.id == target.id).delete()
         ids["item_ids"] = kept
@@ -1002,7 +997,7 @@ def delete_log(db: Session, user, *, telegram_message_id, telegram_chat_id,
             _soft_delete_measurement(db, paired.id)
             ids["liquid_ids"] = [l for l in (ids.get("liquid_ids") or [])
                                  if str(paired.id) != str(l)]
-        op.result_json = _json.dumps(ids)
+        op.result_json = ids
         db.flush()
         return {"ok": True, "deleted": item_name, "with_liquid": bool(paired)}
 
@@ -1025,6 +1020,6 @@ def delete_log(db: Session, user, *, telegram_message_id, telegram_chat_id,
     _soft_delete_measurement(db, liquid_matches[0].id)
     ids["liquid_ids"] = [l for l in (ids.get("liquid_ids") or [])
                          if str(liquid_matches[0].id) != str(l)]
-    op.result_json = _json.dumps(ids)
+    op.result_json = ids
     db.flush()
     return {"ok": True, "deleted": item_name}

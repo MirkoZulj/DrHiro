@@ -296,10 +296,12 @@ def _resolve(db, name: str, vocabulary):
     """Resolve a cleaned food phrase to a catalogue row.
 
     Order: canonical synonym (typo-tolerant, exact DB lookup) -> resolve_food
-    -> difflib against catalogue names. Returns (Food|None, matched_name|None).
+    -> difflib against catalogue names. Returns
+    (Food|None, matched_name|None, canonical_key|None) -- THREE values, matching
+    every other return below and the caller in log_intents.parse_log_text.
     """
     if not name:
-        return None, None
+        return None, None, None
 
     # 1. Canonical map, tolerant of typos. Deterministic and highest priority so
     #    "toast"/"tost" and "rice"/"rise" always land on the same food.

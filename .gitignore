@@ -72,3 +72,33 @@ __pycache__/
 # Signed builds live on the VPS / Telegram (installed at runtime); never in git.
 # (The apk/ directory rule above covers the sidecar; this covers loose files.)
 *.apk
+# ── Secrets and environment ───────────────────────────────────────────────
+settings.json
+*creds*
+*_rsa
+*.jks
+# ── Runtime data, dumps and backups ───────────────────────────────────────
+backups/
+imports/incoming/
+data/
+dumps/
+*.sqlite
+*.sqlite3
+*.db
+*.log.*
+# ── Python ────────────────────────────────────────────────────────────────
+venv/
+.mypy_cache/
+.ruff_cache/
+# ── Node / web ────────────────────────────────────────────────────────────
+.next/
+.cache/
+coverage/
+# ── Android artefacts ─────────────────────────────────────────────────────
+*.aab
+*.jar
+apps/android-bridge/build/
+apps/android-bridge/**/build/
+# ── OS / editor ───────────────────────────────────────────────────────────
+# ops backups that may embed host material
+bin/home_socks.sh.pre-*

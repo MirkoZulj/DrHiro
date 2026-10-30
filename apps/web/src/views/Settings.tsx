@@ -1,6 +1,6 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import { authClient, API_BASE } from '../lib/auth'
-import SystemSettings from './SystemSettings'
 
 export default function Settings() {
   const [error, setError] = useState<string | null>(null)
@@ -56,8 +56,6 @@ export default function Settings() {
 
       {error && <div className="error">{error}</div>}
 
-      <SystemSettings />
-
       <section className="section">
         <h3>Your data</h3>
         <div className="form-card">
@@ -70,6 +68,21 @@ export default function Settings() {
             </button>
           </div>
           {exportInfo && <div className="status">{exportInfo}</div>}
+        </div>
+      </section>
+
+      <section className="section">
+        <h3>Imports</h3>
+        <div className="form-card">
+          <p className="muted" style={{ marginTop: 0 }}>
+            Bring in a Mi Fitness export ZIP. The import is additive — it fills gaps and never overwrites
+            days drHiro already has.
+          </p>
+          <div className="form-actions" style={{ marginTop: 12 }}>
+            <Link className="btn" to="/import/mifitness">
+              Import Mi Fitness export
+            </Link>
+          </div>
         </div>
       </section>
 
