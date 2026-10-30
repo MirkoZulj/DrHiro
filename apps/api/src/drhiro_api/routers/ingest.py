@@ -233,7 +233,10 @@ def _validate_measured_at(measured_at: datetime | None) -> None:
     if measured_at is None:
         return
     from datetime import timedelta
-    if measured_at > datetime.now() + timedelta(minutes=5):
+    # Compare like with like: a tz-aware timestamp against a naive `now()` raises
+    # TypeError, which surfaced as a 500 on the manual-measurement endpoints.
+    now = datetime.now(measured_at.tzinfo) if measured_at.tzinfo else datetime.now()
+    if measured_at > now + timedelta(minutes=5):
         raise HTTPException(
             status_code=400,
             detail=f"measured_at cannot be in the future (got {measured_at.isoformat()})",

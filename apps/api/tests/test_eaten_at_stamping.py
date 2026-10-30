@@ -134,7 +134,9 @@ def test_bare_date_correction_lands_on_intended_nutrition_day(client, db, monkey
     db.commit()
 
     import drhiro_api.routers.openclaw_tools as ot
-    frozen = datetime(2026, 10, 12, 18, 0, tzinfo=ZAGREB)
+    # Relative to "now" so the 7-day correction guard does not reject the move
+    # as the calendar advances past a hardcoded date.
+    frozen = datetime.now(ZAGREB).replace(hour=18, minute=0, second=0, microsecond=0)
     monkeypatch.setattr(ot, "local_now", lambda tz=None: frozen)
 
     meal_id = _seed_confirmed_meal(client, "4403")
@@ -169,7 +171,8 @@ def test_bare_date_correction_before_boundary_clamps_to_previous_day(client, db,
     db.commit()
 
     import drhiro_api.routers.openclaw_tools as ot
-    frozen = datetime(2026, 10, 12, 1, 0, tzinfo=ZAGREB)
+    # Relative to "now" (see above): the boundary rule, not the calendar, is under test.
+    frozen = datetime.now(ZAGREB).replace(hour=1, minute=0, second=0, microsecond=0)
     monkeypatch.setattr(ot, "local_now", lambda tz=None: frozen)
 
     meal_id = _seed_confirmed_meal(client, "4404")
