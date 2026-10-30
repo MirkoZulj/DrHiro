@@ -102,3 +102,9 @@ apps/android-bridge/**/build/
 # ── OS / editor ───────────────────────────────────────────────────────────
 # ops backups that may embed host material
 bin/home_socks.sh.pre-*
+
+# editor/ops backups
+*.bak
+*.bak-*
+*.orig
+*.rej
