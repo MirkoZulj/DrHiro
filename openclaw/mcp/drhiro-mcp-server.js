@@ -22,6 +22,21 @@ const SERVICE_TOKEN = process.env.DRHIRO_OPENCLAW_SERVICE_TOKEN || "";
 // differs is silently dropped — a confused/manipulated model can never act
 // as a different paired user. When unset, no tools can be called (fail-closed).
 const CONFIGURED_TELEGRAM_ID = process.env.DRHIRO_TELEGRAM_ID || "";
+// Inbound message id shared by the drhiro-msgid plugin (message_received hook).
+// The plugin writes the real Telegram message id of the latest inbound message;
+// we read it here so a meal log always carries a trustworthy idempotency key
+// even when the model omits or guesses telegram_message_id.
+const INBOUND_ID_FILE = process.env.DRHIRO_INBOUND_ID_FILE || "/home/node/.openclaw/tmp/drhiro-msgid.json";
+const INBOUND_ID_TTL_MS = 30 * 60 * 1000;
+function readInboundMessageId() {
+  try {
+    const raw = fs.readFileSync(INBOUND_ID_FILE, "utf8");
+    const j = JSON.parse(raw);
+    if (j && j.id && Number.isFinite(j.at) && Date.now() - j.at < INBOUND_ID_TTL_MS) return String(j.id);
+  } catch (_) {}
+  return null;
+}
+
 
 function tool(name, description, inputSchema, handler) {
   return { name, description, inputSchema, handler };
@@ -43,10 +58,45 @@ const TOOLS = [
     { type: "object", properties: { telegram_id: { type: "string" }, systolic: { type: "integer" }, diastolic: { type: "integer" }, pulse: { type: "integer" }, measured_at: { type: "string" }, context: { type: "string" } },
       required: ["telegram_id", "systolic", "diastolic"] },
     (a) => call("POST", "/tools/create_manual_bp", a, { systolic: a.systolic, diastolic: a.diastolic, pulse: a.pulse, measured_at: a.measured_at, context: a.context })),
-  tool("create_meal_from_text", "Log a meal from a free-text description.",
-    { type: "object", properties: { telegram_id: { type: "string" }, text: { type: "string" }, meal_type: { type: "string" }, eaten_at: { type: "string" } },
+  tool("create_meal_from_text", "Log a meal from a free-text description. The Telegram message id is injected server-side from the current inbound message, so you do NOT need to supply telegram_message_id — any value you pass is ignored and replaced with the real inbound id. The chat id is pinned server-side to the deployment identity. Call this EXACTLY ONCE per user message — after it returns, continue with get_pending_meal and confirm_meal for the returned meal_id, and do NOT call it a second time for the same message. If a response reports duplicate_suppressed, that means this same message was already logged by your earlier call; confirm the meal from your first response and do NOT tell the user it was 'already logged'.",
+    { type: "object", properties: { telegram_id: { type: "string" }, text: { type: "string" }, meal_type: { type: "string" }, eaten_at: { type: "string" }, telegram_message_id: { type: "string", description: "REQUIRED. The Telegram message id of the user message this log came from." } },
       required: ["telegram_id", "text"] },
-    (a) => call("POST", "/tools/create_meal_from_text", a, { text: a.text, meal_type: a.meal_type, eaten_at: a.eaten_at })),
+    (a) => {
+      // Phantom-meal guard: a meal write must carry the originating message id.
+      // The chat id is pinned to the configured identity (never model-supplied);
+      // the message id comes from the model. Together they feed the API
+      // idempotency key, so a forged/repeated message id collides and the
+      // duplicate write is rejected server-side.
+      const inboundId = readInboundMessageId();
+      const messageId = inboundId || a.telegram_message_id;
+      if (!messageId) {
+        throw new Error("create_meal_from_text requires telegram_message_id (the id of the user message this log came from)");
+      }
+      return call("POST", "/tools/create_meal_from_text", a, {
+        text: a.text,
+        meal_type: a.meal_type,
+        eaten_at: a.eaten_at,
+        telegram_chat_id: resolveTelegramId(a.telegram_id),
+        telegram_message_id: String(messageId),
+      });
+    }),
+
+  tool("get_pending_meal", "Get the parsed items of a needs_review meal (status=needs_review) so you can verify each match before confirming. Returns item_id for each item, which you pass to update_meal_item.",
+    { type: "object", properties: { telegram_id: { type: "string" }, meal_id: { type: "string" } }, required: ["telegram_id", "meal_id"] },
+    (a) => call("POST", "/tools/get_pending_meal", a, { meal_id: a.meal_id })),
+  tool("update_meal_item", "Correct ONE item of ANY meal the user owns — a needs_review draft OR a meal that is already confirmed. There is NO status guard: a confirmed meal is patched in place and the parent meal totals are rewritten. Get item_id from get_pending_meal (draft) or list_my_meals (anything already logged), then pass the fields to fix (display_name, grams, unit, quantity, and/or *_per_100g values). The API re-resolves nutrition from the corrected name. Never tell the user a confirmed meal cannot be edited.",
+    { type: "object", properties: { telegram_id: { type: "string" }, meal_id: { type: "string" }, item_id: { type: "string" }, display_name: { type: "string" }, grams: { type: "number" }, unit: { type: "string" }, quantity: { type: "number" } }, required: ["telegram_id", "meal_id", "item_id"] },
+    (a) => call("POST", "/tools/update_meal_item", a, { meal_id: a.meal_id, item_id: a.item_id, patch: { display_name: a.display_name, grams: a.grams, unit: a.unit, quantity: a.quantity } })),
+  tool("confirm_meal", "Confirm a needs_review meal once you have verified (and if needed corrected) all its items. This commits the meal to the log.",
+    { type: "object", properties: { telegram_id: { type: "string" }, meal_id: { type: "string" } }, required: ["telegram_id", "meal_id"] },
+    (a) => call("POST", "/tools/confirm_meal", a, { meal_id: a.meal_id })),
+  tool("list_my_meals", "List the user's meals for one local day (default today), oldest first, with each meal's meal_id and every item's item_id plus grams/kcal. CALL THIS FIRST whenever the user wants to fix, change or delete something they ALREADY logged ('last night's dinner was 250 g not 300 g'). Never ask the user for a meal id and never send them to the dashboard — this tool gives you the ids. Pass date=YYYY-MM-DD for a past day; meal_type filters to one slot.",
+    { type: "object", properties: { telegram_id: { type: "string" }, date: { type: "string", description: "YYYY-MM-DD in the user's timezone; omit for today" }, meal_type: { type: "string" } },
+      required: ["telegram_id"] },
+    (a) => call("POST", "/tools/list_meals", a, { date: a.date, meal_type: a.meal_type })),
+  tool("update_meal", "Correct an EXISTING meal's DAY and/or MEAL TYPE (use when the user says a meal was filed on the wrong day, e.g. \"that was Sunday's dinner\"). Pass eaten_at (YYYY-MM-DD) and/or meal_type; this moves the whole meal. update_meal_item only edits one item's contents. Returns the new day/weekday/local time.",
+    { type: "object", properties: { telegram_id: { type: "string" }, meal_id: { type: "string" }, eaten_at: { type: "string" }, meal_type: { type: "string" } }, required: ["telegram_id", "meal_id"] },
+    (a) => call("POST", "/tools/update_meal", a, { meal_id: a.meal_id, eaten_at: a.eaten_at, meal_type: a.meal_type })),
   tool("list_my_reminders", "List the user's reminders.",
     { type: "object", properties: { telegram_id: { type: "string" } }, required: ["telegram_id"] },
     (a) => call("GET", "/tools/list_my_reminders", a)),
@@ -67,9 +117,33 @@ const TOOLS = [
   tool("issue_web_login_link", "Mint a one-click dashboard login link for the user. Returns {url} the bot should DM to the user — tapping it opens the dashboard already logged in (no code entry).",
     { type: "object", properties: { telegram_id: { type: "string" } }, required: ["telegram_id"] },
     (a) => call("POST", "/tools/issue_web_login_link", a, {})),
-  tool("undo_last_user_action", "Undo the user's last logged action.",
+    tool("undo_last_user_action", "Undo the user's last logged action.",
     { type: "object", properties: { telegram_id: { type: "string" } }, required: ["telegram_id"] },
     (a) => call("POST", "/tools/undo_last_user_action", a, {})),
+  tool("search_food", "Search for foods by name. Returns ranked candidates with nutrition per 100g. Use this to verify and correct food matches before confirming a meal.",
+    { type: "object", properties: { telegram_id: { type: "string" }, query: { type: "string" }, limit: { type: "integer" } }, required: ["telegram_id", "query"] },
+    (a) => call("POST", "/tools/search_food", a, { query: a.query, limit: a.limit || 5 })),
+  tool("set_my_timezone", "Set the user's timezone so all dates, meal days and reminders follow the user's DEVICE clock when they travel. Accepts an IANA name (\"Asia/Tokyo\") or a UTC offset (\"UTC+9\" / \"+09:00\"). Call this when the user says they are somewhere new (e.g. \"I'm in Tokyo now\"). Returns the resulting local date/time.",
+    { type: "object", properties: { telegram_id: { type: "string" }, timezone: { type: "string" } }, required: ["telegram_id", "timezone"] },
+    (a) => call("POST", "/tools/set_my_timezone", a, { timezone: a.timezone })),
+  tool("log_activity", "Log a workout/physical activity the user DID, with calories BURNED (e.g. 'gardening, 850 kcal'). This is the ONLY way to record burned activity energy. NEVER file a workout as a meal — that adds burned kcal to the day's EATEN food total and corrupts the food ledger.",
+    { type: "object", properties: { telegram_id: { type: "string" }, title: { type: "string" }, calories_burned: { type: "number" }, activity_date: { type: "string" }, description: { type: "string" } }, required: ["telegram_id", "title", "calories_burned"] },
+    (a) => call("POST", "/tools/log_activity", a, { title: a.title, calories_burned: a.calories_burned, activity_date: a.activity_date, description: a.description })),
+  tool("list_activities", "List the user's logged activities for a day (default today, user tz), with each id/title/calories_burned and the day's total burned kcal. Pass date=YYYY-MM-DD for another day.",
+    { type: "object", properties: { telegram_id: { type: "string" }, date: { type: "string" } }, required: ["telegram_id"] },
+    (a) => call("POST", "/tools/list_activities", a, { date: a.date })),
+  tool("delete_activity", "Delete a logged activity by activity_id (from list_activities).",
+    { type: "object", properties: { telegram_id: { type: "string" }, activity_id: { type: "string" } }, required: ["telegram_id", "activity_id"] },
+    (a) => call("POST", "/tools/delete_activity", a, { activity_id: a.activity_id })),
+  tool("list_mifitness_archives", "List Mi Fitness export ZIPs staged in the VPS inbox (name, size, mtime) plus whether the .zip_pw password file is present.",
+    { type: "object", properties: { telegram_id: { type: "string" } }, required: ["telegram_id"] },
+    (a) => call("POST", "/tools/list_mifitness_archives", a, {})),
+  tool("import_mifitness_export", "Import a staged Mi Fitness export BY BARE FILENAME from the VPS inbox. DRY RUN FIRST (dry_run=true), show the user the report, then ask before a real import. Gap-filling only: never overwrites existing data. Runs in the background (~3 min) and returns a job_id; poll get_mifitness_import_status. The archive password is read from the sibling .zip_pw file — never send it in chat.",
+    { type: "object", properties: { telegram_id: { type: "string" }, filename: { type: "string" }, dry_run: { type: "boolean" } }, required: ["telegram_id", "filename"] },
+    (a) => call("POST", "/tools/import_mifitness_export", a, { filename: a.filename, dry_run: !!a.dry_run })),
+  tool("get_mifitness_import_status", "Status/report of a Mi Fitness import job. Pass job_id from import_mifitness_export (omit for latest). wait_seconds (0-50) waits for completion in one call.",
+    { type: "object", properties: { telegram_id: { type: "string" }, job_id: { type: "string" }, wait_seconds: { type: "integer" } }, required: ["telegram_id"] },
+    (a) => call("POST", "/tools/get_mifitness_import_status", a, { job_id: a.job_id, wait_seconds: a.wait_seconds || 0 })),
 ];
 
 /**

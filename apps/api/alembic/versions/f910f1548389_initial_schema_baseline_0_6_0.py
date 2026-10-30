@@ -1,8 +1,8 @@
-"""initial canonical schema
+"""initial schema baseline 0.6.0
 
-Revision ID: 3c00321778bc
+Revision ID: f910f1548389
 Revises: 
-Create Date: 2026-08-10 09:56:21.829864
+Create Date: 2026-10-30 19:15:50.721700
 
 """
 from typing import Sequence, Union
@@ -11,8 +11,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision: str = '3c00321778bc'
-down_revision: Union[str, None] = 'b2f3c4d5e6f7'  # food-domain baseline now runs first
+revision: str = 'f910f1548389'
+down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -30,6 +30,30 @@ def upgrade() -> None:
     sa.Column('metadata_json', sa.JSON(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('data_sources',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('source_key', sa.String(length=32), nullable=False),
+    sa.Column('source_label', sa.String(length=255), nullable=False),
+    sa.Column('source_url', sa.String(length=512), nullable=True),
+    sa.Column('source_version', sa.String(length=32), nullable=True),
+    sa.Column('license', sa.String(length=255), nullable=True),
+    sa.Column('description', sa.Text(), nullable=True),
+    sa.Column('is_active', sa.Boolean(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('source_key')
+    )
+    op.create_table('nutrients',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('nutrient_code', sa.String(length=32), nullable=False),
+    sa.Column('nutrient_label', sa.String(length=255), nullable=False),
+    sa.Column('unit', sa.String(length=16), nullable=False),
+    sa.Column('category', sa.String(length=16), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('nutrient_code')
     )
     op.create_table('rule_definitions',
     sa.Column('id', sa.UUID(), nullable=False),
@@ -51,12 +75,26 @@ def upgrade() -> None:
     sa.Column('locale', sa.String(length=16), nullable=False),
     sa.Column('date_of_birth', sa.String(length=10), nullable=True),
     sa.Column('sex_for_health_calculations', sa.String(length=16), nullable=True),
-    sa.Column('height_cm', sa.Float(), nullable=True),
+    sa.Column('height_cm', sa.Double(), nullable=True),
+    sa.Column('basal_metabolism_kcal', sa.Double(), nullable=True),
     sa.Column('status', sa.String(length=20), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('activities',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('user_id', sa.UUID(), nullable=False),
+    sa.Column('activity_date', sa.Date(), nullable=False),
+    sa.Column('title', sa.String(length=255), nullable=False),
+    sa.Column('description', sa.Text(), nullable=True),
+    sa.Column('calories_burned', sa.Double(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_activities_user_id'), 'activities', ['user_id'], unique=False)
     op.create_table('alerts',
     sa.Column('id', sa.UUID(), nullable=False),
     sa.Column('user_id', sa.UUID(), nullable=False),
@@ -87,15 +125,37 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['grantor_user_id'], ['users.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('consumption_operations',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('user_id', sa.UUID(), nullable=False),
+    sa.Column('source', sa.String(length=50), nullable=False),
+    sa.Column('source_chat_id', sa.String(length=100), nullable=False),
+    sa.Column('source_message_id', sa.String(length=100), nullable=False),
+    sa.Column('source_bot_id', sa.String(length=100), nullable=False),
+    sa.Column('idempotency_key', sa.String(length=200), nullable=False),
+    sa.Column('raw_text', sa.Text(), nullable=False),
+    sa.Column('result_json', sa.JSON(), nullable=True),
+    sa.Column('status', sa.String(length=20), nullable=False),
+    sa.Column('payload_hash', sa.String(length=64), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('idempotency_key')
+    )
+    op.create_index('ix_consumption_op_user', 'consumption_operations', ['user_id', 'source'], unique=False)
+    op.create_index('uq_consumption_op_telegram', 'consumption_operations', ['user_id', 'source', 'source_chat_id', 'source_message_id'], unique=True)
     op.create_table('daily_aggregates',
     sa.Column('id', sa.UUID(), nullable=False),
     sa.Column('user_id', sa.UUID(), nullable=False),
     sa.Column('local_date', sa.String(length=10), nullable=False),
     sa.Column('metric_type', sa.String(length=32), nullable=False),
     sa.Column('value_json', sa.JSON(), nullable=False),
-    sa.Column('coverage_score', sa.Float(), nullable=True),
+    sa.Column('coverage_score', sa.Double(), nullable=True),
     sa.Column('source_count', sa.Integer(), nullable=False),
     sa.Column('computed_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('source_provider', sa.String(length=32), nullable=True),
+    sa.Column('source_record_id', sa.String(length=255), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
@@ -129,19 +189,27 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('provider', 'provider_subject', name='uq_external_identity')
     )
-    op.create_table('food_catalog_items',
+    op.create_table('foods',
     sa.Column('id', sa.UUID(), nullable=False),
-    sa.Column('user_id', sa.UUID(), nullable=True),
+    sa.Column('data_source_id', sa.UUID(), nullable=False),
+    sa.Column('external_id', sa.String(length=255), nullable=False),
     sa.Column('display_name', sa.String(length=255), nullable=False),
+    sa.Column('display_name_en', sa.String(length=255), nullable=True),
     sa.Column('barcode', sa.String(length=64), nullable=True),
-    sa.Column('nutrients_per_100g_json', sa.JSON(), nullable=False),
-    sa.Column('source', sa.String(length=32), nullable=False),
-    sa.Column('source_version', sa.String(length=32), nullable=False),
+    sa.Column('category', sa.String(length=64), nullable=True),
+    sa.Column('is_generic', sa.Boolean(), nullable=False),
+    sa.Column('is_liquid', sa.Boolean(), nullable=False),
+    sa.Column('is_default', sa.Boolean(), nullable=True),
+    sa.Column('serving_grams', sa.Double(), nullable=True),
+    sa.Column('serving_unit', sa.String(length=32), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
-    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
-    sa.PrimaryKeyConstraint('id')
+    sa.ForeignKeyConstraint(['data_source_id'], ['data_sources.id'], ),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('data_source_id', 'external_id', name='uq_food_source_external')
     )
+    op.create_index('ix_foods_barcode', 'foods', ['barcode'], unique=False)
+    op.create_index('ix_foods_display_name', 'foods', ['display_name'], unique=False)
     op.create_table('goals',
     sa.Column('id', sa.UUID(), nullable=False),
     sa.Column('user_id', sa.UUID(), nullable=False),
@@ -168,6 +236,20 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('user_id', 'batch_id', name='uq_ingest_batch_user_batch')
     )
+    op.create_table('log_write_fingerprints',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('user_id', sa.UUID(), nullable=False),
+    sa.Column('source', sa.String(length=32), nullable=False),
+    sa.Column('fingerprint', sa.String(length=64), nullable=False),
+    sa.Column('seen_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('result_json', sa.JSON(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index('ix_log_fingerprints_user_seen', 'log_write_fingerprints', ['user_id', 'seen_at'], unique=False)
+    op.create_index('ix_log_fingerprints_user_source_fp', 'log_write_fingerprints', ['user_id', 'source', 'fingerprint'], unique=False)
     op.create_table('meals',
     sa.Column('id', sa.UUID(), nullable=False),
     sa.Column('user_id', sa.UUID(), nullable=False),
@@ -178,7 +260,7 @@ def upgrade() -> None:
     sa.Column('notes', sa.Text(), nullable=True),
     sa.Column('photo_asset_id', sa.String(length=255), nullable=True),
     sa.Column('totals_json', sa.JSON(), nullable=True),
-    sa.Column('confidence', sa.Float(), nullable=True),
+    sa.Column('confidence', sa.Double(), nullable=True),
     sa.Column('confirmed_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
@@ -197,7 +279,7 @@ def upgrade() -> None:
     sa.Column('source_record_id', sa.String(length=255), nullable=False),
     sa.Column('source_device_id', sa.String(length=255), nullable=True),
     sa.Column('recording_method', sa.String(length=32), nullable=False),
-    sa.Column('confidence', sa.Float(), nullable=True),
+    sa.Column('confidence', sa.Double(), nullable=True),
     sa.Column('metadata_json', sa.JSON(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
@@ -221,17 +303,84 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('food_brands',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('food_id', sa.UUID(), nullable=False),
+    sa.Column('brand_name', sa.String(length=255), nullable=True),
+    sa.Column('brand_owner', sa.String(length=255), nullable=True),
+    sa.Column('packaging_text', sa.Text(), nullable=True),
+    sa.Column('origin_country', sa.String(length=64), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['food_id'], ['foods.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('food_catalog_items',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('user_id', sa.UUID(), nullable=True),
+    sa.Column('food_id', sa.UUID(), nullable=True),
+    sa.Column('display_name', sa.String(length=255), nullable=False),
+    sa.Column('barcode', sa.String(length=64), nullable=True),
+    sa.Column('nutrients_per_100g_json', sa.JSON(), nullable=False),
+    sa.Column('source', sa.String(length=32), nullable=False),
+    sa.Column('source_version', sa.String(length=32), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['food_id'], ['foods.id'], ),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('food_ingredients',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('food_id', sa.UUID(), nullable=False),
+    sa.Column('ingredient_text', sa.Text(), nullable=False),
+    sa.Column('ingredient_order', sa.Integer(), nullable=False),
+    sa.Column('is_allergen', sa.Boolean(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['food_id'], ['foods.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('food_nutrients',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('food_id', sa.UUID(), nullable=False),
+    sa.Column('nutrient_id', sa.UUID(), nullable=False),
+    sa.Column('amount_per_100g', sa.Double(), nullable=True),
+    sa.Column('amount_per_serving', sa.Double(), nullable=True),
+    sa.ForeignKeyConstraint(['food_id'], ['foods.id'], ),
+    sa.ForeignKeyConstraint(['nutrient_id'], ['nutrients.id'], ),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('food_id', 'nutrient_id', name='uq_food_nutrient')
+    )
+    op.create_index('ix_food_nutrients_nutrient', 'food_nutrients', ['nutrient_id'], unique=False)
+    op.create_table('food_resolution_rules',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('user_id', sa.UUID(), nullable=False),
+    sa.Column('original_pattern', sa.Text(), nullable=False),
+    sa.Column('resolved_food_id', sa.UUID(), nullable=True),
+    sa.Column('rule_text', sa.Text(), nullable=True),
+    sa.Column('scope', sa.String(length=16), nullable=False),
+    sa.Column('active', sa.Boolean(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint("scope IN ('user', 'global')", name='ck_food_rules_scope'),
+    sa.ForeignKeyConstraint(['resolved_food_id'], ['foods.id'], ),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index('ix_food_rules_user', 'food_resolution_rules', ['user_id', 'active'], unique=False)
     op.create_table('meal_items',
     sa.Column('id', sa.UUID(), nullable=False),
     sa.Column('meal_id', sa.UUID(), nullable=False),
     sa.Column('food_catalog_item_id', sa.String(length=255), nullable=True),
     sa.Column('display_name', sa.String(length=255), nullable=False),
-    sa.Column('quantity', sa.Float(), nullable=False),
+    sa.Column('quantity', sa.Double(), nullable=False),
     sa.Column('unit', sa.String(length=32), nullable=True),
-    sa.Column('grams', sa.Float(), nullable=True),
+    sa.Column('grams', sa.Double(), nullable=True),
+    sa.Column('volume_ml', sa.Double(), nullable=True),
+    sa.Column('beverage_category', sa.String(length=32), nullable=True),
     sa.Column('nutrients_json', sa.JSON(), nullable=True),
     sa.Column('source', sa.String(length=32), nullable=False),
-    sa.Column('confidence', sa.Float(), nullable=True),
+    sa.Column('confidence', sa.Double(), nullable=True),
     sa.Column('user_corrected', sa.Boolean(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
@@ -259,19 +408,38 @@ def downgrade() -> None:
     op.drop_index('ix_occurrences_status_due', table_name='reminder_occurrences')
     op.drop_table('reminder_occurrences')
     op.drop_table('meal_items')
+    op.drop_index('ix_food_rules_user', table_name='food_resolution_rules')
+    op.drop_table('food_resolution_rules')
+    op.drop_index('ix_food_nutrients_nutrient', table_name='food_nutrients')
+    op.drop_table('food_nutrients')
+    op.drop_table('food_ingredients')
+    op.drop_table('food_catalog_items')
+    op.drop_table('food_brands')
     op.drop_table('reminders')
     op.drop_index('ix_measurements_user_metric_time', table_name='measurements')
     op.drop_table('measurements')
     op.drop_table('meals')
+    op.drop_index('ix_log_fingerprints_user_source_fp', table_name='log_write_fingerprints')
+    op.drop_index('ix_log_fingerprints_user_seen', table_name='log_write_fingerprints')
+    op.drop_table('log_write_fingerprints')
     op.drop_table('ingest_batches')
     op.drop_table('goals')
-    op.drop_table('food_catalog_items')
+    op.drop_index('ix_foods_display_name', table_name='foods')
+    op.drop_index('ix_foods_barcode', table_name='foods')
+    op.drop_table('foods')
     op.drop_table('external_identities')
     op.drop_table('device_connections')
     op.drop_table('daily_aggregates')
+    op.drop_index('uq_consumption_op_telegram', table_name='consumption_operations')
+    op.drop_index('ix_consumption_op_user', table_name='consumption_operations')
+    op.drop_table('consumption_operations')
     op.drop_table('consent_grants')
     op.drop_table('alerts')
+    op.drop_index(op.f('ix_activities_user_id'), table_name='activities')
+    op.drop_table('activities')
     op.drop_table('users')
     op.drop_table('rule_definitions')
+    op.drop_table('nutrients')
+    op.drop_table('data_sources')
     op.drop_table('audit_events')
     # ### end Alembic commands ###

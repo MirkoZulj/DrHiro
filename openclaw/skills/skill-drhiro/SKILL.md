@@ -38,22 +38,28 @@ exec drhiro_api.sh <telegram_id> <METHOD> <path> [json-body]
 
 Examples:
 ```
-exec drhiro_api.sh 123456789 GET  /tools/get_my_today_summary
-exec drhiro_api.sh 123456789 POST /tools/create_manual_weight '{"value": 82.4}'
-exec drhiro_api.sh 123456789 POST /tools/create_manual_bp '{"systolic":128,"diastolic":78,"pulse":64,"measured_at":"2026-08-10T08:00:00Z"}'
-exec drhiro_api.sh 123456789 POST /tools/create_meal_from_text '{"text":"2 eggs, toast","meal_type":"breakfast"}'
-exec drhiro_api.sh 123456789 POST /tools/get_pending_meal '{"meal_id":"..."}'
-exec drhiro_api.sh 123456789 POST /tools/search_food '{"query":"cheese","limit":5}'
-exec drhiro_api.sh 123456789 POST /tools/update_meal_item '{"meal_id":"...","item_id":"...","patch":{"display_name":"Cheese, cheddar"}}'
-exec drhiro_api.sh 123456789 POST /tools/confirm_meal '{"meal_id":"..."}'
-exec drhiro_api.sh 123456789 POST /tools/issue_device_code '{}'
-exec drhiro_api.sh 123456789 POST /tools/undo_last_user_action '{}'
-exec drhiro_api.sh 123456789 GET  /tools/list_my_reminders
-exec drhiro_api.sh 123456789 POST /tools/create_reminder '{"type":"bp","schedule_json":{"days":["mon"],"time":"08:00"},"timezone":"Europe/Zagreb"}'
-exec drhiro_api.sh 123456789 POST /tools/snooze_reminder '{"occurrence_id":"...","duration_minutes":15}'
-exec drhiro_api.sh 123456789 POST /tools/set_user_goal '{"goal_type":"steps","target_json":{"daily_steps":8000},"period":"30d"}'
-exec drhiro_api.sh 123456789 GET  /tools/get_my_active_alerts
-exec drhiro_api.sh 123456789 POST /tools/acknowledge_alert '{"alert_id":"..."}'
+exec drhiro_api.sh 984523234 GET  /tools/get_my_today_summary
+exec drhiro_api.sh 984523234 POST /tools/create_manual_weight '{"value": 82.4}'
+exec drhiro_api.sh 984523234 POST /tools/create_manual_bp '{"systolic":128,"diastolic":78,"pulse":64,"measured_at":"2026-08-10T08:00:00Z"}'
+# Meal logging: use the create_meal_from_text MCP tool (drhiro__create_meal_from_text), NOT this exec helper.
+# The MCP server injects the real inbound Telegram message id automatically; any id you pass is ignored.
+exec drhiro_api.sh 984523234 POST /tools/get_pending_meal '{"meal_id":"..."}'
+exec drhiro_api.sh 984523234 POST /tools/search_food '{"query":"cheese","limit":5}'
+exec drhiro_api.sh 984523234 POST /tools/update_meal_item '{"meal_id":"...","item_id":"...","patch":{"display_name":"Cheese, cheddar"}}'
+exec drhiro_api.sh 984523234 POST /tools/confirm_meal '{"meal_id":"..."}'
+exec drhiro_api.sh 984523234 POST /tools/update_meal '{"meal_id":"...","eaten_at":"2026-10-04","meal_type":"dinner"}'
+exec drhiro_api.sh 984523234 POST /tools/set_my_timezone '{"timezone":"Asia/Tokyo"}'
+exec drhiro_api.sh 984523234 POST /tools/log_activity '{"title":"Gardening","calories_burned":850,"activity_date":"2026-10-04"}'
+exec drhiro_api.sh 984523234 POST /tools/list_activities '{"date":"2026-10-04"}'
+exec drhiro_api.sh 984523234 POST /tools/delete_activity '{"activity_id":"..."}'
+exec drhiro_api.sh 984523234 POST /tools/issue_device_code '{}'
+exec drhiro_api.sh 984523234 POST /tools/undo_last_user_action '{}'
+exec drhiro_api.sh 984523234 GET  /tools/list_my_reminders
+exec drhiro_api.sh 984523234 POST /tools/create_reminder '{"type":"bp","schedule_json":{"days":["mon"],"time":"08:00"},"timezone":"Europe/Zagreb"}'
+exec drhiro_api.sh 984523234 POST /tools/snooze_reminder '{"occurrence_id":"...","duration_minutes":15}'
+exec drhiro_api.sh 984523234 POST /tools/set_user_goal '{"goal_type":"steps","target_json":{"daily_steps":8000},"period":"30d"}'
+exec drhiro_api.sh 984523234 GET  /tools/get_my_active_alerts
+exec drhiro_api.sh 984523234 POST /tools/acknowledge_alert '{"alert_id":"..."}'
 ```
 
 Tool list:
@@ -71,6 +77,11 @@ Tool list:
 | issue_web_login_link | POST | /tools/issue_web_login_link |
 | update_meal_item | POST | /tools/update_meal_item |
 | confirm_meal | POST | /tools/confirm_meal |
+| update_meal | POST | /tools/update_meal |
+| set_my_timezone | POST | /tools/set_my_timezone |
+| log_activity | POST | /tools/log_activity |
+| list_activities | POST | /tools/list_activities |
+| delete_activity | POST | /tools/delete_activity |
 | undo_last_user_action | POST | /tools/undo_last_user_action |
 | list_my_reminders | GET | /tools/list_my_reminders |
 | create_reminder | POST | /tools/create_reminder |
@@ -79,9 +90,80 @@ Tool list:
 | get_my_active_alerts | GET | /tools/get_my_active_alerts |
 | acknowledge_alert | POST | /tools/acknowledge_alert |
 | search_food | POST | /tools/search_food |
+| list_mifitness_archives | POST | /tools/list_mifitness_archives |
+| import_mifitness_export | POST | /tools/import_mifitness_export |
+| get_mifitness_import_status | POST | /tools/get_mifitness_import_status |
 
 The script is `chmod +x`. If `exec` is unavailable, fall back to the
 equivalent curl command with the two headers.
+
+## Confirm EVERY log — and keep the clock on the user's DEVICE (non-negotiable)
+
+### The device clock, not yours
+- You run in UTC. NEVER quote your own clock, and NEVER compute a date or
+  weekday yourself. Every payload that involves a meal or "today" carries the
+  user's own clock: `timezone`, `local_date`, `local_time`, `utc_offset`,
+  `nutrition_date` (the day a meal belongs to) and `day_start_hour`.
+  `get_my_today_summary`, `create_meal_from_text`, `get_pending_meal`,
+  `confirm_meal` and `update_meal` all return them. Quote THOSE values.
+- The user travels. When he says he is somewhere new ("I'm in Tokyo", "we
+  landed in New York", "it's UTC+9 here"), call `set_my_timezone` with an IANA
+  name (`Asia/Tokyo`) or a UTC offset (`UTC+9`, `+09:00`) BEFORE logging
+  anything else. It returns his new local date/time — confirm it back to him.
+  Do not keep dating meals in his old zone.
+
+### Always confirm a logged meal in this shape
+After `confirm_meal` succeeds — or for a draft you are about to confirm — reply
+using the meal's OWN payload fields, never invented values:
+1. the day and weekday it was filed under — `<weekday>, <local_date>`
+   (`nutrition_date` is the boundary-shifted day; use `weekday`/`local_date`
+   for the human sentence);
+2. the meal type (`meal_type`);
+3. the LOCAL time used (`local_time`, plus `timezone`/`utc_offset`);
+4. each item with its quantity/unit and `kcal`;
+5. the meal total (`total_kcal`, or `totals.kcal`).
+Then offer the one-line correction: "say 'that was Sunday's dinner' and I'll
+move it."
+
+Example shape (fill from the tool payload — do not fabricate):
+"For Monday dinner I logged: rice 200 g (260 kcal), chicken breast 150 g
+(198 kcal), salad 100 g (35 kcal) — 493 kcal total, at 19:42 (Europe/Zagreb).
+If that was a different day or meal, say 'that was Sunday's dinner' and I'll
+move it."
+
+### Changing something ALREADY logged (any day) — look it up, never ask for an id
+
+When the user corrects a meal that is already confirmed ("last night's dinner was
+250 g of bread, not 300"), the ids you need are not in your context. Fetch them:
+
+1. `list_my_meals` with `date` (`YYYY-MM-DD`, HIS timezone; omit for today) and
+   optionally `meal_type`. It returns every meal that day with `meal_id`,
+   `status`, `meal_type`, `weekday`, `local_time`, `total_kcal`, and each item's
+   `item_id`, `display_name`, `grams`, `kcal`.
+2. Pick the meal and the item that match what he described (slot + food name).
+3. `update_meal_item` with that `meal_id` / `item_id` and the fields to change
+   (`grams`, `quantity`, `unit`, `display_name`, or `*_per_100g`). There is NO
+   status guard — a confirmed meal is patched in place and the parent meal's
+   totals are rewritten. Do not re-log it, do not undo-and-recreate it.
+4. Report the result in plain prose from the payload the tool returned.
+
+Hard rules:
+- NEVER ask the user for a meal id or an item id, and NEVER mint a dashboard link
+  so he can read one out to you. You have `list_my_meals`; use it.
+- NEVER say a confirmed meal cannot be edited, must be re-logged, or is
+  read-only. It is editable; `update_meal_item` proves it.
+- If the day he means returns nothing, check the neighbouring day before asking
+  him anything — a late-night meal belongs to its nutritional day, not the
+  calendar day he is thinking of.
+
+### Correcting a meal's day or meal type
+`update_meal_item` edits one ITEM's contents. To move the WHOLE meal to another
+day and/or slot, call `update_meal` with `meal_id` and `eaten_at`
+(`YYYY-MM-DD` — the original local time-of-day is kept) and/or `meal_type`. It
+is scoped to the user's own meal, audited, and refuses a date more than ~7 days
+away. Report the new `weekday`/`local_date`/`meal_type`/`local_time` from its
+response. If the user's correction is further out than 7 days, ask him to
+confirm the date instead of retrying.
 
 ## Food-Logging Flow (CRITICAL — agent verifies with online lookup)
 
@@ -109,7 +191,50 @@ Parser returns: "Chicken fat, raw" (WRONG)
 You call: `search_food("chicken")` → returns "Chicken, breast, boneless, skinless, raw"
 You call: `update_meal_item(patch: {"display_name": "Chicken, breast, boneless, skinless, raw", "external_id": "..."})`
 
+### BREAKING A RE-RESOLUTION LOOP (non-negotiable)
+
+**If re-pointing via `display_name` / `external_id` keeps landing on the SAME
+WRONG food** (or any wrong food), do NOT keep re-pointing and do NOT tell the
+user "the API won't let me override". The API ALWAYS lets you override — you
+just aren't using the right field.
+
+When the catalog keeps re-resolving to the wrong entry (the classic case is a
+short name like "cheese" matching "Croissants, cheese", or "cottage cheese"
+resolving to a croissant), switch to the **numeric per-100g override** and
+force the correct values directly:
+
+```
+exec drhiro_api.sh <telegram_id> POST /tools/update_meal_item \
+  '{"meal_id": "...", "item_id": "...",
+    "patch": {
+      "display_name": "Cottage cheese, lowfat (uncorrected by catalog)",
+      "grams": 200,
+      "kcal_per_100g": 100,
+      "protein_per_100g": 12
+    }}'
+```
+
+The `*_per_100g` fields write `nutrients_json` DIRECTLY and **skip catalog
+resolution entirely** — the wrong food literally cannot come back. The server
+scales every per-100g value by the item's `grams`/100, so pass the grams too.
+There is no status guard: this patches a confirmed meal in place. If a
+contradiction with the item's catalog name worries you, keep the user's
+`display_name` and put the correct numbers in `*_per_100g`.
+
+**Never claim "the API won't let me override" until you have actually passed
+a `*_per_100g` value and seen it rejected.** The override path is the
+escape hatch whenever resolution misfires OR the user gave exact numbers.
+
+
 ### Drinks / Liquids — handled differently from food (MANDATORY branch)
+
+## Stop After Two Attempts (non-negotiable)
+
+When correcting a meal item via `update_meal_item`, stop after TWO attempts
+per item. If the item is still unresolved or mis-matched after two
+corrections, PAUSE and ask the user for the item's calories or a known
+generic name. Do NOT keep retrying name variants or re-pointing at catalog
+foods — the item stays as-is and the user must provide the missing data.
 
 The parser classifies drinks by **`kind`**. The `kind` field decides everything.
 Follow it exactly; never search_food a drink as if it were food.
@@ -150,7 +275,22 @@ them; the server scales per-100g by the item's logged grams.
 
 
 
-`search_food` now cascades: **local food DB -> USDA FoodData Central online -> DuckDuckGo web search**. When the local DB and USDA have no match, it searches the internet, and if it finds nutrition it SAVES the food into the local database so the next lookup resolves it locally (candidates carry `source` = local/usda-online/duckduckgo). when the local food database has no good match (returns candidates with `source: "usda-online"` and `online_lookup: true`). This is how you find correct values (e.g. pancetta, which is not in the local DB). When an item is missing locally or the parser match is wrong, search online and use the USDA candidate, or ask the user which option to pick if several fit.
+`search_food` now cascades: **local food DB -> USDA FoodData Central online -> DuckDuckGo web search**, and **every candidate is verified by Jev** (the `skill-jev` decision model) before it is used:
+
+- The item's name is translated to **English first** — Jev is English-first and does not know Croatian words (`kava` vs `Coffee` scores 0.01).
+- Score **>= 0.88** -> accepted automatically and logged.
+- Score **0.5 - 0.88** -> **not** auto-accepted. The item comes back with `needs_confirmation: true` and a `candidates` list. **Ask the user a multiple-choice question** naming those options, let them choose, then apply the chosen candidate with `update_meal_item`.
+- Score **< 0.5** -> rejected; the cascade moves to the next source.
+- Nothing above 0.5 -> the item is unresolved. **Ask the user** rather than guessing.
+- Online values additionally pass an **LLM plausibility check**, because Jev judges names only — it cannot tell dry coffee (310 kcal/100 g) from brewed (2 kcal/100 g).
+
+You may call Jev yourself to double-check any candidate (translate to English first):
+
+```
+exec {baseDir}/../skill-jev/scripts/jev_verify.sh "<raw input in English>" "<candidate name>"
+```
+
+It prints `{"score":0.98,"accept":true,"threshold":0.88,...}`. `accept:null` means Jev was unreachable — treat that as *unverified*, never as a rejection.
 
 ### NO 0-KCAL CONFIRMS (non-negotiable)
 
@@ -194,9 +334,79 @@ confirming.
 
 ### Date Handling
 
-`create_meal_from_text` resolves "yesterday" / "on Monday" in the user's
-timezone. The returned `eaten_at` is what will be logged — confirm it
-matches the user's intent if they specified a date.
+`create_meal_from_text` resolves relative dates ("yesterday", "last night",
+"on Monday", "this morning", "2 days ago") in the user's timezone, SERVER-SIDE.
+NEVER do date arithmetic yourself and NEVER strip the user's date words out of
+the `text` argument: pass the user's own words through. "For dinner last night I
+had 4 beers" must be sent as text="dinner last night, 4 beers", not as
+text="4 beers". Dropping the date words records a meal eaten last night as
+happening this morning. The returned `eaten_at` is what was logged — check it
+against the user's words and correct it if they disagree.
+
+### Nutrition day boundary (which day a meal belongs to)
+
+A nutrition day does NOT start at local midnight — it starts with the day's
+first meal (breakfast). A meal eaten just after midnight (e.g. 00:01) is the
+PREVIOUS day's dinner/snack, not the start of a new day.
+
+- `get_my_today_summary` reports the day explicitly: use its `nutrition_date`
+  (an ISO date) as the day a meal belongs to. Report totals for that date.
+- NEVER derive the day from the container clock: the gateway runs in UTC, so
+  between local midnight and ~02:00 (UTC+2) its clock is still on the previous
+  UTC day and will disagree with the user's local day. Trust `nutrition_date`.
+- Do NOT sum a day's calories yourself across midnight: a meal logged after
+  00:00 local belongs to the previous `nutrition_date`, and only the tool's
+  `calories_kcal_today` / `meals_logged_today` numbers are boundary-aware.
+  When the user asks "how many calories today", call `get_my_today_summary`
+  and quote `calories_kcal_today` and `nutrition_date` verbatim.
+- ANY day total you quote — "today so far", "this week", per-meal roll-ups
+  you add yourself — MUST come from `get_my_today_summary`'s
+  `calories_kcal_today` together with its `nutrition_date`, quoted
+  verbatim. A SELF-COMPUTED total (adding per-meal `total_kcal` values
+  yourself) is FORBIDDEN: it is boundary-blind, includes
+  `needs_review` drafts the tile excludes, and has produced a number that
+  disagreed with the user's dashboard. Never say "today so far: ~X kcal"
+  from your own arithmetic — quote the tool's two fields or say nothing.
+- The boundary hour is `day_start_hour` in the payload (default 4 = local
+  times before 04:00 count as the previous day). Do not hard-code it.
+
+## Activities — burned calories go in the ACTIVITY ledger, NEVER the meal ledger (non-negotiable)
+
+When the user reports a workout or any physical activity they DID (gardening,
+running, gym, a long walk, football…), log it with **`log_activity`** — the ONLY
+correct tool for burned energy:
+
+```
+exec drhiro_api.sh <telegram_id> POST /tools/log_activity \
+  '{"title":"Gardening","calories_burned":850,"activity_date":"2026-10-04"}'
+```
+
+- `title` (required): a short label for what they did.
+- `calories_burned` (required): the BURNED kcal they told you (>= 0).
+- `activity_date` (optional, `YYYY-MM-DD`): omit to log on the user's current
+  nutrition day. Pass a date for "yesterday" / a named day — resolve it from the
+  user's words, never from your own UTC clock.
+- `description` (optional): any extra detail.
+
+The response returns `id`, `date`, `title`, `calories_burned` and
+`activity_kcal_today` (the day's total BURNED kcal). Confirm back to the user
+using THOSE values.
+
+**NEVER file a workout as a meal.** Do not call `create_meal_from_text` with
+activity text, and never pass `meal_type="activity"` or any marker to smuggle
+activity into the meal ledger. That workaround put BURNED calories into the day's
+EATEN total — 850 kcal of gardening was counted as food eaten — and silently lost
+real logs. Activity kcal and food kcal are different ledgers; mixing them
+corrupts every food total. If you ever catch yourself about to log an activity
+any way other than `log_activity`, stop.
+
+- **List / confirm the day's activities:** `list_activities` with `{"date":"YYYY-MM-DD"}`
+  (omit `date` for today). Returns each activity and the day's `total_burned`.
+- **Remove a mis-logged activity:** `delete_activity` with `{"activity_id":"..."}`
+  (the id from `list_activities` or `log_activity`). Never delete an activity by
+  logging a compensating meal.
+- `undo_last_user_action` also undoes a logged activity (the most recent of
+  measurement/activity/meal).
 
 ## File imports (OMRON CSV)
 
@@ -214,6 +424,44 @@ attachment, import it:
 
 Never claim readings were imported unless the script output shows
 `accepted > 0`.
+
+## Mi Fitness export import (VPS inbox — large files)
+
+A Telegram bot cannot download a file larger than 20 MB and a real Mi Fitness
+manual export is ~23 MB, so the user drops the ZIP into the VPS inbox by hand
+and asks you to import it BY NAME. NEVER ask the user to send the ZIP as a
+Telegram attachment, and NEVER ask for the archive password in chat.
+
+The flow (follow it in order):
+
+1. **LIST.** Call `list_mifitness_archives`. It shows each staged archive
+   (name, size, mtime) and whether the `.zip_pw` password file is present.
+   Show the user the names and use the one they name.
+2. **DRY RUN FIRST.** Call `import_mifitness_export` with `filename` (bare
+   name) and `dry_run: true`. It starts a background job (~1-3 min) and
+   returns a `job_id` immediately.
+3. **POLL.** Call `get_mifitness_import_status` with that `job_id` (pass
+   `wait_seconds: 45` to wait inside one call) until `status` is `done` or
+   `error`.
+4. **REPORT.** Show the user the summary — inserted, duplicates, skipped, day
+   range, errors, elapsed — and say plainly the dry run wrote NOTHING.
+5. **ASK.** Only after the user confirms, call `import_mifitness_export` with
+   `dry_run: false`, poll again, and report the real result.
+
+Rules:
+
+- The archive password is read SERVER-SIDE from the sibling `.zip_pw` file
+  (mode 600) in the inbox. It is never a tool argument. Never request it,
+  never accept it, never mention its value, and never repeat it in a reply.
+  If a tool reports the password file is missing, tell the user to place it in
+  the inbox `.zip_pw` file — do NOT ask for it in chat.
+- `filename` is a BARE name: no folder, no `/`, no `..`. Paths are rejected.
+- The import is gap-filling and idempotent: it NEVER overwrites a day another
+  source (e.g. Health Connect) already owns, and re-importing the same archive
+  inserts 0 new rows (every row comes back as a duplicate). Say this when the
+  user worries about "overrunning existing data".
+- It runs as a background job because the gateway's MCP request timeout
+  (60 s) is shorter than the run.
 
 ## Device linking (Android bridge)
 
@@ -295,6 +543,21 @@ member's data without an active consent grant.
    response confirms it.** If you have no tool for an action (e.g. setting
    a reminder), say you cannot do it yet — do NOT tell the user it is done
    and let the next day prove you wrong.
+10. **Activities are logged ONLY with `log_activity`.** NEVER file a workout,
+    exercise or burned-calorie entry as a meal item (`create_meal_from_text`,
+    `meal_type="activity"`, or any marker). Burned kcal belong in the activity
+    ledger; putting them in the meal ledger corrupts the food totals and loses
+    logs. If you lack a tool for something, say so — never improvise a
+    workaround that writes into the wrong ledger.
+11. **Log each meal with `create_meal_from_text` EXACTLY ONCE per user
+    message.** After it returns, proceed only with `get_pending_meal` →
+    (verify/correct) → `confirm_meal` for that `meal_id`. NEVER call
+    `create_meal_from_text` a second time for the same message. If a
+    response's `duplicate_suppressed` is true, that means you (the agent)
+    already logged this same message in this turn — do NOT tell the user it
+    was 'already logged'; confirm the meal from your first successful
+    response. The MCP tool injects the inbound message id automatically —
+    never invent or pass a telegram_message_id.
 
 ## Escalation Template (urgent)
 

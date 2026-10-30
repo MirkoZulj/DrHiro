@@ -25,9 +25,8 @@ from sqlalchemy.orm import Session
 
 from drhiro_api.db import get_db
 from drhiro_api.deps import get_current_user
-from drhiro_api.models import Activity, BeverageMeasurement, Measurement, User
+from drhiro_api.models import Activity, Measurement, User
 from drhiro_api.security import audit
-from drhiro_api.services.consumption import update_measurement_value, delete_measurement
 
 router = APIRouter(prefix="/data-points", tags=["data-points"])
 
@@ -179,34 +178,8 @@ def update_data_point(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Edit a measurement (its value payload, timestamp, or unit).
-
-    For beverage measurements (linked via BeverageMeasurement), delegates to
-    ``consumption.update_measurement_value`` so all projections (MealItem,
-    Meal.totals) are updated atomically.
-    """
+    """Edit a measurement (its value payload, timestamp, or unit)."""
     m = _get_measurement(db, user, mid)
-
-    # Check if this measurement is a beverage — if so, delegate to domain
-    # so the linked MealItem + Meal.totals are kept consistent atomically.
-    bev = db.query(BeverageMeasurement).filter(
-        BeverageMeasurement.measurement_id == m.id,
-        BeverageMeasurement.user_id == user.id,
-    ).first()
-
-    if bev and (req.value is not None or req.unit is not None):
-        # Domain handles value + unit change for beverages, plus all projections
-        result = update_measurement_value(db, user.id, mid, req.value if req.value is not None else m.value_json)
-        if not result["ok"]:
-            raise HTTPException(status_code=404, detail="Measurement not found.")
-        audit(db, "user", str(user.id), user.id, "data_point.update", "measurement", str(m.id))
-        if req.measured_at is not None:
-            m.start_at = req.measured_at
-            m.end_at = req.measured_at
-        db.commit()
-        return SimpleResult(ok=True, id=str(m.id), message="Measurement updated.")
-
-    # Non-beverage path (unchanged)
     if req.value is not None:
         m.value_json = req.value
     if req.measured_at is not None:
@@ -225,27 +198,8 @@ def delete_data_point(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Delete a measurement.
-
-    For beverage measurements (linked via BeverageMeasurement), delegates to
-    ``consumption.delete_measurement`` so the linked MealItem and
-    Meal.totals are updated atomically (no orphan, no stale totals).
-    """
+    """Delete a measurement."""
     m = _get_measurement(db, user, mid)
-
-    # Check if beverage
-    bev = db.query(BeverageMeasurement).filter(
-        BeverageMeasurement.measurement_id == m.id,
-        BeverageMeasurement.user_id == user.id,
-    ).first()
-
-    if bev:
-        result = delete_measurement(db, user.id, mid)
-        if not result["ok"]:
-            raise HTTPException(status_code=404, detail="Measurement not found.")
-        audit(db, "user", str(user.id), user.id, "data_point.delete", "measurement", str(m.id))
-        return SimpleResult(ok=True, id=str(m.id), message="Measurement deleted.")
-
     db.delete(m)
     audit(db, "user", str(user.id), user.id, "data_point.delete", "measurement", str(m.id))
     db.commit()

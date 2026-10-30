@@ -11,38 +11,79 @@ arbitrary row in physical table order. Searching "egg" could return
 (143 kcal) -- silently, with no error, because the wrong food resolved
 "successfully". A wrong number is indistinguishable from a right one
 downstream, which makes this the worst kind of failure.
+
+2026-10-04 (proper resolution fix). Three problems were fixed together:
+
+1. **Catalogue completeness** -- done outside this module by
+   `scripts/import_generic_staples.py`; the ranker cannot pick a row that does
+   not exist.
+2. **Match-quality gate** -- a local match is only trustworthy when the query
+   is a *head* match for the name (its tokens are the name's leading tokens,
+   plural-tolerant) and the name carries no unrequested preparation qualifier.
+   `_is_weak_head_match()` is the shared predicate. This is what stops
+   `banana` -> `Pepper, banana, raw` and `bacon` -> `Bacon, meatless`.
+3. **Total, deterministic order** -- ties fall through to `external_id`, `id`
+   so the SAME query can never resolve to a different food after a
+   VACUUM/UPDATE (the bug that let a brand's zero-calorie "cola" win a day).
+
+Ranking is still computed in Python, but only over the rows already filtered
+by `display_name ILIKE '%query%'` (bounded), because plural folding and
+leading-token set tests are not expressible as a stable SQL ORDER BY.
+
+2026-10-04 (0.1.19 defaults fix). A bare generic word must resolve to the
+PLAIN default, not an arbitrary variant:
+
+1. **Variant-marker penalty** -- a name carrying a marker the query did not ask
+   for ("light", "nonfat", "lean", ...) loses to a name without one.
+2. **Curated `foods.is_default` layer** -- ranking alone cannot know which
+   variant is "plain" (nothing in "beer, light" vs "beer, regular, all" says
+   which a user means by "beer"), so the choice is recorded as data and
+   preferred ahead of the variant/token tie-breaks, behind an exact-name match.
+3. **Honest ambiguity** -- a curated default suppresses the hint outright (the
+   top match IS the answer). Otherwise the top two candidates are compared: a
+   >25% energy gap is reported ambiguous so the bot asks instead of guessing;
+   rows with matching energy (tap vs bottled water) stay non-ambiguous.
+4. **NBSP normalisation** -- non-breaking spaces are folded to plain spaces in
+   names and queries so a raw string comparison against a typed name holds.
 """
 
 from __future__ import annotations
 
 import logging
-
-from dataclasses import dataclass, field
-
-from sqlalchemy import and_, case, func, literal, or_
-from sqlalchemy.orm import Session, selectinload
-
-from drhiro_api.models import Food, FoodResolutionRule
+import re
 
 log = logging.getLogger(__name__)
 
+from dataclasses import dataclass, field
+
+from sqlalchemy import and_, func, or_
+from sqlalchemy.orm import Session, selectinload
+
+from drhiro_api.models import DataSource, Food, FoodResolutionRule
+
 # Ranking tiers, lower sorts first.
 TIER_EXACT = 0      # display_name == query (case-insensitive)
-TIER_PREFIX = 1     # display_name starts with query AT A WORD BOUNDARY
+TIER_PREFIX = 1     # name's LEADING tokens are the query (plural-tolerant)
 TIER_WORD = 2       # query appears as a whole word anywhere
 TIER_SUBSTRING = 3  # query appears anywhere, including mid-word ("egg" in "Eggplant")
-
-# Two candidates in the same tier whose name lengths differ by no more than
-# this many characters are treated as genuinely ambiguous: the tie-breakers
-# cannot meaningfully separate them, so we refuse to silently pick a winner.
-AMBIGUITY_LENGTH_DELTA = 4
 
 # Preparation qualifiers that make a row a less likely answer to a bare
 # ingredient name. Someone typing "egg" means a fresh egg, not dried egg
 # powder or frozen pasteurised egg product. These are demoted within their
 # tier, below unqualified rows, but never excluded -- an explicit search for
 # "Egg, white, dried" must still find it (and will, via the exact-match tier).
-PREPARATION_QUALIFIERS = ("dried", "frozen", "pasteurized", "canned", "powder", "dehydrated")
+PREPARATION_QUALIFIERS = (
+    "dried", "frozen", "pasteurized", "canned", "powder", "dehydrated",
+    # Extended 2026-10-04: qualifiers that must not answer a bare generic word.
+    # "bacon" must not return "Bacon, meatless"; "water" must not return
+    # "Water convolvulus, raw"; "peach" must not return "Peach nectar".
+    "meatless", "imitation", "substitute", "nectar", "chips", "cone",
+    "sandwich", "babyfood", "baby food", "infant", "formula", "mix", "dry",
+    # Processed/deli meat words: a bare "beef" wants fresh beef, not a cured,
+    # smoked or ground-into-a-loaf product ("Beef, cured, pastrami").
+    "cured", "corned", "smoked", "bologna", "pastrami", "sausage", "salami",
+    "jerky", "deli", "luncheon", "spread", "sticks", "breakfast",
+)
 
 # USDA names are comma-inverted: "Vinegar, red wine" is red-wine VINEGAR, not
 # wine. When the query matches only a modifier and the head category is a
@@ -52,6 +93,105 @@ _HEAD_CATEGORY_EXCLUSIONS = {
     "wine": {"vinegar", "sauce"},
     "steak": {"potato", "fries", "sauce", "sandwich", "submarine"},
 }
+
+# Variant markers (2026-10-04, 0.1.19). A name carrying one of these, when the
+# QUERY did not ask for it, is a less likely answer to a bare generic word:
+# someone typing "beer" means a regular beer, not "Alcoholic beverage, beer,
+# light"; "milk" means whole milk, not "Milk, nonfat". Matched on word
+# boundaries, case- and separator-insensitive, so "low-fat" == "low fat".
+# Hyphenated spellings are listed both ways because the normaliser folds any
+# non-alphanumeric run to a single space ("non-fat" -> "non fat"), while the
+# closed-up spelling stays one token ("nonfat").
+VARIANT_MARKERS = (
+    "light", "lite", "low-fat", "low fat", "reduced", "nonfat", "non-fat",
+    "skim", "diet", "unsweetened", "no sugar added", "decaf", "decaffeinated",
+    "lean", "extra lean", "low sodium", "low-sodium", "low carb", "imitation",
+    "meatless", "substitute", "fat free", "fat-free",
+)
+
+# Relative energy gap (kcal/100g) above which two same-head rivals are a
+# genuine ambiguity rather than interchangeable variants. An absolute floor
+# keeps near-zero foods comparable: water at 0 vs 1 kcal/100g is 100% relative
+# but immaterial, so it must NOT read as an ambiguity.
+AMBIGUITY_ENERGY_DELTA = 0.25
+AMBIGUITY_ENERGY_FLOOR = 5.0
+
+# How many ranked candidates the de-duplication pass keeps before slicing to
+# the caller's `limit`. The wider window keeps the deduped order stable when a
+# caller asks for very few rows; the ambiguity check itself only needs the top
+# two.
+_AMBIGUITY_WINDOW = 12
+
+# Non-breaking space (U+00A0): three catalogue rows carry one inside their
+# display_name. The ranker's tokeniser treats it as a separator (so matching
+# already tolerates it), but a raw `display_name == user_typed_name`
+# comparison does not -- normalise it to a plain space at every boundary.
+NBSP = "\u00a0"
+
+
+def normalize_display_name(name: str | None) -> str:
+    """Fold non-breaking spaces to plain spaces in a food name or query.
+
+    Also collapses repeated spaces: an NBSP that sat next to a real space
+    (",<space><NBSP>fresh") folds to a double space, which a raw comparison
+    against a typed name still fails on. Runs of spaces are therefore folded
+    to one so a stored name equals the same name typed normally.
+    """
+    s = (name or "").replace(NBSP, " ")
+    return re.sub(r" {2,}", " ", s)
+
+
+def _norm_phrase(s: str) -> str:
+    """Lowercase and collapse every non-alphanumeric run to a single space."""
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+# Normalised, de-duplicated marker phrases ("low-fat"/"low fat" collapse to one).
+_VARIANT_MARKER_SET = tuple(sorted({_norm_phrase(m) for m in VARIANT_MARKERS}))
+
+
+def _has_unrequested_variant(name: str, query: str) -> bool:
+    """True when `name` carries a variant marker the query did not ask for.
+
+    Word-boundary matched on normalised phrases, so "light" does not fire on
+    "delight" and "low-fat" matches "low fat".
+    """
+    n = " " + _norm_phrase(name) + " "
+    q = " " + _norm_phrase(query) + " "
+    return any(f" {m} " in n and f" {m} " not in q for m in _VARIANT_MARKER_SET)
+
+
+def _energy_per_100g(food: Food) -> float | None:
+    """Energy (kcal) per 100 g for a loaded Food, or None when absent."""
+    for fn in food.nutrients:
+        nut = getattr(fn, "nutrient", None)
+        if nut is not None and nut.nutrient_code == "energy":
+            return fn.amount_per_100g
+    return None
+
+
+def _energy_differs_materially(a: Food, b: Food) -> bool:
+    """True when two foods' energy differs by more than AMBIGUITY_ENERGY_DELTA.
+
+    Both rows must have energy; a missing value cannot be judged, so it is
+    treated as "no material difference" (never a fabricated ambiguity). The
+    difference must clear BOTH a relative threshold and an absolute floor, so
+    near-zero foods (water 0 vs 1 kcal) do not read as ambiguous.
+    """
+    ea, eb = _energy_per_100g(a), _energy_per_100g(b)
+    if ea is None or eb is None:
+        return False
+    hi = max(abs(ea), abs(eb))
+    if hi <= 0:
+        return False
+    gap = abs(ea - eb)
+    return gap > AMBIGUITY_ENERGY_FLOOR and gap / hi > AMBIGUITY_ENERGY_DELTA
+
+
+# Safety cap on the candidate set pulled for Python-side scoring. Every query
+# is a food name, so the ILIKE filter keeps this well under the cap; the whole
+# `foods` table is ~8.5k rows, so this never truncates a real query.
+_MAX_CANDIDATES = 20000
 
 
 @dataclass
@@ -69,6 +209,7 @@ class ResolveResult:
     matches: list[FoodMatch] = field(default_factory=list)
     ambiguous: bool = False
     note: str | None = None  # set when a learned user rule decided the result
+    weak: bool = False  # best candidate failed the head-match quality gate
 
     @property
     def best(self) -> Food | None:
@@ -82,127 +223,334 @@ class ResolveResult:
         return bool(self.matches)
 
 
-def _tier_expression(query: str):
-    """SQL CASE that assigns each row its relevance tier.
+def _fold_token(tok: str) -> str:
+    """Lowercase a token and fold common English plurals (peaches -> peach)."""
+    t = tok.lower()
+    if len(t) > 4 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 4 and t.endswith(("ches", "shes", "sses", "xes", "zes", "oes")):
+        return t[:-2]
+    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        return t[:-1]
+    return t
 
-    Ranking happens in the database, not in Python: we must not pull the whole
-    table into memory to sort it.
 
-    Word boundaries matter. USDA names are comma-separated phrases
-    ("Egg, whole, raw, fresh"), so we normalise separators to spaces and pad
-    the whole string, letting a single LIKE test find whole words anywhere --
-    including the first and last. Without this, a prefix test on "egg" ranks
-    "Eggplant, raw" above "Egg, whole, raw, fresh", which is exactly the class
-    of silent substitution this module exists to prevent.
+def _fold_tokens(text: str) -> list[str]:
+    """Split a name/query into plural-folded lowercase tokens."""
+    return [_fold_token(t) for t in re.split(r"[^a-z0-9%]+", (text or "").lower()) if t]
+
+
+def _head_tokens(name: str) -> list[str]:
+    """Folded tokens of a name's leading comma segment (its category/head)."""
+    return _fold_tokens((name or "").split(",")[0])
+
+
+def _contains_query_word(query: str, name: str) -> bool:
+    """True when every folded query token appears as a folded token in `name`.
+
+    Used by the branded-last-resort rule: a non-generic (branded) row may not
+    outrank a generic row that actually contains the query as a word, so bare
+    "beer" cannot resolve to the branded "beer mustard".
     """
-    lowered = func.lower(Food.display_name)
-    q = query.lower()
-
-    # ", " and "," -> " " so commas act as word separators, then pad both ends.
-    normalised = func.concat(
-        " ", func.replace(func.replace(lowered, ",", " "), "  ", " "), " "
-    )
-
-    return case(
-        (lowered == q, TIER_EXACT),
-        # Prefix, but only when the query ends at a word boundary.
-        (normalised.like(f" {q} %"), TIER_PREFIX),
-        # Whole word anywhere in the name.
-        (normalised.like(f"% {q} %"), TIER_WORD),
-        else_=TIER_SUBSTRING,
-    )
+    qt = _fold_tokens(query)
+    nt = set(_fold_tokens(name))
+    return bool(qt) and all(q in nt for q in qt)
 
 
-def _preparation_penalty(query: str):
-    """1 when the row carries a preparation qualifier the query did not ask for.
+def _head_match(query: str, name: str) -> bool:
+    """True when the query's tokens are the name's LEADING tokens.
 
-    Applied as an ORDER BY term after tier, so it never promotes a worse tier --
-    it only settles which row wins *within* a tier. If the user actually typed
-    the qualifier, no penalty applies.
+    Plural-tolerant and order-insensitive within the leading window, so
+    `banana` reaches `Bananas, raw` (leading token "banana"), `chicken breast`
+    reaches `Chicken, breast, ...` (first two tokens), but `banana` does NOT
+    reach `Pepper, banana, raw` (leading token "pepper").
     """
-    lowered = func.lower(Food.display_name)
-    q = query.lower()
-
-    conditions = [
-        lowered.like(f"%{word}%")
-        for word in PREPARATION_QUALIFIERS
-        if word not in q
-    ]
-    # Always return a CASE expression so the ORDER BY clause is valid SQL.
-    # When no conditions apply, all rows get 0 (no penalty).
-    return case((or_(*conditions), 1), else_=0) if conditions else case((literal(1) == literal(1), 0), else_=0)
+    qt = _fold_tokens(query)
+    nt = _fold_tokens(name)
+    if not qt or len(nt) < len(qt):
+        return False
+    return all(q in set(nt[: len(qt)]) for q in qt)
 
 
-def _head_category_penalty(query: str):
-    """1 when the query matches only a modifier of an unrelated head category.
+def _head_exact(query: str, name: str) -> bool:
+    """True when the query is exactly the name's leading comma segment.
 
-    "Vinegar, red wine" is vinegar, not wine: the query appears after the
-    comma while the head ("Vinegar") names a different food. Applied as an
-    ORDER BY term after tier, so it never promotes a worse tier -- it only
-    settles which row wins *within* a tier.
+    `Water, bottled, generic` beats `Water convolvulus, raw` for "water"
+    because the query *is* the head ("Water"), not merely its first token.
     """
-    terms = _HEAD_CATEGORY_EXCLUSIONS.get(query.lower())
+    qt = _fold_tokens(query)
+    ht = _head_tokens(name)
+    return bool(qt) and len(ht) == len(qt) and all(h in set(qt) for h in ht)
+
+
+def _match_position(query: str, name: str) -> int:
+    """Index of the earliest query token inside `name`'s folded tokens.
+
+    A rank tie-break that runs *after* the curated `is_default` flag: when two
+    candidates are otherwise equal, the one whose name carries the query word
+    earlier is the better answer -- the query word sits closer to the head, so
+    the row is less likely to be a different food that merely mentions it. Bare
+    "beer" therefore prefers "Alcoholic beverage, beer, light" (beer at index 2)
+    over "Beverages, carbonated, root beer" (beer at index 3). Names that
+    contain no query token sort last.
+    """
+    qt = set(_fold_tokens(query))
+    nt = _fold_tokens(name)
+    if not qt:
+        return len(nt) + 1
+    for i, t in enumerate(nt):
+        if t in qt:
+            return i
+    return len(nt) + 1
+
+
+def _has_unrequested_qualifier(name: str, query: str) -> bool:
+    low, q = (name or "").lower(), (query or "").lower()
+    return any(w in low and w not in q for w in PREPARATION_QUALIFIERS)
+
+
+def _has_head_exclusion(name: str, query: str) -> bool:
+    """True when the query matches only a modifier of an unrelated head category."""
+    terms = _HEAD_CATEGORY_EXCLUSIONS.get((query or "").lower())
     if not terms:
-        # Always return a CASE expression so the ORDER BY clause is valid SQL.
-        return case((literal(1) == literal(1), 0), else_=0)
+        return False
+    head = (name or "").split(",")[0].strip().lower()
+    q = (query or "").lower()
+    if q in head:
+        return False
+    return any(t in head for t in terms)
 
-    head = func.lower(func.split_part(Food.display_name, ",", 1))
-    q = query.lower()
 
-    # Query must NOT appear (even partially) in the head -- "wine sauce" head
-    # still contains the query concept, so it stays unpenalised.
-    query_in_head = head.like(f"%{q}%")
-    head_is_other_food = or_(*[head.like(f"%{t}%") for t in terms])
+def _is_weak_head_match(query: str, name: str) -> bool:
+    """True when `name` is a qualified/branded near-miss for `query`.
 
-    return case((and_(head_is_other_food, ~query_in_head), 1), else_=0)
+    Shared by `resolve_food` (to flag a weak best hit) and `_lookup_nutrients`
+    (to fall through to the online cascade rather than log a near-miss).
+    """
+    if not _head_match(query, name):
+        return True
+    if _has_unrequested_qualifier(name, query):
+        return True
+    return False
+
+
+def _is_bare_query(query: str) -> bool:
+    """True for a short generic phrase ("beef", "chicken breast").
+
+    Long, comma-qualified names ("Kefir, lowfat, plain, LIFEWAY") are explicit
+    and must not be pushed to the online cascade by the weak-match gate.
+    """
+    q = (query or "").strip()
+    return "," not in q and len(_fold_tokens(q)) <= 2
+
+
+def _tier(query: str, name: str) -> int:
+    """Assign a row its relevance tier (plural-tolerant)."""
+    ql = (query or "").strip().lower()
+    nl = (name or "").strip().lower()
+    if not ql:
+        return TIER_SUBSTRING
+    qt = _fold_tokens(query)
+    nt = _fold_tokens(name)
+    # EXACT requires the plural-folded token SET of the query to equal the
+    # candidate's -- a shared head token is not enough. "Pepper, banana, raw"
+    # must NOT be an EXACT match for "Peppers, bell, green, raw"; only
+    # "Peppers, bell, green, raw" is exact for that name.
+    if nl == ql or (qt and sorted(qt) == sorted(nt)):
+        return TIER_EXACT
+    # Leading window, order-insensitive: "white rice" reaches
+    # "Rice, white, cooked" and "chicken breast" reaches
+    # "Chicken, breast, ..." -- USDA inverts noun phrases.
+    if qt and len(nt) >= len(qt) and set(nt[: len(qt)]) == set(qt):
+        return TIER_PREFIX
+    # Whole-word (plural-folded) subsequence anywhere in the name.
+    if qt:
+        i = 0
+        for t in nt:
+            if i < len(qt) and t == qt[i]:
+                i += 1
+                if i == len(qt):
+                    return TIER_WORD
+    return TIER_SUBSTRING
+
+
+def _query_filter_tokens(query: str) -> list[str]:
+    """Distinct lowercase tokens to require in a candidate's name.
+
+    USDA inverts noun phrases ("Rice, white, cooked"), so a contiguous
+    `ILIKE '%white rice%'` misses the row the user means. We instead require
+    every query token to appear (case-insensitively), plural-tolerant.
+    """
+    raw = [t for t in re.split(r"[^a-z0-9]+", (query or "").lower()) if len(t) >= 2]
+    out: list[str] = []
+    for t in raw[:5]:
+        if t not in out:
+            out.append(t)
+        folded = _fold_token(t)
+        if folded != t and folded not in out:
+            out.append(folded)
+    return out
 
 
 def resolve_food(db: Session, query: str, limit: int = 10, user_id=None) -> ResolveResult:
     """Resolve a free-text food name to ranked candidates.
 
-    Ordering:
-      1. tier (exact, then word-boundary prefix, then whole-word, then substring)
-      2. no unrequested preparation qualifier -- fresh before dried/frozen
-      3. generic foods before branded -- someone typing "egg" wants the
-         ingredient, not a packaged product
-      4. shorter display_name first -- fewer qualifiers means more canonical
-      5. name alphabetically, purely so results are deterministic
+    Ordering (all ascending, lower is better):
+      0. branded-last-resort -- 0 unless the row is branded while a generic row
+         contains the query as a word
+      1. tier -- exact, then leading-token prefix, then whole word, then substring
+      2. head_exact -- the query IS the name's head category
+      3. head_match -- the query's tokens are the name's leading tokens
+      4. head_category exclusion -- "Vinegar, red wine" is not wine
+      5. no unrequested preparation qualifier -- fresh before dried/frozen/meatless
+      6. generic foods before branded
+      7. curated default variant (foods.is_default) -- for a bare generic word the
+         human-curated plain row beats an arbitrary variant
+      8. match position -- the query word earlier in the name is the better answer
+      9. no unrequested variant marker -- "beer" beats "beer, light"
+     10. fewer name tokens (fewer unrequested words = more canonical)
+     11. usda source before drhiro_private
+     12. external_id, id -- TOTAL ORDER so results never drift between runs
     """
-    query = (query or "").strip()
+    query = normalize_display_name((query or "")).strip()
     if not query:
         return ResolveResult()
 
     # Learned rules first: a user-corrected resolution ("wine" means the
-    # beverage, not vinegar) overrides ranking for this user.
+    # beverage, not vinegar) overrides ranking for this user. The two poisoned
+    # rules this bug created (bare "beef"/"chicken breast" -> a branded product)
+    # were deactivated as data, not here: a broad rule is substring-matched, so
+    # keeping them would also hijack "corned beef" (see the delivery report).
     ruled = match_resolution_rule(db, query, user_id)
     if ruled is not None:
-        return ResolveResult(matches=[FoodMatch(food=ruled, tier=TIER_EXACT)],
+        # Report the ruled food's REAL tier. A rule is not automatically an
+        # exact match: before this, any rule stamped its target TIER_EXACT, so
+        # a rule pointing at "Peppers, bell, green, raw" made the query
+        # "Pepper, banana, raw" report a green bell pepper as an EXACT hit.
+        return ResolveResult(matches=[FoodMatch(food=ruled,
+                                                tier=_tier(query, ruled.display_name))],
                              note="user rule")
 
-    tier = _tier_expression(query)
-    penalty = _preparation_penalty(query)
-    head_penalty = _head_category_penalty(query)
+    usda_id = (
+        db.query(DataSource.id).filter(DataSource.source_key == "usda").scalar()
+    )
 
+    filter_tokens = _query_filter_tokens(query)
+    name_conds = [Food.display_name.ilike(f"%{t}%") for t in filter_tokens] or [
+        Food.display_name.ilike(f"%{query}%")
+    ]
     rows = (
-        db.query(Food, tier.label("tier"))
-        .options(selectinload(Food.nutrients))
-        .filter(Food.display_name.ilike(f"%{query}%"))
-        .order_by(
-            tier.asc(),
-            head_penalty.asc(),
-            penalty.asc(),
-            # NULL is_generic sorts with branded rather than ahead of generic.
-            case((Food.is_generic.is_(True), 0), else_=1).asc(),
-            func.length(Food.display_name).asc(),
-            Food.display_name.asc(),
+        db.query(
+            Food.id,
+            Food.display_name,
+            Food.is_generic,
+            Food.is_default,
+            Food.external_id,
+            Food.data_source_id,
         )
-        .limit(limit)
+        .filter(and_(*name_conds))
+        .limit(_MAX_CANDIDATES)
         .all()
     )
 
-    matches = [FoodMatch(food=food, tier=int(tier_value)) for food, tier_value in rows]
+    # Branded rows are a LAST RESORT: if ANY generic row contains the query as a
+    # word, no non-generic row may outrank it. This is what stops bare "beer"
+    # resolving to the branded "beer mustard"/"beer cheese spread" while the
+    # generic "Alcoholic beverage, beer, light" sits a tier lower. A deliberate
+    # branded pin still wins, because it comes through the rule layer above.
+    has_generic_word_match = any(
+        r.is_generic and _contains_query_word(query, r.display_name) for r in rows
+    )
 
-    return ResolveResult(matches=matches, ambiguous=_is_ambiguous(matches, query))
+    def _key(r):
+        name = r.display_name
+        return (
+            # 0 ranks generic rows (and everything, when no generic word-match
+            # exists) ahead of branded rows that the generic layer already
+            # answers.
+            0 if (r.is_generic or not has_generic_word_match) else 1,
+            _tier(query, name),
+            0 if _head_exact(query, name) else 1,
+            0 if _head_match(query, name) else 1,
+            0 if _has_head_exclusion(name, query) else 1,
+            0 if not _has_unrequested_qualifier(name, query) else 1,
+            0 if r.is_generic else 1,
+            # Curated default variant for a bare generic word. Ahead of the
+            # variant/token tie-breaks, but BEHIND the exact-name tier above:
+            # an exact catalogue name always wins over the default flag.
+            0 if r.is_default else 1,
+            # Tie-break after the curated default: the candidate whose name
+            # carries the query word earliest is the better answer (bare "beer"
+            # prefers "Alcoholic beverage, beer, light" over "...root beer").
+            _match_position(query, name),
+            # A name carrying a variant marker the query did not ask for loses
+            # to a name without one ("beer" beats "beer, light").
+            0 if not _has_unrequested_variant(name, query) else 1,
+            # Fewer unrequested words = more canonical. This must outrank the
+            # source rank: "COOKED WHITE RICE" (3 tokens, private) is a better
+            # answer to "white rice" than a 12-token USDA cracker that merely
+            # mentions white rice flour.
+            len(_fold_tokens(name)),
+            0 if (usda_id is not None and r.data_source_id == usda_id) else 1,
+            str(r.external_id or ""),
+            str(r.id),
+        )
+
+    ordered = sorted(rows, key=_key)
+
+    # De-duplicate by display_name: the same food exists in both `usda` and
+    # `drhiro_private` (a translation artifact). Identical names can never be
+    # ranked deterministically and would otherwise trip the ambiguity check.
+    # We dedupe a WINDOW wider than the returned `limit`: ambiguity is a
+    # property of the candidate space, not of how many rows the caller asked
+    # for. The best same-head rival (e.g. "beer, light" behind "beer, regular")
+    # can sit below an unrelated word match ("root beer") that the curated
+    # default and variant penalties pushed up, so a top-`limit` slice would
+    # miss the real rival and under-report ambiguity.
+    seen: set[str] = set()
+    unique = []
+    for r in ordered:
+        key = (r.display_name or "").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+        if len(unique) >= max(limit, _AMBIGUITY_WINDOW):
+            break
+
+    if not unique:
+        return ResolveResult()
+
+    tiers = {r.id: _tier(query, r.display_name) for r in unique}
+    foods = {
+        f.id: f
+        for f in db.query(Food)
+        .options(selectinload(Food.nutrients))
+        .filter(Food.id.in_([r.id for r in unique]))
+        .all()
+    }
+    all_matches = [FoodMatch(food=foods[r.id], tier=tiers[r.id]) for r in unique if r.id in foods]
+    matches = all_matches[:limit]
+    weak = bool(matches) and _is_weak_head_match(query, matches[0].food.display_name)
+
+    return ResolveResult(matches=matches, ambiguous=_is_ambiguous(all_matches, query), weak=weak)
+
+
+def _find_exact_name(db: Session, name: str):
+    """Return the Food whose display_name is exactly `name` (case-insensitive).
+
+    NBSP-folded on both sides so a name typed with plain spaces matches a row
+    stored with a non-breaking space (and vice versa).
+    """
+    n = normalize_display_name(name).strip().lower()
+    if not n:
+        return None
+    return (
+        db.query(Food)
+        .filter(func.lower(func.replace(Food.display_name, NBSP, " ")) == n)
+        .order_by(Food.external_id, Food.id)
+        .first()
+    )
 
 
 def match_resolution_rule(db: Session, query: str, user_id=None):
@@ -211,13 +559,19 @@ def match_resolution_rule(db: Session, query: str, user_id=None):
     Matching is deliberately simple: case-insensitive substring of the rule's
     original_pattern in the query. Only active rules for THIS user (plus any
     global-scope rules) apply; most recently updated wins.
+
+    Guard (spec defect D1b): a rule must never silently override an EXACT
+    catalogue name with a different food. If the query -- or the rule's own
+    pattern -- is a literal existing display_name, the rule must resolve to
+    that row or be ignored. A user pin beats a near-miss; it never beats a
+    literal name match.
     """
     q = query.lower()
     if not q:
         return None
 
     conds = [FoodResolutionRule.active.is_(True),
-             func.lower(FoodResolutionRule.original_pattern).isnot(None)]
+             FoodResolutionRule.original_pattern.isnot(None)]
     if user_id is not None:
         conds.append(
             or_(FoodResolutionRule.user_id == user_id,
@@ -234,46 +588,56 @@ def match_resolution_rule(db: Session, query: str, user_id=None):
         pat = (r.original_pattern or "").lower().strip()
         if pat and pat in q and r.resolved_food_id:
             food = db.get(Food, r.resolved_food_id)
+            if food is None:
+                continue
+            for literal in (_find_exact_name(db, query),
+                            _find_exact_name(db, r.original_pattern)):
+                if literal is not None and literal.id != food.id:
+                    log.info(
+                        "rule %r -> %r ignored: %r is an exact catalogue name",
+                        r.original_pattern, food.display_name, literal.display_name,
+                    )
+                    food = None
+                    break
             if food is not None:
                 return food
     return None
 
 
-def _has_unrequested_qualifier(name: str, query: str) -> bool:
-    low, q = name.lower(), query.lower()
-    return any(w in low and w not in q for w in PREPARATION_QUALIFIERS)
-
-
-def _has_head_exclusion(name: str, query: str) -> bool:
-    """Python mirror of _head_category_penalty for ambiguity detection."""
-    terms = _HEAD_CATEGORY_EXCLUSIONS.get(query.lower())
-    if not terms:
-        return False
-    head = name.split(",")[0].strip().lower()
-    q = query.lower()
-    if q in head:
-        return False
-    return any(t in head for t in terms)
-
-
 def _is_ambiguous(matches: list[FoodMatch], query: str) -> bool:
-    """True when the top two candidates cannot be meaningfully separated.
+    """True when the top two candidates carry materially different energy.
 
-    Ambiguous means: same tier, same preparation-penalty class, and name
-    lengths close enough that shorter-is-more-canonical is not discriminating.
-    An exact match is never ambiguous -- there is nothing better to find.
+    Two rules, applied in order:
+
+    1. **A curated default IS the answer.** When the top match has
+       `foods.is_default`, a human already decided which variant is the plain
+       one, so re-asking the user is noise -- the hint is suppressed outright.
+       This is what makes bare "water"/"beer"/"milk" resolve silently.
+    2. **Top-two energy rule.** Otherwise the leader and its runner-up are
+       compared directly: interchangeable when their energy agrees ("Water,
+       tap" vs "Water, bottled", both 0 kcal), a genuine ambiguity the bot must
+       ask about when they differ by more than AMBIGUITY_ENERGY_DELTA ("Bread,
+       potato" 266 vs "Bread, cheese" 408). A lower-tier, more penalised or
+       differently-sourced runner-up is not a genuine rival. An exact match is
+       never ambiguous -- there is nothing better to find.
     """
     if len(matches) < 2:
         return False
 
     first, second = matches[0], matches[1]
 
-    if first.tier == TIER_EXACT:
-        return False
-    if first.tier != second.tier:
+    # 1. A curated default is the answer: never second-guess it.
+    if first.food.is_default:
         return False
 
-    # A penalised runner-up is not a genuine rival to an unpenalised leader.
+    if first.tier == TIER_EXACT:
+        return False
+
+    # 2. Top-two: only a same-tier rival is a genuine alternative; a lower-tier
+    # runner-up is a weaker match, not a coin-flip.
+    if first.tier != second.tier:
+        return False
+    # A penalised or differently-sourced runner-up is not a genuine rival.
     if _has_unrequested_qualifier(first.food.display_name, query) != \
        _has_unrequested_qualifier(second.food.display_name, query):
         return False
@@ -283,8 +647,7 @@ def _is_ambiguous(matches: list[FoodMatch], query: str) -> bool:
     if bool(first.food.is_generic) != bool(second.food.is_generic):
         return False
 
-    delta = abs(len(first.food.display_name) - len(second.food.display_name))
-    return delta <= AMBIGUITY_LENGTH_DELTA
+    return _energy_differs_materially(first.food, second.food)
 
 
 def nutrient_map(food: Food, code_by_id: dict) -> dict:
@@ -300,7 +663,6 @@ def nutrient_map(food: Food, code_by_id: dict) -> dict:
             out[code] = fn.amount_per_100g
     return out
 
-
 def online_food_candidates(query: str, limit: int = 5, source: str = "auto") -> list[dict]:
     """Online nutrition lookup: USDA FoodData Central, then DuckDuckGo.
 
@@ -311,14 +673,14 @@ def online_food_candidates(query: str, limit: int = 5, source: str = "auto") -> 
 
     Returns a list of candidate dicts with keys: external_id, display_name,
     kcal_per_100g, protein_g_per_100g, carbs_g_per_100g, fat_per_100g,
-    fiber_per_100g, sodium_mg_per_100g, source.
+    fiber_per_100g, sodium_mg_per_100g, source, brand_owner, data_type.
 
-    All configuration is environment-driven; no hardcoded hosts or
-    credentials. The DuckDuckGo endpoint comes from DDG_HTTP_URL; when it is
-    unset the DDG tier is skipped rather than hitting a baked-in address.
+    This is the shared online cascade used by both search_food (the tool)
+    and _lookup_nutrients (the correction path), so corrections automatically
+    find online values when the local DB is thin.
     """
-    import json as _j
     import os as _os
+    import json as _j
     import re as _re
     import urllib.request as _ur
 
@@ -345,18 +707,19 @@ def online_food_candidates(query: str, limit: int = 5, source: str = "auto") -> 
                     "fiber_g_per_100g": it.fiber_g_per_100g,
                     "sodium_mg_per_100g": it.sodium_mg_per_100g,
                     "source": "usda-online",
+                    "brand_owner": getattr(it, "brand_owner", None),
+                    "data_type": getattr(it, "data_type", None),
                 })
         except Exception:
             log.exception("USDA online lookup failed for %r", query)
 
     # --- DuckDuckGo web fallback ---
-    ddg_url = (_os.environ.get("DDG_HTTP_URL") or "").rstrip("/")
-    if ddg_url and (source == "ddg" or (source == "auto" and not out)):
+    if source == "ddg" or (source == "auto" and not out):
         def _fetch(q):
             try:
                 body = _ur.urlopen(
                     _ur.Request(
-                        ddg_url + "/lookup",
+                        "http://172.20.0.1:8098/lookup",
                         data=_j.dumps({"query": q}).encode(),
                         headers={"Content-Type": "application/json"},
                     ),
@@ -364,7 +727,6 @@ def online_food_candidates(query: str, limit: int = 5, source: str = "auto") -> 
                 ).read()
                 return _j.loads(body or b"{}")
             except Exception:
-                log.exception("DuckDuckGo lookup failed for %r", q)
                 return {}
 
         data = _fetch(query)
@@ -387,9 +749,11 @@ def online_food_candidates(query: str, limit: int = 5, source: str = "auto") -> 
                 "protein_g_per_100g": c.get("protein_g_per_100g"),
                 "carbs_g_per_100g": c.get("carbs_g_per_100g"),
                 "fat_g_per_100g": c.get("fat_g_per_100g"),
-                "fiber_per_100g": None,
+                "fiber_g_per_100g": None,
                 "sodium_mg_per_100g": None,
                 "source": "duckduckgo",
+                "brand_owner": None,
+                "data_type": "Scraped",
             })
 
     return out

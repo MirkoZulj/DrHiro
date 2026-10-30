@@ -13,10 +13,19 @@ outage degrades to the previous behaviour rather than blocking logging.
 from __future__ import annotations
 
 import logging
+import time
 
 from drhiro_api.services.llm_client import chat_complete_sync
 
 log = logging.getLogger(__name__)
+
+# A sanity check is advisory: it must never hold a meal write open. The model
+# box can be off or busy, so bound each call and, after one failure, skip the
+# check for a cooldown instead of paying the timeout again for every item.
+SANITY_TIMEOUT_S = 8.0
+FAILURE_COOLDOWN_S = 120.0
+
+_unavailable_until = 0.0
 
 _SYSTEM = (
     "You sanity-check nutrition data. You are given a food name and its values "
@@ -34,8 +43,12 @@ def llm_values_plausible(
     carbs: float | None,
     fat: float | None,
 ) -> bool:
-    """True if the values look plausible for `name`. Fails open."""
+    """True if the values look plausible for `name`. Fails open and fast."""
+    global _unavailable_until
+
     if not name or kcal is None:
+        return True
+    if time.monotonic() < _unavailable_until:
         return True
     try:
         out = chat_complete_sync(
@@ -51,9 +64,16 @@ def llm_values_plausible(
                 },
             ],
             temperature=0.0,
+            timeout=SANITY_TIMEOUT_S,
         )
     except Exception:
-        log.exception("LLM value sanity check failed for %r; failing open", name)
+        _unavailable_until = time.monotonic() + FAILURE_COOLDOWN_S
+        log.warning(
+            "LLM value sanity check unavailable for %r; skipping checks for %ss",
+            name,
+            int(FAILURE_COOLDOWN_S),
+            exc_info=True,
+        )
         return True
 
     verdict = (out or "").strip().upper()

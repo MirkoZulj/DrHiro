@@ -99,8 +99,10 @@ def test_empty_bucket_is_null_not_zero(client, db, user_a):
 
 def test_meal_near_local_midnight_lands_in_local_bucket(client, db, user_a):
     monday = _this_monday()
-    # 00:30 Monday local == 22:30 Sunday UTC in summer; must be the Monday bucket.
-    _meal(db, user_a, _local_day_at(monday, 0, 30), 100, 5, 10, 4)
+    # 04:30 Monday local == 02:30 Monday UTC in summer. Still a local-vs-UTC
+    # case (the UTC date and the local date differ for negative offsets), but
+    # after the 04:00 nutrition-day boundary so the bucket is unambiguously Monday.
+    _meal(db, user_a, _local_day_at(monday, 4, 30), 100, 5, 10, 4)
     # 23:30 Sunday local == 21:30 Sunday UTC; must be the Sunday bucket.
     _meal(db, user_a, _local_day_at(monday + timedelta(days=6), 23, 30), 200, 10, 20, 8)
     out = _get(client, user_a, "day")
@@ -150,7 +152,7 @@ def test_calorie_bucket_uses_local_day_like_macros(client, db, user_a):
     chart on the UTC date would drop it from the week entirely (idx < 0).
     """
     monday = _this_monday()
-    _meal(db, user_a, _local_day_at(monday, 0, 30), 100, 5, 10, 4)
+    _meal(db, user_a, _local_day_at(monday, 4, 30), 100, 5, 10, 4)
     cal = _get(client, user_a, "day", metric="calories")
     mac = _get(client, user_a, "day", metric="macros")
     assert cal["points"][0]["label"] == "Mon"
@@ -279,7 +281,9 @@ def _get_trends(client, user, period="7d", metric="calories"):
 def test_daily_nutrition_uses_local_day_not_utc(client, db, user_a):
     """A meal at local 00:30 belongs to the local day, as it does in the charts."""
     monday = _this_monday()
-    late = _local_day_at(monday, 0, 30)  # 22:30 the previous day in UTC
+    # 04:30 local sits just past the 04:00 nutrition-day boundary, so it belongs
+    # to the same local day while its UTC stamp may still fall on another date.
+    late = _local_day_at(monday, 4, 30)
     _meal(db, user_a, late, 100, 5, 10, 4)
 
     trend = _get_trends(client, user_a, "7d")

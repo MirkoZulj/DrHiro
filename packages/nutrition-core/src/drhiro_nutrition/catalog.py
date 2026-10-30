@@ -25,10 +25,13 @@ class FoodItem:
     fat_g_per_100g: float | None = None
     fiber_g_per_100g: float | None = None
     sodium_mg_per_100g: float | None = None
-    alcohol_g_per_100g: float | None = None
     serving_grams: float | None = None
     serving_unit: str | None = None
     is_liquid: bool = False
+    # Provenance for brand handling: FDC dataType + brandOwner when the record
+    # is a Branded food. Used by _persist_food to set is_generic correctly.
+    data_type: str | None = None
+    brand_owner: str | None = None
 
 
 @dataclass(frozen=True)

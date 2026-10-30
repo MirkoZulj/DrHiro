@@ -8,6 +8,7 @@ import Reminders from './views/Reminders'
 import Goals from './views/Goals'
 import Consents from './views/Consents'
 import Settings from './views/Settings'
+import ImportMifitness from './views/ImportMifitness'
 import Activities from './views/Activities'
 import TelegramLinkCallback from './views/TelegramLinkCallback'
 import { AppShell } from './components/AppShell'
@@ -29,6 +30,10 @@ export default function App() {
     authClient.init().then((u) => {
       setUser(u)
       setReady(true)
+      // Device-driven clock: once signed in, tell the server the zone this
+      // device is actually in (Intl.DateTimeFormat) so the user's day boundary
+      // and meal dates follow the device when they travel.
+      if (u) authClient.reportTimezone()
     })
   }, [])
 
@@ -48,6 +53,7 @@ export default function App() {
           <Route path="/goals" element={user ? <Goals /> : <Navigate to="/login" />} />
           <Route path="/consents" element={user ? <Consents /> : <Navigate to="/login" />} />
           <Route path="/settings" element={user ? <Settings /> : <Navigate to="/login" />} />
+          <Route path="/import/mifitness" element={user ? <ImportMifitness /> : <Navigate to="/login" />} />
           <Route path="*" element={<Navigate to="/" />} />
         </Routes>
       </main>

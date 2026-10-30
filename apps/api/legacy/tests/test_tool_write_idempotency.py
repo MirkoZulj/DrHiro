@@ -40,7 +40,9 @@ def _headers(telegram_id: str = "1001", **extra) -> dict:
 
 
 def _call(client, text=PROD_TEXT, headers=None, **body):
-    payload = {"text": text}
+    # The tool contract now requires the originating Telegram identity so that
+    # repeated messages can be suppressed; supply it unless the test overrides.
+    payload = {"text": text, "telegram_chat_id": "9001", "telegram_message_id": "5001"}
     payload.update(body)
     resp = client.post(TOOL_URL, json=payload, headers=headers or _headers())
     assert resp.status_code == 200, resp.text

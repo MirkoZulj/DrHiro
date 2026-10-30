@@ -9,8 +9,7 @@ const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
 /** Human-readable schedule from schedule_json, e.g. "Weekdays at 09:00". */
 function fmtSchedule(schedule: Record<string, unknown>): string {
-  // Backend returns days as weekday names (e.g. "mon", "wed")
-  const days = (Array.isArray(schedule.days) && (schedule.days as string[])) || []
+  const days = (Array.isArray(schedule.days_of_week) && (schedule.days_of_week as number[])) || []
   const time = typeof schedule.time === 'string' ? schedule.time : null
   const timePart = time ? ` at ${time}` : ''
 
@@ -18,16 +17,14 @@ function fmtSchedule(schedule: Record<string, unknown>): string {
   if (days.length === 0) {
     dayPart = 'Daily'
   } else {
-    const WEEKDAY_NAMES = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
-    const set = new Set(days.map((d) => WEEKDAY_NAMES.indexOf(d.toLowerCase())))
-    const isWeekdays = [0, 1, 2, 3, 4].every((d) => set.has(d)) && !set.has(5) && !set.has(6)
-    const isWeekend = set.has(5) && set.has(6) && [0, 1, 2, 3, 4].every((d) => !set.has(d))
+    const set = new Set(days.map((d) => Number(d)))
+    const isWeekdays = [1, 2, 3, 4, 5].every((d) => set.has(d)) && !set.has(6) && !set.has(7)
+    const isWeekend = set.has(6) && set.has(7) && [1, 2, 3, 4, 5].every((d) => !set.has(d))
     if (isWeekdays) dayPart = 'Weekdays'
     else if (isWeekend) dayPart = 'Weekends'
     else dayPart = [...set]
-      .filter((d) => d >= 0)
       .sort((a, b) => a - b)
-      .map((d) => DAY_NAMES[d])
+      .map((d) => DAY_NAMES[(d - 1) % 7])
       .join(', ')
   }
   return dayPart + timePart
@@ -72,9 +69,7 @@ export default function Reminders() {
     setType(r.type)
     const sch = (r.schedule_json ?? {}) as Record<string, unknown>
     if (typeof sch.time === 'string') setTime(sch.time)
-    const WEEKDAY_NAMES = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
-    // Backend sends days as weekday names (e.g. "mon", "wed")
-    const daysArr = Array.isArray(sch.days) ? (sch.days as string[]).map((d) => (WEEKDAY_NAMES.indexOf(d.toLowerCase()) + 1).toString()).join(',') : ''
+    const daysArr = Array.isArray(sch.days_of_week) ? (sch.days_of_week as number[]).join(',') : ''
     setDays(daysArr || '1,2,3,4,5')
   }
 
@@ -89,10 +84,8 @@ export default function Reminders() {
     setCreating(true)
     setError(null)
     try {
-      // The backend expects days as weekday names (lowercase), not numbers
-      const WEEKDAY_NAMES = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
       const schedule = days
-        ? { days: days.split(',').map((d: string) => WEEKDAY_NAMES[Number(d.trim()) - 1]).filter(Boolean), time }
+        ? { days_of_week: days.split(',').map((d) => Number(d.trim())).filter((n) => !Number.isNaN(n)), time }
         : { time }
       if (editingId) {
         await authClient.api(`/reminders/${editingId}`, {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Import USDA FoodData Central JSON exports into drHiro's normalized schema.
 
-Reads the JSON files from $USDA_DATA_DIR (default: ./usda) and populates:
+Reads the JSON files from ~/usda/ and populates:
   - data_sources (ensures the 'usda' row exists)
   - nutrients (upserts all unique nutrient types from both files)
   - foods (one row per USDA food, linked to the 'usda' data source)
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -45,7 +46,7 @@ if str(API_SRC) not in sys.path:
 USDA_SOURCE_KEY = "usda"
 
 # ── USDA JSON file paths ───────────────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("USDA_DATA_DIR", "usda"))
+DATA_DIR = Path("/home/mirko/usda")
 FOUNDATION_FILE = DATA_DIR / "FoodData_Central_foundation_food_json_2026-04-30.json"
 SR_LEGACY_FILE = DATA_DIR / "FoodData_Central_sr_legacy_food_json_2018-04.json"
 
@@ -318,7 +319,10 @@ def _do_import(db) -> None:
 
             all_foods[fdc_id] = {
                 "external_id": str(fdc_id),
-                "display_name": description,
+                # Fold non-breaking spaces (and any doubled space they leave
+                # behind) so stored names stay comparable to a typed name
+                # (drhiro-api 0.1.19 NBSP normalisation).
+                "display_name": re.sub(r" {2,}", " ", (description or "").replace("\u00a0", " ")),
                 "category": food_category,
                 "is_generic": not is_branded_food(description),
                 "is_liquid": is_liquid,

@@ -19,23 +19,29 @@ import csv
 import hashlib
 import io
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from drhiro_api.db import get_db
 from drhiro_api.deps import get_current_user_optional, get_user_by_telegram_id
-from drhiro_api.models import Measurement, User
+from drhiro_api.models import IngestBatch, Measurement, User
 from drhiro_api.security import audit, validate_service_token
+from drhiro_api.services import mifitness_import
 from drhiro_schema.metrics import MetricType
 from drhiro_schema.values import BloodPressureValue
 
 router = APIRouter(prefix="/import", tags=["import"])
 
-MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB — OMRON CSV
+# Mi Fitness exports are large (the reference archive is a 23 MB encrypted ZIP
+# that decompresses to ~394 MB of CSV). The cap is raised for this importer
+# ONLY; the server decompresses the ZIP in a streaming fashion.
+MIFITNESS_MAX_FILE_BYTES = 64 * 1024 * 1024  # 64 MB
 
 
 def _resolve_importer(
@@ -243,3 +249,76 @@ async def import_omron_csv(
               {"accepted": accepted, "duplicates": duplicates, "rejected": len(rejected)})
     db.commit()
     return ImportResult(accepted=accepted, duplicates=duplicates, rejected=rejected, rows=rows)
+
+
+@router.post("/mifitness")
+async def import_mifitness_export(
+    file: UploadFile = File(...),
+    password: str = Form(...),
+    dry_run: bool = Form(False),
+    importer: User = Depends(_resolve_importer),
+    db: Session = Depends(get_db),
+):
+    """Import a Mi Fitness manual-export ZIP (gap-filling, additive, idempotent).
+
+    Multipart: ``file`` (the encrypted ZIP), ``password`` (archive password,
+    never stored), ``dry_run`` (true = reconcile only, write nothing).
+
+    The route accepts the large ZIP (cap raised for this importer only) and the
+    importer service decompresses and streams it server-side.  On a real run
+    the reconciliation report is persisted into ``ingest_batches`` with
+    ``batch_id='mifitness-<timestamp>'``.
+    """
+    user = importer
+    content = await file.read()
+    if len(content) > MIFITNESS_MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"ZIP too large (max {MIFITNESS_MAX_FILE_BYTES // (1024 * 1024)} MB)",
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if not password:
+        raise HTTPException(status_code=400, detail="Archive password required")
+
+    try:
+        report = mifitness_import.run_import(
+            db,
+            user=user,
+            source=content,
+            password=password,
+            dry_run=dry_run,
+            import_filename=file.filename,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+    except zipfile.BadZipFile:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Not a valid ZIP archive")
+    except Exception:
+        db.rollback()
+        raise
+
+    if not dry_run:
+        batch_id = f"mifitness-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+        db.add(
+            IngestBatch(
+                user_id=user.id,
+                installation_id="mifitness_import",
+                batch_id=batch_id,
+                result_json=report,
+            )
+        )
+        audit(db, "user", str(user.id), user.id, "import.mifitness",
+              "measurement", file.filename or "mifitness.zip",
+              {
+                  "raw_inserted": report["raw"]["inserted"],
+                  "raw_duplicates": report["raw"]["duplicates"],
+                  "daily_inserted": report["daily"]["inserted"],
+                  "dry_run": dry_run,
+              })
+        db.commit()
+        report["batch_id"] = batch_id
+
+    return report
