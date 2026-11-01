@@ -96,6 +96,8 @@ def _camoufox_ssh_command(remote_cmd: str) -> list[str]:
     environment or embedded in source.
     """
     host = os.environ.get("DRHIRO_CAMOUFOX_SSH_HOST", "")
+    if not host:
+        return []
     user = os.environ.get("DRHIRO_CAMOUFOX_SSH_USER", "mirko")
     key = os.environ.get("DRHIRO_CAMOUFOX_SSH_KEY", "/run/secrets/camoufox_key")
     target = host if "@" in host else f"{user}@{host}"
@@ -115,8 +117,13 @@ def _google_nutrition(query: str) -> list[dict]:
         search_query = f"{query} nutritional information"
         encoded = urllib.parse.quote(search_query)
         
+        cmd = _camoufox_ssh_command(f"python3 /home/mirko/camoufox_nutrition.py '{encoded}'")
+        if not cmd:
+            log.info("Camoufox search skipped: DRHIRO_CAMOUFOX_SSH_HOST is not set")
+            return []
+
         result = subprocess.run(
-            _camoufox_ssh_command(f"python3 /home/mirko/camoufox_nutrition.py '{encoded}'"),
+            cmd,
             capture_output=True,
             text=True,
             timeout=120,
