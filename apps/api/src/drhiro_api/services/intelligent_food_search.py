@@ -89,6 +89,26 @@ def _extract_nutrients_per_100g(db: Session, food: Food) -> dict:
     return nutrient_map(food, code_by_id)
 
 
+def _camoufox_ssh_command(remote_cmd: str) -> list[str]:
+    """Build a key-based ssh invocation for the Pi camoufox helper.
+
+    Authentication is by key only; no password is ever read from the
+    environment or embedded in source.
+    """
+    host = os.environ.get("DRHIRO_CAMOUFOX_SSH_HOST", "")
+    user = os.environ.get("DRHIRO_CAMOUFOX_SSH_USER", "mirko")
+    key = os.environ.get("DRHIRO_CAMOUFOX_SSH_KEY", "/run/secrets/camoufox_key")
+    target = host if "@" in host else f"{user}@{host}"
+    return [
+        "ssh", "-i", key,
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=30",
+        target, remote_cmd,
+    ]
+
+
 def _google_nutrition(query: str) -> list[dict]:
     """Use camoufox browser on Pi to Google for nutrition info."""
     try:
@@ -96,13 +116,7 @@ def _google_nutrition(query: str) -> list[dict]:
         encoded = urllib.parse.quote(search_query)
         
         result = subprocess.run(
-            [
-                "sshpass", "-p", os.environ.get("DRHIRO_CAMOUFOX_SSH_PASSWORD", ""), "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ConnectTimeout=30",
-                os.environ.get("DRHIRO_CAMOUFOX_SSH_HOST", ""),
-                f"python3 /home/mirko/camoufox_nutrition.py '{encoded}'"
-            ],
+            _camoufox_ssh_command(f"python3 /home/mirko/camoufox_nutrition.py '{encoded}'"),
             capture_output=True,
             text=True,
             timeout=120,

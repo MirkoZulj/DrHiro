@@ -2,6 +2,11 @@
 FROM python:3.12-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
+# ssh client for the camoufox nutrition helper (key auth only)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Install only pinned deps first for layer caching
