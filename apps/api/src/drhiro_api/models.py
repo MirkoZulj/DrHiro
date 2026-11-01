@@ -489,6 +489,27 @@ class ConsumptionOperation(Base, TimestampMixin):
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=True)
 
 
+class MedicalRecord(Base, TimestampMixin):
+    """A transcribed medical document (lab report, prescription, letter).
+
+    The content is the agent's FAITHFUL transcription of the document the user
+    photographed (original language, exact numbers/units/dates) — never a
+    summary or interpretation.
+    """
+
+    __tablename__ = "medical_records"
+    __table_args__ = (Index("ix_medical_records_user_recorded", "user_id", "recorded_at"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), default="telegram_photo", nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    user: Mapped["User"] = relationship()
+
+
 class LogWriteFingerprint(Base, TimestampMixin):
     """Server-side content fingerprint for a free-text logging write.
 

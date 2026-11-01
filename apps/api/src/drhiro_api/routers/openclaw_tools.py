@@ -20,12 +20,12 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session, selectinload
 
 from drhiro_api.db import get_db
 from drhiro_api.deps import get_user_by_telegram_id
-from drhiro_api.models import Activity, Alert, Goal, IngestBatch, Meal, MealItem, Measurement, Reminder, ReminderOccurrence, User
+from drhiro_api.models import Activity, Alert, Goal, IngestBatch, Meal, MealItem, Measurement, MedicalRecord, Reminder, ReminderOccurrence, User
 from drhiro_api.routers.auth import mint_web_login_code
 from drhiro_api.routers.dashboard import _measurements_since
 from drhiro_api.security import audit, validate_service_token
@@ -926,6 +926,112 @@ def tool_delete_activity(req: DeleteActivityTool, user: User = Depends(_resolve_
         message=f"Deleted activity '{info['title']}' ({info['calories_burned']:g} kcal) on {info['date']}.",
         data={**info, "deleted": True, "activity_kcal_today": day_total},
     )
+
+
+class AddMedicalRecordTool(BaseModel):
+    title: str | None = None
+    content: str
+    recorded_at: datetime | None = None
+
+
+@router.post("/add_medical_record", response_model=ToolResponse)
+def tool_add_medical_record(req: AddMedicalRecordTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Store the user's transcribed medical document (lab report, prescription, letter).
+
+    ``content`` is the faithful transcription the agent read from the photo —
+    original language, exact numbers/units/dates. The agent confirms the
+    transcription with the user BEFORE calling this. A naive ``recorded_at``
+    is resolved in the user's timezone.
+    """
+    content = (req.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content must not be empty — store the document's transcription, not a summary")
+    recorded_at = req.recorded_at
+    if recorded_at is not None and recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=resolve_tz(user.timezone))
+    rec = MedicalRecord(
+        user_id=user.id,
+        title=((req.title or "").strip() or None),
+        content=content,
+        source_type="telegram_photo",
+        recorded_at=recorded_at or datetime.now(timezone.utc),
+    )
+    db.add(rec)
+    db.flush()
+    _tool_audit(db, user, "tools.add_medical_record", "medical_record", str(rec.id))
+    db.commit()
+    return ToolResponse(
+        ok=True,
+        message="Medical record stored.",
+        data=_medical_record_out(rec),
+    )
+
+
+class ListMedicalRecordsTool(BaseModel):
+    query: str | None = None  # substring search over title + content
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+@router.post("/list_medical_records", response_model=ToolResponse)
+def tool_list_medical_records(req: ListMedicalRecordsTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """List the user's stored medical records, newest first, newest ``limit``.
+
+    Pass ``query`` to search a fragment across title AND content (e.g. a lab
+    name, a doctor, a medicine). Use the returned ``id`` with
+    ``delete_medical_record``.
+    """
+    q = db.query(MedicalRecord).filter(MedicalRecord.user_id == user.id)
+    if req.query and req.query.strip():
+        like = f"%{req.query.strip()}%"
+        q = q.filter(or_(MedicalRecord.title.ilike(like), MedicalRecord.content.ilike(like)))
+    rows = q.order_by(MedicalRecord.recorded_at.desc(), MedicalRecord.created_at.desc()).limit(req.limit).all()
+    _tool_audit(db, user, "tools.list_medical_records", metadata={"query": req.query, "count": len(rows)})
+    db.commit()
+    return ToolResponse(
+        ok=True,
+        message=f"{len(rows)} medical record(s) found." if rows else "No medical records found.",
+        data={
+            "count": len(rows),
+            "records": [_medical_record_out(r) for r in rows],
+        },
+    )
+
+
+class DeleteMedicalRecordTool(BaseModel):
+    record_id: str
+
+
+@router.post("/delete_medical_record", response_model=ToolResponse)
+def tool_delete_medical_record(req: DeleteMedicalRecordTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Delete one of the user's stored medical records by id (from list_medical_records)."""
+    rec = (
+        db.query(MedicalRecord)
+        .filter(MedicalRecord.id == _maybe_uuid(req.record_id), MedicalRecord.user_id == user.id)
+        .first()
+    )
+    if not rec:
+        raise HTTPException(status_code=404, detail="Medical record not found")
+    info = _medical_record_out(rec)
+    db.delete(rec)
+    _tool_audit(db, user, "tools.delete_medical_record", "medical_record", str(info["id"]),
+                metadata={"title": info["title"]})
+    db.commit()
+    return ToolResponse(
+        ok=True,
+        message="Medical record deleted.",
+        data={**info, "deleted": True},
+    )
+
+
+def _medical_record_out(rec: MedicalRecord) -> dict:
+    return {
+        "id": str(rec.id),
+        "title": rec.title,
+        "content": rec.content,
+        "source_type": rec.source_type,
+        "recorded_at": rec.recorded_at.isoformat() if rec.recorded_at else None,
+        "created_at": rec.created_at.isoformat() if rec.created_at else None,
+    }
 
 
 @router.post("/undo_last_user_action", response_model=ToolResponse)

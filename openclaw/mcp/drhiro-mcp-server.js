@@ -144,6 +144,15 @@ const TOOLS = [
   tool("get_mifitness_import_status", "Status/report of a Mi Fitness import job. Pass job_id from import_mifitness_export (omit for latest). wait_seconds (0-50) waits for completion in one call.",
     { type: "object", properties: { telegram_id: { type: "string" }, job_id: { type: "string" }, wait_seconds: { type: "integer" } }, required: ["telegram_id"] },
     (a) => call("POST", "/tools/get_mifitness_import_status", a, { job_id: a.job_id, wait_seconds: a.wait_seconds || 0 })),
+  tool("add_medical_record", "Store a medical document the user photographed (lab report, prescription, letter). First transcribe the photo FAITHFULLY — original language, exact numbers/units/dates, no summarizing and no translation — then SHOW the transcription to the user and get their confirmation BEFORE calling this. content = the confirmed transcription; title = optional short label (e.g. 'Lab blood panel'); recorded_at = optional ISO date/datetime the document is dated.",
+    { type: "object", properties: { telegram_id: { type: "string" }, title: { type: "string" }, content: { type: "string" }, recorded_at: { type: "string" } }, required: ["telegram_id", "content"] },
+    (a) => call("POST", "/tools/add_medical_record", a, { title: a.title, content: a.content, recorded_at: a.recorded_at })),
+  tool("list_medical_records", "List the user's stored medical records (transcriptions of lab reports, prescriptions, letters), newest first. Pass query to search a fragment across title AND content (a lab name, a medicine, a doctor). Use the returned id with delete_medical_record.",
+    { type: "object", properties: { telegram_id: { type: "string" }, query: { type: "string" }, limit: { type: "integer" } }, required: ["telegram_id"] },
+    (a) => call("POST", "/tools/list_medical_records", a, { query: a.query, limit: a.limit || 20 })),
+  tool("delete_medical_record", "Delete a stored medical record by record_id (from list_medical_records). Confirm with the user before deleting.",
+    { type: "object", properties: { telegram_id: { type: "string" }, record_id: { type: "string" } }, required: ["telegram_id", "record_id"] },
+    (a) => call("POST", "/tools/delete_medical_record", a, { record_id: a.record_id })),
 ];
 
 /**

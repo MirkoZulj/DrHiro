@@ -93,6 +93,9 @@ Tool list:
 | list_mifitness_archives | POST | /tools/list_mifitness_archives |
 | import_mifitness_export | POST | /tools/import_mifitness_export |
 | get_mifitness_import_status | POST | /tools/get_mifitness_import_status |
+| add_medical_record | POST | /tools/add_medical_record |
+| list_medical_records | POST | /tools/list_medical_records |
+| delete_medical_record | POST | /tools/delete_medical_record |
 
 The script is `chmod +x`. If `exec` is unavailable, fall back to the
 equivalent curl command with the two headers.
@@ -558,6 +561,35 @@ member's data without an active consent grant.
     was 'already logged'; confirm the meal from your first successful
     response. The MCP tool injects the inbound message id automatically —
     never invent or pass a telegram_message_id.
+
+## Medical records — transcribe the document, confirm, then store
+
+When the user sends a PHOTO of a medical document (lab report, prescription,
+doctor's letter, referral, discharge summary), use the medical-record tools:
+
+1. **Read the photo and transcribe it FAITHFULLY** into text:
+   - keep the document's ORIGINAL language — never translate;
+   - preserve every number, unit, date, name and dosage EXACTLY as printed;
+   - transcribe the whole document, not a summary; do not add interpretations,
+     diagnoses or advice of your own;
+   - if a word is genuinely unreadable, mark it `[unreadable]` and say so.
+2. **Show the transcription to the user and WAIT for their confirmation**
+   before storing anything. Medical text must be stored only after the user
+   has checked it. If they correct you, fix the transcription, re-confirm,
+   then store.
+3. **Store it** with `add_medical_record`:
+   - `content` = the confirmed transcription;
+   - `title` = optional short label (e.g. "Lab blood panel", "Prescription");
+   - `recorded_at` = optional ISO date/datetime the document itself is dated
+     (its printed date, not today).
+4. Confirm back with the stored `id` and `title`.
+
+To find a previously stored document ("my last blood panel", "that
+prescription"), use `list_medical_records` — pass `query` for a fragment
+search across title AND content (a lab name, a medicine, a doctor). Use the
+returned `id` with `delete_medical_record` if the user asks to remove one
+(confirm first). Never ask the user for a record id — `list_medical_records`
+gives you the ids.
 
 ## Escalation Template (urgent)
 
