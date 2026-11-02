@@ -92,8 +92,9 @@ async function uploadScan(args, filePath, recordId) {
   if (!telegramId) return { ok: false, error: "No configured Telegram identity (DRHIRO_TELEGRAM_ID not set)" };
   let bytes;
   try { bytes = fs.readFileSync(filePath); } catch (e) { return { ok: false, error: "Cannot read media file: " + e }; }
-  const ext = (filePath.match(/\.([a-z0-9]+)$/i) || [])[1] || "";
-  const mime = MEDIA_MIME[ext.toLowerCase()] || "application/octet-stream";
+  const extMatch = filePath.match(/\.([a-z0-9]+)$/i);
+  const ext = extMatch ? "." + extMatch[1].toLowerCase() : "";
+  const mime = MEDIA_MIME[ext] || "application/octet-stream";
   const boundary = "----drhiroScan" + Date.now();
   const parts = [];
   if (recordId) {
