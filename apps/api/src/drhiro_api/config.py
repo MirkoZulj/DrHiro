@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DRHIRO_", env_file=".env", extra="ignore")
 
     app_name: str = "drHiro Core API"
-    version: str = "0.7.0"
+    version: str = "0.8.0"
     debug: bool = False
 
     database_url: str = "postgresql+psycopg://drhiro:drhiro@localhost:5432/drhiro"
@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     jev_ledger_guard_enabled: bool = True
 
     miniapp_allowed_origins: list[str] = ["https://t.me"]
+
+    # Where stored medical document scans live (medical.py stores
+    # <dir>/scans/<user_id>/<uuid>.<ext> and medical_records.source_image_path
+    # holds the path relative to this directory).
+    medical_scans_dir: str = "/opt/drhiro/data/medical_scans"
 
 
 @lru_cache

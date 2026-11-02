@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from drhiro_api.config import get_settings
-from drhiro_api.routers import auth, auth_web, dashboard, datapoints, import_csv, ingest, me, meals, openclaw_tools, privacy, reminders
+from drhiro_api.routers import auth, auth_web, dashboard, datapoints, import_csv, ingest, me, meals, medical, openclaw_tools, privacy, reminders
 from drhiro_api.routers.xiaomi_csv import router as xiaomi_csv_router
 
 settings = get_settings()
@@ -45,6 +45,7 @@ app.include_router(import_csv.router, prefix="/api/v1")
 app.include_router(xiaomi_csv_router, prefix="/api/v1")
 app.include_router(ingest.router, prefix="/api/v1")
 app.include_router(meals.router, prefix="/api/v1")
+app.include_router(medical.router, prefix="/api/v1")
 app.include_router(dashboard.router, prefix="/api/v1")
 app.include_router(reminders.router, prefix="/api/v1")
 app.include_router(privacy.router, prefix="/api/v1")

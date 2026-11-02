@@ -506,8 +506,41 @@ class MedicalRecord(Base, TimestampMixin):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     source_type: Mapped[str] = mapped_column(String(32), default="telegram_photo", nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    # Optional link to the clinical encounter this document belongs to.
+    encounter_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("medical_encounters.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    # Optional relative path (within the medical-scans data volume) of the
+    # scanned document image this record was transcribed from. Served only to
+    # the owning user via /api/v1/medical/scan/{record_id}.
+    source_image_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
     user: Mapped["User"] = relationship()
+    encounter: Mapped["MedicalEncounter | None"] = relationship(back_populates="records")
+
+
+class MedicalEncounter(Base, TimestampMixin):
+    """A clinical encounter (visit, lab draw, prescription pickup) that groups
+    one or more transcribed medical records and their source scans.
+
+    Records point at it via ``medical_records.encounter_id``; deleting an
+    encounter deletes the records inside it (the agent confirms first).
+    """
+
+    __tablename__ = "medical_encounters"
+    __table_args__ = (Index("ix_medical_encounters_user_date", "user_id", "encounter_date"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    encounter_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    facility: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    user: Mapped["User"] = relationship()
+    records: Mapped[list["MedicalRecord"]] = relationship(
+        back_populates="encounter", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class LogWriteFingerprint(Base, TimestampMixin):
