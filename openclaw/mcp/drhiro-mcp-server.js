@@ -37,6 +37,93 @@ function readInboundMessageId() {
   return null;
 }
 
+// ---- Inbound media relay (medical scans) ----
+// The gateway saves each inbound Telegram photo to media/inbound/<uuid>.jpg in
+// the shared state volume. The model can never relay binary itself, so the
+// medical-record tools read the NEWEST unconsumed inbound media file
+// server-side and upload the bytes to the API (multipart). A consumed-marker
+// state file prevents re-attaching an older photo on a later turn.
+const MEDIA_DIR = process.env.DRHIRO_MEDIA_DIR || "/home/node/.openclaw/media/inbound";
+const MEDIA_CONSUMED_FILE = process.env.DRHIRO_MEDIA_CONSUMED_FILE || "/home/node/.openclaw/tmp/drhiro-media-consumed.json";
+const MEDIA_TTL_MS = 30 * 60 * 1000;
+const MEDIA_MAX_BYTES = 25 * 1024 * 1024;
+
+function readConsumedSet() {
+  try {
+    const j = JSON.parse(fs.readFileSync(MEDIA_CONSUMED_FILE, "utf8"));
+    if (j && Array.isArray(j.consumed)) return j;
+  } catch (_) {}
+  return { consumed: [], at: Date.now() };
+}
+
+function writeConsumedSet(set) {
+  try {
+    fs.mkdirSync(require("path").dirname(MEDIA_CONSUMED_FILE), { recursive: true });
+    fs.writeFileSync(MEDIA_CONSUMED_FILE, JSON.stringify(set));
+  } catch (e) { try { console.warn("[drhiro-mcp] media consumed write failed: " + e); } catch (_) {} }
+}
+
+/** Newest unconsumed inbound media file within TTL; marks it consumed. */
+function takeLatestInboundMedia() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(MEDIA_DIR).map((name) => {
+      const p = require("path").join(MEDIA_DIR, name);
+      const st = fs.statSync(p);
+      return { path: p, name, mtime: st.mtimeMs, size: st.size };
+    });
+  } catch (_) { return null; }
+  entries = entries.filter((e) => e.mtime > Date.now() - MEDIA_TTL_MS && e.size > 0 && e.size <= MEDIA_MAX_BYTES);
+  entries.sort((a, b) => b.mtime - a.mtime);
+  const consumed = new Set(readConsumedSet().consumed);
+  const candidate = entries.find((e) => !consumed.has(e.path));
+  if (!candidate) return null;
+  consumed.add(candidate.path);
+  writeConsumedSet({ consumed: Array.from(consumed).slice(-50), at: Date.now() });
+  return candidate;
+}
+
+const MEDIA_MIME = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".heic": "image/heic" };
+
+/** Multipart upload of a media file to the API scan route. */
+async function uploadScan(args, filePath, recordId) {
+  if (!SERVICE_TOKEN) return { ok: false, error: "DRHIRO_OPENCLAW_SERVICE_TOKEN not set" };
+  const telegramId = resolveTelegramId(args && args.telegram_id);
+  if (!telegramId) return { ok: false, error: "No configured Telegram identity (DRHIRO_TELEGRAM_ID not set)" };
+  let bytes;
+  try { bytes = fs.readFileSync(filePath); } catch (e) { return { ok: false, error: "Cannot read media file: " + e }; }
+  const ext = (filePath.match(/\.([a-z0-9]+)$/i) || [])[1] || "";
+  const mime = MEDIA_MIME[ext.toLowerCase()] || "application/octet-stream";
+  const boundary = "----drhiroScan" + Date.now();
+  const parts = [];
+  if (recordId) {
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="record_id"\r\n\r\n${recordId}\r\n`));
+  }
+  parts.push(Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="scan${ext}"\r\nContent-Type: ${mime}\r\n\r\n`));
+  parts.push(bytes);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  const body = Buffer.concat(parts);
+  try {
+    const res = await fetch(API_BASE + "/tools/upload_medical_scan", {
+      method: "POST",
+      headers: {
+        "X-Service-Token": SERVICE_TOKEN,
+        "X-Telegram-Id": telegramId,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": String(body.length),
+      },
+      body,
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: `API ${res.status}: ${text.slice(0, 300)}` };
+    try { return JSON.parse(text); } catch { return { ok: true, raw: text }; }
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
 
 function tool(name, description, inputSchema, handler) {
   return { name, description, inputSchema, handler };
@@ -144,9 +231,30 @@ const TOOLS = [
   tool("get_mifitness_import_status", "Status/report of a Mi Fitness import job. Pass job_id from import_mifitness_export (omit for latest). wait_seconds (0-50) waits for completion in one call.",
     { type: "object", properties: { telegram_id: { type: "string" }, job_id: { type: "string" }, wait_seconds: { type: "integer" } }, required: ["telegram_id"] },
     (a) => call("POST", "/tools/get_mifitness_import_status", a, { job_id: a.job_id, wait_seconds: a.wait_seconds || 0 })),
-  tool("add_medical_record", "Store a medical document the user photographed (lab report, prescription, letter). First transcribe the photo FAITHFULLY — original language, exact numbers/units/dates, no summarizing and no translation — then SHOW the transcription to the user and get their confirmation BEFORE calling this. content = the confirmed transcription; title = optional short label (e.g. 'Lab blood panel'); recorded_at = optional ISO date/datetime the document is dated.",
-    { type: "object", properties: { telegram_id: { type: "string" }, title: { type: "string" }, content: { type: "string" }, recorded_at: { type: "string" } }, required: ["telegram_id", "content"] },
-    (a) => call("POST", "/tools/add_medical_record", a, { title: a.title, content: a.content, recorded_at: a.recorded_at })),
+  tool("add_medical_record", "Store a medical document the user photographed (lab report, prescription, letter). First transcribe the photo FAITHFULLY — original language, exact numbers/units/dates, no summarizing and no translation — then SHOW the transcription to the user and get their confirmation BEFORE calling this. content = the confirmed transcription; title = optional short label (e.g. 'Lab blood panel'); recorded_at = optional ISO date/datetime the document is dated; encounter_id = optional encounter id from list_medical_encounters to group this document under a visit; attach_latest_media = set true to store the photo the user just sent as the record's source scan (the bridge relays the image bytes server-side).",
+    { type: "object", properties: { telegram_id: { type: "string" }, title: { type: "string" }, content: { type: "string" }, recorded_at: { type: "string" }, encounter_id: { type: "string" }, attach_latest_media: { type: "boolean" } }, required: ["telegram_id", "content"] },
+    async (a) => {
+      const r = await call("POST", "/tools/add_medical_record", a, { title: a.title, content: a.content, recorded_at: a.recorded_at, encounter_id: a.encounter_id });
+      if (!r || r.ok !== true || !a.attach_latest_media) return r;
+      const recordId = r && r.data && r.data.id;
+      const media = takeLatestInboundMedia();
+      if (!media) return { ...r, data: { ...(r.data || {}), scan: null }, message: (r.message || "") + " No recent inbound photo found to attach as scan." };
+      const up = await uploadScan(a, media.path, recordId);
+      if (!up || up.ok !== true) return { ...r, data: { ...(r.data || {}), scan: { error: (up && up.error) || "upload failed" } } };
+      return { ...r, data: { ...(r.data || {}), scan: up.data } };
+    }),
+  tool("add_medical_encounter", "Create a medical encounter (a visit, lab draw or prescription pickup) that groups related medical records. encounter_date = YYYY-MM-DD of the visit; facility = optional clinic/hospital name; title = optional short label; notes = optional free text. Propose facility + date from the documents and CONFIRM with the user before creating. Then store each document with add_medical_record + the returned encounter_id.",
+    { type: "object", properties: { telegram_id: { type: "string" }, encounter_date: { type: "string" }, facility: { type: "string" }, title: { type: "string" }, notes: { type: "string" } }, required: ["telegram_id", "encounter_date"] },
+    (a) => call("POST", "/tools/add_medical_encounter", a, { encounter_date: a.encounter_date, facility: a.facility, title: a.title, notes: a.notes })),
+  tool("list_medical_encounters", "List the user's medical encounters, newest first, each with its record_count. Use the returned id with get_medical_encounter (details + its records) or delete_medical_encounter.",
+    { type: "object", properties: { telegram_id: { type: "string" }, limit: { type: "integer" } }, required: ["telegram_id"] },
+    (a) => call("POST", "/tools/list_medical_encounters", a, { limit: a.limit || 20 })),
+  tool("get_medical_encounter", "Return one medical encounter and every medical record stored inside it (full transcriptions). encounter_id comes from list_medical_encounters.",
+    { type: "object", properties: { telegram_id: { type: "string" }, encounter_id: { type: "string" } }, required: ["telegram_id", "encounter_id"] },
+    (a) => call("POST", "/tools/get_medical_encounter", a, { encounter_id: a.encounter_id })),
+  tool("delete_medical_encounter", "Delete a medical encounter AND ALL records stored inside it (deletes the documents too). Confirm with the user before calling — this is destructive.",
+    { type: "object", properties: { telegram_id: { type: "string" }, encounter_id: { type: "string" } }, required: ["telegram_id", "encounter_id"] },
+    (a) => call("POST", "/tools/delete_medical_encounter", a, { encounter_id: a.encounter_id })),
   tool("list_medical_records", "List the user's stored medical records (transcriptions of lab reports, prescriptions, letters), newest first. Pass query to search a fragment across title AND content (a lab name, a medicine, a doctor). Use the returned id with delete_medical_record.",
     { type: "object", properties: { telegram_id: { type: "string" }, query: { type: "string" }, limit: { type: "integer" } }, required: ["telegram_id"] },
     (a) => call("POST", "/tools/list_medical_records", a, { query: a.query, limit: a.limit || 20 })),

@@ -94,6 +94,10 @@ Tool list:
 | import_mifitness_export | POST | /tools/import_mifitness_export |
 | get_mifitness_import_status | POST | /tools/get_mifitness_import_status |
 | add_medical_record | POST | /tools/add_medical_record |
+| add_medical_encounter | POST | /tools/add_medical_encounter |
+| list_medical_encounters | POST | /tools/list_medical_encounters |
+| get_medical_encounter | POST | /tools/get_medical_encounter |
+| delete_medical_encounter | POST | /tools/delete_medical_encounter |
 | list_medical_records | POST | /tools/list_medical_records |
 | delete_medical_record | POST | /tools/delete_medical_record |
 
@@ -581,8 +585,34 @@ doctor's letter, referral, discharge summary), use the medical-record tools:
    - `content` = the confirmed transcription;
    - `title` = optional short label (e.g. "Lab blood panel", "Prescription");
    - `recorded_at` = optional ISO date/datetime the document itself is dated
-     (its printed date, not today).
+     (its printed date, not today);
+   - `encounter_id` = optional — group the document under a medical encounter
+     (see below);
+   - `attach_latest_media` = set `true` so the photo the user just sent is
+     stored as the record's source scan (the bridge relays the image bytes
+     server-side — you never handle the image data yourself).
 4. Confirm back with the stored `id` and `title`.
+
+**Encounters — grouping documents from the same visit.** When the user sends
+ONE OR MORE document photos that belong to the same visit (same facility/date,
+or pages of one report), propose a grouping AFTER transcribing: default
+proposal is the facility + date read from the documents ("Domaća laboratorija,
+2026-05-11 — group these together?"). On confirmation:
+
+1. `add_medical_encounter` with `encounter_date` (YYYY-MM-DD), `facility`,
+   optional `title`/`notes` — keep the original language of the document for
+   facility/title;
+2. store each transcription with `add_medical_record` + that `encounter_id`
+   (and `attach_latest_media: true` when the user sent the photo in this
+   conversation);
+3. confirm back with the encounter id and how many documents were stored.
+
+To revisit an encounter ("what was in that blood panel", "all documents from
+the clinic visit"), use `list_medical_encounters` (newest first, each with a
+`record_count`) then `get_medical_encounter` for the full transcriptions.
+`delete_medical_encounter` removes the encounter AND every record inside it —
+always confirm with the user first. Never ask the user for ids;
+`list_medical_encounters` / `list_medical_records` give you the ids.
 
 To find a previously stored document ("my last blood panel", "that
 prescription"), use `list_medical_records` — pass `query` for a fragment

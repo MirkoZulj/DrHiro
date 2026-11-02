@@ -14,10 +14,10 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, text
@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from drhiro_api.db import get_db
 from drhiro_api.deps import get_user_by_telegram_id
-from drhiro_api.models import Activity, Alert, Goal, IngestBatch, Meal, MealItem, Measurement, MedicalRecord, Reminder, ReminderOccurrence, User
+from drhiro_api.models import Activity, Alert, Goal, IngestBatch, Meal, MealItem, Measurement, MedicalEncounter, MedicalRecord, Reminder, ReminderOccurrence, User
 from drhiro_api.routers.auth import mint_web_login_code
 from drhiro_api.routers.dashboard import _measurements_since
 from drhiro_api.security import audit, validate_service_token
@@ -932,6 +932,7 @@ class AddMedicalRecordTool(BaseModel):
     title: str | None = None
     content: str
     recorded_at: datetime | None = None
+    encounter_id: str | None = None  # optional: group under a medical encounter
 
 
 @router.post("/add_medical_record", response_model=ToolResponse)
@@ -946,6 +947,15 @@ def tool_add_medical_record(req: AddMedicalRecordTool, user: User = Depends(_res
     content = (req.content or "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="content must not be empty — store the document's transcription, not a summary")
+    encounter = None
+    if req.encounter_id:
+        encounter = (
+            db.query(MedicalEncounter)
+            .filter(MedicalEncounter.id == _maybe_uuid(req.encounter_id), MedicalEncounter.user_id == user.id)
+            .first()
+        )
+        if not encounter:
+            raise HTTPException(status_code=404, detail="Encounter not found (encounter_id must come from list_medical_encounters)")
     recorded_at = req.recorded_at
     if recorded_at is not None and recorded_at.tzinfo is None:
         recorded_at = recorded_at.replace(tzinfo=resolve_tz(user.timezone))
@@ -955,6 +965,7 @@ def tool_add_medical_record(req: AddMedicalRecordTool, user: User = Depends(_res
         content=content,
         source_type="telegram_photo",
         recorded_at=recorded_at or datetime.now(timezone.utc),
+        encounter_id=encounter.id if encounter else None,
     )
     db.add(rec)
     db.flush()
@@ -1030,8 +1041,201 @@ def _medical_record_out(rec: MedicalRecord) -> dict:
         "content": rec.content,
         "source_type": rec.source_type,
         "recorded_at": rec.recorded_at.isoformat() if rec.recorded_at else None,
+        "encounter_id": str(rec.encounter_id) if rec.encounter_id else None,
+        "source_image_path": rec.source_image_path,
         "created_at": rec.created_at.isoformat() if rec.created_at else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Medical encounters (group records of one visit / lab draw / prescription)
+# ---------------------------------------------------------------------------
+
+
+def _encounter_out(e: MedicalEncounter, record_count: int | None = None) -> dict:
+    out = {
+        "id": str(e.id),
+        "encounter_date": e.encounter_date.isoformat() if e.encounter_date else None,
+        "facility": e.facility,
+        "title": e.title,
+        "notes": e.notes,
+        "created_at": e.created_at.isoformat() if e.created_at else None,
+        "updated_at": e.updated_at.isoformat() if e.updated_at else None,
+    }
+    if record_count is not None:
+        out["record_count"] = record_count
+    return out
+
+
+class AddMedicalEncounterTool(BaseModel):
+    encounter_date: str  # YYYY-MM-DD
+    facility: str | None = None
+    title: str | None = None
+    notes: str | None = None
+
+
+@router.post("/add_medical_encounter", response_model=ToolResponse)
+def tool_add_medical_encounter(req: AddMedicalEncounterTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Create a clinical encounter that groups one or more medical records.
+
+    ``encounter_date`` is the date of the visit/lab draw (YYYY-MM-DD).
+    Default grouping proposal: facility + date taken from the documents —
+    confirm with the user before storing.
+    """
+    try:
+        d = date.fromisoformat((req.encounter_date or "").strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="encounter_date must be YYYY-MM-DD")
+    e = MedicalEncounter(
+        user_id=user.id,
+        encounter_date=d,
+        facility=((req.facility or "").strip() or None),
+        title=((req.title or "").strip() or None),
+        notes=((req.notes or "").strip() or None),
+    )
+    db.add(e)
+    db.flush()
+    _tool_audit(db, user, "tools.add_medical_encounter", "medical_encounter", str(e.id))
+    db.commit()
+    return ToolResponse(
+        ok=True,
+        message=f"Medical encounter stored ({d.isoformat()}). Add records with add_medical_record + encounter_id.",
+        data=_encounter_out(e, 0),
+    )
+
+
+class ListMedicalEncountersTool(BaseModel):
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+@router.post("/list_medical_encounters", response_model=ToolResponse)
+def tool_list_medical_encounters(req: ListMedicalEncountersTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """List the user's medical encounters, newest first, with record counts.
+
+    Use the returned ``id`` with ``get_medical_encounter`` (details + records)
+    or ``delete_medical_encounter``.
+    """
+    from sqlalchemy import func
+
+    rows = (
+        db.query(MedicalEncounter, func.count(MedicalRecord.id))
+        .outerjoin(MedicalRecord, MedicalRecord.encounter_id == MedicalEncounter.id)
+        .filter(MedicalEncounter.user_id == user.id)
+        .group_by(MedicalEncounter.id)
+        .order_by(MedicalEncounter.encounter_date.desc(), MedicalEncounter.created_at.desc())
+        .limit(req.limit)
+        .all()
+    )
+    items = [_encounter_out(e, int(cnt or 0)) for e, cnt in rows]
+    _tool_audit(db, user, "tools.list_medical_encounters", metadata={"count": len(items)})
+    db.commit()
+    return ToolResponse(
+        ok=True,
+        message=f"{len(items)} encounter(s) found." if items else "No medical encounters found.",
+        data={"count": len(items), "encounters": items},
+    )
+
+
+class GetMedicalEncounterTool(BaseModel):
+    encounter_id: str
+
+
+@router.post("/get_medical_encounter", response_model=ToolResponse)
+def tool_get_medical_encounter(req: GetMedicalEncounterTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """One encounter plus the records stored inside it (id from list_medical_encounters)."""
+    e = (
+        db.query(MedicalEncounter)
+        .filter(MedicalEncounter.id == _maybe_uuid(req.encounter_id), MedicalEncounter.user_id == user.id)
+        .first()
+    )
+    if not e:
+        raise HTTPException(status_code=404, detail="Encounter not found")
+    records = (
+        db.query(MedicalRecord)
+        .filter(MedicalRecord.encounter_id == e.id)
+        .order_by(MedicalRecord.recorded_at.desc(), MedicalRecord.created_at.desc())
+        .all()
+    )
+    _tool_audit(db, user, "tools.get_medical_encounter", "medical_encounter", str(e.id))
+    db.commit()
+    return ToolResponse(
+        ok=True,
+        data={"encounter": _encounter_out(e, len(records)), "records": [_medical_record_out(r) for r in records]},
+    )
+
+
+class DeleteMedicalEncounterTool(BaseModel):
+    encounter_id: str
+
+
+@router.post("/delete_medical_encounter", response_model=ToolResponse)
+def tool_delete_medical_encounter(req: DeleteMedicalEncounterTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Delete an encounter AND every medical record stored inside it.
+
+    Confirm with the user before calling — this removes all the documents
+    grouped under the encounter. Refuses unknown ids.
+    """
+    e = (
+        db.query(MedicalEncounter)
+        .filter(MedicalEncounter.id == _maybe_uuid(req.encounter_id), MedicalEncounter.user_id == user.id)
+        .first()
+    )
+    if not e:
+        raise HTTPException(status_code=404, detail="Encounter not found")
+    records = db.query(MedicalRecord).filter(MedicalRecord.encounter_id == e.id).all()
+    info = _encounter_out(e, len(records))
+    for r in records:
+        db.delete(r)
+    db.delete(e)
+    _tool_audit(db, user, "tools.delete_medical_encounter", "medical_encounter", str(e.id),
+                metadata={"record_count": len(records)})
+    db.commit()
+    return ToolResponse(
+        ok=True,
+        message=f"Deleted encounter and {len(records)} record(s).",
+        data={**info, "deleted": True, "deleted_record_count": len(records)},
+    )
+
+
+class UploadMedicalScanTool(BaseModel):
+    record_id: str | None = None  # optional: bind scan to an existing record
+
+
+@router.post("/upload_medical_scan", response_model=ToolResponse)
+async def tool_upload_medical_scan(
+    file: UploadFile = File(...),
+    record_id: str | None = Form(default=None),
+    user: User = Depends(_resolve_user),
+    db: Session = Depends(get_db),
+):
+    """Store a document scan image (multipart) and optionally bind it to a
+    medical record. Used by the MCP bridge, which reads the inbound Telegram
+    photo from the gateway's media directory server-side and relays the bytes —
+    the model never handles binary itself."""
+    from drhiro_api.routers.medical import store_scan
+
+    data = await file.read()
+    rel = store_scan(user, data, file.content_type)
+    rid = None
+    if record_id:
+        rec = (
+            db.query(MedicalRecord)
+            .filter(MedicalRecord.id == _maybe_uuid(record_id), MedicalRecord.user_id == user.id)
+            .first()
+        )
+        if not rec:
+            raise HTTPException(status_code=404, detail="Medical record not found")
+        rec.source_image_path = rel
+        db.add(rec)
+        rid = str(rec.id)
+    _tool_audit(db, user, "tools.upload_medical_scan", "medical_record", rid,
+                metadata={"path": rel, "bound": bool(rid)})
+    db.commit()
+    return ToolResponse(
+        ok=True,
+        message="Scan stored." + (" Bound to record." if rid else ""),
+        data={"path": rel, "record_id": rid},
+    )
 
 
 @router.post("/undo_last_user_action", response_model=ToolResponse)
