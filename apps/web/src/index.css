@@ -503,6 +503,7 @@ button.link:hover { background: none; text-decoration: underline; }
   border-radius: var(--radius-sm);
 }
 .modal-close:hover { background: var(--color-surface-2, #f0f4f5); }
+.records-popup .modal-close { min-height: 44px; min-width: 44px; }
 .modal-content .section { margin-top: var(--space-4); }
 
 /* Analytics insights */
@@ -1883,3 +1884,201 @@ button.link:hover { background: none; text-decoration: underline; }
   font-size: 30px;
 }
 
+
+/* --- Medical Records timeline (/records) -------------------------------- */
+.records-view h2 { margin-bottom: 0; }
+
+.records-timeline { margin-top: var(--space-4); }
+.records-year-group { position: relative; }
+.records-year-label {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-faint);
+  margin: 0 0 8px 34px;
+}
+.records-year-items { position: relative; }
+/* Vertical rail, left of the cards. Node dots sit on it. */
+.records-year-items::before {
+  content: '';
+  position: absolute;
+  left: 18px;
+  top: 4px;
+  bottom: 8px;
+  width: 2px;
+  background: var(--color-border);
+}
+
+.records-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  text-align: left;
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-card);
+  padding: var(--space-3);
+  margin-bottom: 12px;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  min-height: 44px;
+  transition: border-color 0.15s ease;
+}
+.records-card:hover { border-color: var(--color-accent); }
+
+/* Node dot on the rail: filled = encounter has scans, hollow = none. */
+.records-card::before {
+  content: '';
+  position: absolute;
+  left: 13px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--color-surface, #fff);
+  border: 2px solid var(--color-border);
+  box-sizing: border-box;
+}
+.records-card.has-scans::before {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+}
+.records-card { position: relative; }
+
+.records-card-date { flex: 0 0 34px; text-align: center; }
+.records-card-day { font-size: 20px; font-weight: 700; line-height: 1.1; }
+.records-card-monyr { font-size: 11px; color: var(--color-faint); text-transform: uppercase; letter-spacing: 0.04em; }
+
+.records-card-main { flex: 1; min-width: 0; }
+.records-card-title { font-size: 15px; font-weight: 600; }
+.records-card-sub { font-size: 13px; color: var(--color-faint); margin-top: 2px; }
+.records-card-notes {
+  font-size: 13px;
+  color: var(--color-faint);
+  margin-top: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.records-card-chevron { color: var(--color-faint); font-size: 22px; flex: 0 0 auto; }
+
+/* --- Encounter popup ------------------------------------------------------ */
+.records-overlay { align-items: center; }
+.records-popup {
+  max-width: 720px;
+  max-height: 85vh;
+  padding: 0;
+  overflow: hidden;   /* header sticky, body scrolls */
+  display: flex;
+  flex-direction: column;
+}
+.records-popup-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface, #fff);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.records-popup-date { flex: 0 0 34px; text-align: center; }
+.records-popup-headline { flex: 1; min-width: 0; }
+
+.records-popup-scroll { overflow-y: auto; padding: var(--space-4); }
+
+.records-encounter-notes {
+  font-size: 13px;
+  color: var(--color-faint);
+  background: var(--color-surface-2, #f0f4f5);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+/* Per-document section */
+.records-doc { padding: var(--space-2) 0; }
+.records-doc-header { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+.records-doc-index { font-size: 11px; font-weight: 700; color: var(--color-faint); }
+.records-doc-title { font-size: 15px; font-weight: 600; flex: 1; min-width: 0; }
+.records-doc-badge { font-size: 12px; flex: 0 0 auto; }
+.records-scan-pill {
+  flex: 0 0 auto;
+  font-size: 13px;
+  padding: 8px 12px;
+  min-height: 44px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-accent-soft);
+  color: var(--color-accent-text);
+  cursor: pointer;
+}
+.records-doc-body { font-size: 14px; line-height: 1.5; margin-top: var(--space-2); }
+.records-doc-body p { margin: 0 0 var(--space-2); }
+
+.records-conclusion {
+  background: var(--color-accent-soft);
+  border-left: 3px solid var(--color-accent);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  margin-top: var(--space-2);
+}
+.records-conclusion-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-faint);
+}
+.records-conclusion p { margin: 2px 0 0; }
+
+.records-doc-divider { height: 1px; background: var(--color-border); margin: var(--space-2) 0; }
+
+/* --- Scan lightbox --------------------------------------------------------- */
+.records-lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 15, 18, 0.92);
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+}
+.records-lightbox-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+}
+.records-lightbox-title { color: #fff; font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.records-lightbox-close {
+  background: none;
+  border: 0;
+  color: #fff;
+  font-size: 22px;
+  cursor: pointer;
+  padding: 10px;
+  min-height: 44px;
+  min-width: 44px;
+  border-radius: var(--radius-sm);
+}
+.records-lightbox-body { flex: 1; overflow: auto; display: flex; align-items: center; justify-content: center; }
+.records-lightbox-body img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.records-lightbox-loading, .records-lightbox-error { color: #cfd8dc; font-size: 14px; }
+.records-lightbox-error { color: #f1948a; }
+
+/* Responsive: near-fullscreen popup <600px */
+@media (max-width: 600px) {
+  .records-popup {
+    max-width: none;
+    max-height: none;
+    inset: 12px;
+    width: auto;
+    position: fixed;
+    border-radius: var(--radius-lg);
+  }
+}

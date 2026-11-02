@@ -10,12 +10,14 @@ import Consents from './views/Consents'
 import Settings from './views/Settings'
 import ImportMifitness from './views/ImportMifitness'
 import Activities from './views/Activities'
+import Records from './views/Records'
 import TelegramLinkCallback from './views/TelegramLinkCallback'
 import { AppShell } from './components/AppShell'
 
 const NAV = [
   { to: '/', label: 'Home', icon: '🏠', end: true },
   { to: '/activities', label: 'Activities', icon: '🏃' },
+  { to: '/records', label: 'Records', icon: '🩺' },
   { to: '/meals', label: 'Meals', icon: '🍽️' },
   { to: '/reminders', label: 'Reminders', icon: '⏰' },
   { to: '/goals', label: 'Goals', icon: '🎯' },
@@ -45,6 +47,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={user ? <Home /> : <Navigate to="/login" />} />
           <Route path="/activities" element={user ? <Activities /> : <Navigate to="/login" />} />
+          <Route path="/records" element={user ? <Records /> : <Navigate to="/login" />} />
           <Route path="/login" element={user ? <Navigate to="/" /> : <Login onLogin={setUser} />} />
           <Route path="/auth/link" element={<TelegramLinkCallback onLogin={setUser} />} />
           <Route path="/trends" element={<Navigate to="/" replace />} />
