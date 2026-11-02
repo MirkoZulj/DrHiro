@@ -197,8 +197,9 @@ def test_dashboard_encounters_contract(client, service_headers, db):
     assert body["count"] == 1
     e = body["encounters"][0]
     assert set(e.keys()) == {"id", "encounter_date", "facility", "title", "notes",
-                             "created_at", "updated_at", "record_count"}
+                             "created_at", "updated_at", "record_count", "scan_count"}
     assert e["record_count"] == 1
+    assert e["scan_count"] == 0
 
     r = client.get(f"/api/v1/medical/encounters/{eid}", headers=h)
     body = r.json()

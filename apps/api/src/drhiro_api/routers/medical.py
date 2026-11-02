@@ -6,6 +6,9 @@ GET  /api/v1/medical/encounters
      -> {"encounters": [MedicalEncounterOut...], "count": int}
 GET  /api/v1/medical/encounters/{id}
      -> {"encounter": MedicalEncounterOut, "records": [MedicalRecordOut...]}
+
+Every encounter object carries record_count (all records) and scan_count
+(records with a non-null source_image_path) in both list and detail.
 POST /api/v1/medical/scan            (multipart file=; auth)
      -> {"path": "<relative path>", "record_id": null}
 GET  /api/v1/medical/scan/{record_id} (auth; streams the image, owner only)
@@ -78,7 +81,9 @@ def resolve_scan_file(user: User, rel_path: str | None) -> str | None:
     return None
 
 
-def _encounter_out(e: MedicalEncounter, record_count: int | None = None) -> dict:
+def _encounter_out(
+    e: MedicalEncounter, record_count: int | None = None, scan_count: int | None = None
+) -> dict:
     out = {
         "id": str(e.id),
         "encounter_date": e.encounter_date.isoformat() if e.encounter_date else None,
@@ -90,6 +95,8 @@ def _encounter_out(e: MedicalEncounter, record_count: int | None = None) -> dict
     }
     if record_count is not None:
         out["record_count"] = record_count
+    if scan_count is not None:
+        out["scan_count"] = scan_count
     return out
 
 
@@ -112,14 +119,18 @@ def list_encounters(user: User = Depends(get_current_user), db: Session = Depend
     from sqlalchemy import func
 
     rows = (
-        db.query(MedicalEncounter, func.count(MedicalRecord.id))
+        db.query(
+            MedicalEncounter,
+            func.count(MedicalRecord.id),
+            func.count(MedicalRecord.source_image_path),
+        )
         .outerjoin(MedicalRecord, MedicalRecord.encounter_id == MedicalEncounter.id)
         .filter(MedicalEncounter.user_id == user.id)
         .group_by(MedicalEncounter.id)
         .order_by(MedicalEncounter.encounter_date.desc(), MedicalEncounter.created_at.desc())
         .all()
     )
-    encounters = [_encounter_out(e, int(cnt or 0)) for e, cnt in rows]
+    encounters = [_encounter_out(e, int(cnt or 0), int(scnt or 0)) for e, cnt, scnt in rows]
     return {"encounters": encounters, "count": len(encounters)}
 
 
@@ -140,7 +151,11 @@ def get_encounter(encounter_id: str, user: User = Depends(get_current_user), db:
         .order_by(MedicalRecord.recorded_at.desc(), MedicalRecord.created_at.desc())
         .all()
     )
-    return {"encounter": _encounter_out(e, len(records)), "records": [_record_out(r) for r in records]}
+    scan_count = sum(1 for r in records if r.source_image_path)
+    return {
+        "encounter": _encounter_out(e, len(records), scan_count),
+        "records": [_record_out(r) for r in records],
+    }
 
 
 @router.post("/medical/scan")
