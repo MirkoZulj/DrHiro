@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DRHIRO_", env_file=".env", extra="ignore")
 
     app_name: str = "drHiro Core API"
-    version: str = "0.8.0"
+    version: str = "0.8.1"
     debug: bool = False
 
     database_url: str = "postgresql+psycopg://drhiro:drhiro@localhost:5432/drhiro"
@@ -66,6 +66,14 @@ class Settings(BaseSettings):
     # <dir>/scans/<user_id>/<uuid>.<ext> and medical_records.source_image_path
     # holds the path relative to this directory).
     medical_scans_dir: str = "/opt/drhiro/data/medical_scans"
+
+    # Generated artefacts (PDF reports, export bundles). Same data dir as scans.
+    generated_files_dir: str = "/opt/drhiro/data/generated"
+    # System backups (pg dumps, file tars, manifests). Mounted into the worker only.
+    backups_dir: str = "/var/backups/drhiro"
+    # GPG recipient for encrypted backups (env DRHIRO_GPG_RECIPIENT is what the
+    # backup script reads directly; this mirrors it for the API/worker surface).
+    backup_gpg_recipient: str = ""
 
 
 @lru_cache
