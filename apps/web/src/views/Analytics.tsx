@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { authClient } from '../lib/auth'
 import Sparkline from '../components/Sparkline'
+import NutritionCoverage from './NutritionCoverage'
 
 interface Finding {
   id: string
@@ -43,7 +44,7 @@ interface GenFile {
   size_bytes?: number | null
 }
 
-type Tab = 'analyse' | 'visit' | 'history' | 'data'
+type Tab = 'analyse' | 'visit' | 'history' | 'intake' | 'data'
 
 const PRESETS = [
   { key: '30d', label: '30d' },
@@ -65,15 +66,16 @@ export default function Analytics() {
     <div>
       <h2 style={{ margin: '8px 0' }}>Analytics</h2>
       <div className="form-actions" style={{ marginBottom: 12 }}>
-        {(['analyse', 'visit', 'history', 'data'] as Tab[]).map((t) => (
+        {(['analyse', 'visit', 'history', 'intake', 'data'] as Tab[]).map((t) => (
           <button key={t} className={tab === t ? '' : 'secondary'} onClick={() => setTab(t)}>
-            {t === 'analyse' ? 'Analyse' : t === 'visit' ? 'Doctor visit' : t === 'history' ? 'History' : 'Data & backup'}
+            {t === 'analyse' ? 'Analyse' : t === 'visit' ? 'Doctor visit' : t === 'history' ? 'History' : t === 'intake' ? 'Intake analysis' : 'Data & backup'}
           </button>
         ))}
       </div>
       {tab === 'analyse' && <AnalyseTab />}
       {tab === 'visit' && <VisitTab />}
       {tab === 'history' && <HistoryTab />}
+      {tab === 'intake' && <NutritionCoverage />}
       {tab === 'data' && <DataTab />}
     </div>
   )

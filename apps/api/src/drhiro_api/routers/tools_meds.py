@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy.orm import Session
 
 from drhiro_api.db import get_db
@@ -52,7 +52,7 @@ class UpdateMedRequest(BaseModel):
     schedule_json: dict | None = None
     brand: str | None = None
     form: str | None = None
-    ingredients_json: list | None = None
+    ingredients_json: list | None = Field(default=None, validation_alias=AliasChoices("ingredients_json", "ingredients"))
     start_date: str | None = None
     end_date: str | None = None
     reason: str | None = None

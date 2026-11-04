@@ -7,6 +7,7 @@ interface MedItem {
   kind: string
   name: string
   brand?: string | null
+  ingredients_json?: Array<Record<string, unknown>> | null
   dose_amount?: number | null
   dose_unit?: string | null
   schedule_json?: Record<string, unknown> | null
@@ -37,6 +38,7 @@ function fmtSchedule(s: Record<string, unknown> | null | undefined): string {
   return t || '—'
 }
 
+
 /** Wave 3 (spec §5.8): Meds dashboard — active list, today strip, adherence
  *  day/week/month view, history timeline. */
 export default function Medications() {
@@ -46,6 +48,10 @@ export default function Medications() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [tab, setTab] = useState<'supplement' | 'medication'>('supplement')
+  const [detail, setDetail] = useState<any | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
 
   // add form
@@ -77,6 +83,20 @@ export default function Medications() {
     load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [granularity])
+
+  async function openSupplement(item: MedItem) {
+    if (expandedId === item.id) { setExpandedId(null); setDetail(null); return }
+    setExpandedId(item.id)
+    setDetailLoading(true)
+    try {
+      const res = await authClient.api(`/medications/${item.id}/composition`)
+      setDetail(res)
+    } catch (e) {
+      setMsg(String(e))
+    } finally {
+      setDetailLoading(false)
+    }
+  }
 
   async function logDose(item: MedItem, status: 'taken' | 'skipped') {
     setBusyId(item.id)
@@ -129,11 +149,81 @@ export default function Medications() {
   }
 
   const active = items.filter((i) => i.status === 'active')
+  const supplements = active.filter((i) => i.kind === 'supplement')
+  const medications = active.filter((i) => i.kind !== 'supplement')
+  const shown = tab === 'supplement' ? supplements : medications
+
+  function itemCard(i: MedItem) {
+    const expanded = expandedId === i.id
+    return (
+      <div className="card" key={i.id}>
+        <div className="label">
+          {i.kind === 'medication' ? '💊' : '🌿'} {i.name}
+          {i.brand ? ` · ${i.brand}` : ''}
+        </div>
+        <div className="value">
+          {i.dose_amount ?? '—'} <small>{i.dose_unit || ''}</small>
+        </div>
+        <div className="sub">{fmtSchedule(i.schedule_json)}</div>
+        <div className="sub">
+          since {i.start_date || '—'}
+          {i.stock_quantity !== null && i.stock_quantity !== undefined ? ` · stock: ${i.stock_quantity}` : ''}
+        </div>
+        <div className="form-actions" style={{ marginTop: 8 }}>
+          <button className="secondary" onClick={() => openSupplement(i)}>
+            {expanded ? 'Hide detail' : 'Detail'}
+          </button>
+          <button disabled={busyId === i.id} onClick={() => logDose(i, 'taken')}>✓ Taken</button>
+          <button className="secondary" disabled={busyId === i.id} onClick={() => logDose(i, 'skipped')}>– Skip</button>
+          <button className="secondary" disabled={busyId === i.id} onClick={() => setStatus(i, 'pause')}>Pause</button>
+          <button className="danger" disabled={busyId === i.id} onClick={() => setStatus(i, 'stop')}>Stop</button>
+        </div>
+        {expanded && (
+          <div style={{ marginTop: 8 }}>
+            {detailLoading && detail?.item_id !== i.id ? (
+              <div className="loading">Loading…</div>
+            ) : detail && detail.item_id === i.id ? (
+              detail.rows.length === 0 ? (
+                <p className="muted">No composition recorded for this item.</p>
+              ) : (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Component</th>
+                      <th>Per capsule</th>
+                      {detail.dose_amount > 1 && <th>Per dose ({detail.dose_amount} ×)</th>}
+                      <th>Daily required</th>
+                      <th>% per capsule</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {detail.rows.map((r: any, idx: number) => (
+                      <tr key={idx}>
+                        <td>{r.component}</td>
+                        <td>{r.per_capsule === null ? '—' : `${r.per_capsule} ${r.unit}`}</td>
+                        {detail.dose_amount > 1 && (
+                          <td>{r.per_dose_total === null ? '—' : `${r.per_dose_total} ${r.unit}`}</td>
+                        )}
+                        <td>{r.rda === null ? '—' : `${r.rda} ${r.unit}`}</td>
+                        <td>{r.pct_per_capsule === null ? '—' : `${r.pct_per_capsule}%`}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )
+            ) : (
+              <p className="muted">No composition recorded for this item.</p>
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
 
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <h2 style={{ margin: '8px 0' }}>Meds</h2>
+        <h2 style={{ margin: '8px 0' }}>Meds &amp; Supplements</h2>
         <button className="secondary" onClick={() => setAdding(!adding)}>
           {adding ? 'Cancel' : '+ Add'}
         </button>
@@ -184,30 +274,20 @@ export default function Medications() {
           <section className="section">
             <h3>Active ({active.length})</h3>
             {active.length === 0 && <p className="muted">Nothing active. Add a supplement or medication above.</p>}
-            <div className="cards">
-              {active.map((i) => (
-                <div className="card" key={i.id}>
-                  <div className="label">
-                    {i.kind === 'medication' ? '💊' : '🌿'} {i.name}
-                    {i.brand ? ` · ${i.brand}` : ''}
-                  </div>
-                  <div className="value">
-                    {i.dose_amount ?? '—'} <small>{i.dose_unit || ''}</small>
-                  </div>
-                  <div className="sub">{fmtSchedule(i.schedule_json)}</div>
-                  <div className="sub">
-                    since {i.start_date || '—'}
-                    {i.stock_quantity !== null && i.stock_quantity !== undefined ? ` · stock: ${i.stock_quantity}` : ''}
-                  </div>
-                  <div className="form-actions" style={{ marginTop: 8 }}>
-                    <button disabled={busyId === i.id} onClick={() => logDose(i, 'taken')}>✓ Taken</button>
-                    <button className="secondary" disabled={busyId === i.id} onClick={() => logDose(i, 'skipped')}>– Skip</button>
-                    <button className="secondary" disabled={busyId === i.id} onClick={() => setStatus(i, 'pause')}>Pause</button>
-                    <button className="danger" disabled={busyId === i.id} onClick={() => setStatus(i, 'stop')}>Stop</button>
-                  </div>
-                </div>
-              ))}
+            <div className="form-actions" style={{ marginBottom: 8 }}>
+              <button className={tab === 'supplement' ? '' : 'secondary'} onClick={() => setTab('supplement')}>
+                Supplements ({supplements.length})
+              </button>
+              <button className={tab === 'medication' ? '' : 'secondary'} onClick={() => setTab('medication')}>
+                Meds ({medications.length})
+              </button>
             </div>
+            {shown.length === 0 && (
+              <p className="muted">
+                {tab === 'supplement' ? 'No active supplements.' : 'No active medications.'}
+              </p>
+            )}
+            <div className="cards">{shown.map(itemCard)}</div>
           </section>
 
           <section className="section">

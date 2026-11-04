@@ -11,7 +11,7 @@ import uuid
 from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy.orm import Session
 
 from drhiro_api.db import get_db
@@ -57,7 +57,9 @@ class MedicationPatchRequest(BaseModel):
     name: str | None = None
     brand: str | None = None
     form: str | None = None
-    ingredients_json: list | None = None
+    # Alias "ingredients" accepted too: agents send label facts under
+    # either name and a silently-ignored extra field hid composition.
+    ingredients_json: list | None = Field(default=None, validation_alias=AliasChoices("ingredients_json", "ingredients"))
     dose_amount: float | None = None
     dose_unit: str | None = None
     schedule_json: dict | None = None
@@ -285,6 +287,49 @@ def get_medication(item_id: str, user: User = Depends(get_current_user), db: Ses
         ],
         "adherence_30d": a30,
     }
+
+
+@router.get("/{item_id}/composition")
+def get_composition(item_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Per-capsule composition vs daily RDA (wave 4 final spec).
+
+    One row per ingredients_json entry mapped to the shared
+    nutrition_rda reference table: amount per capsule (per_1_* basis),
+    per-dose total when dose_amount > 1, daily required amount and
+    % of daily per capsule. Unmapped entries are returned with
+    nutrient_key=None (never dropped, never fabricated)."""
+    from drhiro_api.services.nutrition_rda import RDA_TABLE, age_from_profile, ingredient_to_rda, rda_for_age
+
+    item = _get_item(db, user, item_id)
+    age = age_from_profile(user)
+    rows = []
+    for entry in (item.ingredients_json or []):
+        if not isinstance(entry, dict):
+            continue
+        comp = str(entry.get("component") or entry.get("name") or entry.get("ingredient") or "—")
+        mapped = ingredient_to_rda(entry)
+        if mapped is None:
+            rows.append({
+                "component": comp, "nutrient_key": None,
+                "per_capsule": None, "unit": None, "rda": None,
+                "pct_per_capsule": None, "raw": entry,
+            })
+            continue
+        key, per_capsule = mapped
+        _name, _base, unit, _src = RDA_TABLE[key]
+        rda = rda_for_age(key, age)
+        dose = float(item.dose_amount or 1.0)
+        rows.append({
+            "component": comp, "nutrient_key": key,
+            "per_capsule": round(per_capsule, 2), "unit": unit,
+            "per_dose_total": round(per_capsule * dose, 2) if dose > 1 else None,
+            "dose_amount": item.dose_amount, "dose_unit": item.dose_unit,
+            "rda": rda, "pct_per_capsule": round(per_capsule / rda * 100, 1) if rda else None,
+            "raw": entry,
+        })
+    return {"item_id": str(item.id), "name": item.name, "kind": item.kind,
+            "dose_amount": item.dose_amount, "dose_unit": item.dose_unit,
+            "age": age, "rows": rows}
 
 
 @router.patch("/{item_id}")
