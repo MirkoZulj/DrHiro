@@ -195,20 +195,42 @@ def _dedup_steps(records: list[dict]) -> int:
         if (r.get("end_at") or r["start_at"]) - r["start_at"] >= timedelta(seconds=BUCKET_SECS)
     ]
 
+    def _count(rec) -> float:
+        # Writers use different keys: Health Connect bridge sends
+        # {"count": N}, the generic data-points writer may send
+        # {"value": N} or {"steps": N}. Reading only "count" turned
+        # every non-"count" row into 0 steps (wave 4 steps=0 bug).
+        vj = rec.get("value_json") or {}
+        for k in ("count", "value", "steps"):
+            if vj.get(k) is not None:
+                return float(vj[k])
+        return 0.0
+
     # Buckets are authoritative: count fully, occupy their whole interval.
     occupied: list[tuple[datetime, datetime]] = []
     total = 0
     for rec in buckets:
         start = rec["start_at"]
         end = rec.get("end_at") or start
-        total += (rec.get("value_json") or {}).get("count", 0)
+        total += _count(rec)
         occupied.append((start, end))
 
     # Detail records: only credit the portion NOT covered by any bucket.
     for rec in detail:
         start = rec["start_at"]
         end = rec.get("end_at") or start
-        count = (rec.get("value_json") or {}).get("count", 0)
+        count = _count(rec)
+        if end <= start:
+            # Zero-duration point record (daily total stamped at an
+            # instant, e.g. Xiaomi CSV import): it has no interval to
+            # prorate, so the old `total_sec > 0` guard dropped it to
+            # 0. Count it fully unless a bucket already covers its
+            # instant (then it is a covered detail, not a daily total).
+            if any(os_ <= start < oe for os_, oe in occupied):
+                continue
+            total += count
+            occupied.append((start, end))
+            continue
         uncovered = [(start, end)]
         for occ_start, occ_end in occupied:
             new_uncovered: list[tuple[datetime, datetime]] = []

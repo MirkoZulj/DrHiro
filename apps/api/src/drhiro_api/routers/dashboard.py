@@ -1149,7 +1149,7 @@ def trends_bucketed(
                 active[day] = active.get(day, 0.0) + v
                 active_avail = True
             elif m.metric_type == MetricType.STEPS:
-                steps_by_day[day] = steps_by_day.get(day, 0.0) + float((m.value_json or {}).get("count") or 0)
+                steps_by_day[day] = steps_by_day.get(day, 0.0) + float((m.value_json or {}).get("count") or (m.value_json or {}).get("value") or (m.value_json or {}).get("steps") or 0)
         # walking kcal: prefer tracker active energy, else steps*0.04
         buckets: list[list[float]] = [[] for _ in range(n)]
         for i in range(n):
