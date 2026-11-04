@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+<head><meta charset="utf-8"><link rel="stylesheet" href="base.css"></head>
+<body>
+{% set card = card %}
+{% set s = card.stored %}
+{% set d = card.derived %}
+<h1>{% if lang == 'hr' %}Zdravstvena kartica{% else %}Health card{% endif %}</h1>
+<div class="meta">{{ d.display_name }} · DOB {{ d.date_of_birth or '—' }} ({{ d.age or '—' }}) ·
+{{ d.sex or '—' }} · height {{ d.height_cm or '—' }} cm ·
+{% if lang == 'hr' %}posljednja masa{% else %}latest weight{% endif %} {{ d.latest_weight_kg or '—' }}</div>
+
+<table>
+  <tr><td>{% if lang == 'hr' %}Krvna grupa{% else %}Blood type{% endif %}</td><td>{{ s.blood_type or '—' }}</td>
+      <td>{% if lang == 'hr' %}Donor organa{% else %}Organ donor{% endif %}</td><td>{{ s.organ_donor or '—' }}</td></tr>
+</table>
+
+<h2>{% if lang == 'hr' %}Trenutni lijekovi i suplementi{% else %}Current medications &amp; supplements{% endif %}</h2>
+<table>
+  {% for m in d.current_medications %}<tr><td>{{ m.name }}</td><td>{{ m.dose_amount or '' }} {{ m.dose_unit or '' }}</td></tr>
+  {% else %}<tr><td>—</td></tr>{% endfor %}
+</table>
+
+<h2>{% if lang == 'hr' %}Alergije{% else %}Allergies{% endif %}</h2>
+<p class="card-section entries">
+  {% for a in s.allergies %}{{ a.substance }} ({{ a.severity or '?' }}){% if not loop.last %}; {% endif %}{% else %}—{% endfor %}</p>
+
+<h2>{% if lang == 'hr' %}Dijagnoze / stanja{% else %}Conditions{% endif %}</h2>
+<p class="card-section entries">
+  {% for c in s.conditions %}{{ c.name }} ({{ c.status }}){% if not loop.last %}; {% endif %}{% else %}—{% endfor %}</p>
+
+<h2>{% if lang == 'hr' %}Hitni kontakti{% else %}Emergency contacts{% endif %}</h2>
+<p class="card-section entries">
+  {% for c in s.emergency_contacts %}{{ c.name }} ({{ c.relation }}) {{ c.phone or '' }}{% if not loop.last %}; {% endif %}{% else %}—{% endfor %}</p>
+
+{% if s.notes %}<h2>Notes</h2><div class="verbatim">{{ s.notes }}</div>{% endif %}
+
+<p class="footer-note">
+  {% if lang == 'hr' %}Samostalno održavano od strane pacijenta.{% else %}Self-maintained by the patient.{% endif %}
+  Last reviewed: {{ card.reviewed_at or '—' }}</p>
+
+{# ── Wallet-size emergency block, bilingual hr/en (spec §6.4) ── #}
+<div class="wallet">
+  <div class="wallet-box">
+    <strong>HR / EN — HITNI PODACI / EMERGENCY</strong><br>
+    {{ d.display_name }} · DOB {{ d.date_of_birth or '—' }} ·
+    Krvna grupa / Blood type: {{ s.blood_type or '—' }}<br>
+    {% if lang %}<strong>Alergije / Allergies:</strong>
+      {% for a in s.allergies %}{{ a.substance }}{% if a.severity == 'severe' %} (SEVERE/TEŠKA){% endif %}{% if not loop.last %}; {% endif %}{% else %}—{% endfor %}<br>
+      <strong>Stanja / Conditions:</strong>
+      {% for c in s.conditions %}{{ c.name }}{% if not loop.last %}; {% endif %}{% else %}—{% endfor %}<br>
+      <strong>Lijekovi / Medications:</strong>
+      {% for m in d.current_medications[:6] %}{{ m.name }}{% if not loop.last %}; {% endif %}{% else %}—{% endfor %}<br>
+      <strong>Kontakti / Contacts:</strong>
+      {% for c in s.emergency_contacts[:2] %}{{ c.name }} {{ c.phone or '' }}{% if not loop.last %}; {% endif %}{% else %}—{% endfor %}
+    {% endif %}
+  </div>
+</div>
+</body>
+</html>

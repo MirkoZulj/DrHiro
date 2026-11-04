@@ -1,0 +1,39 @@
+/* Shared report CSS (spec §3.9): A4, 12 mm margins, 9.5 pt, DejaVu. */
+@page {
+    size: A4;
+    margin: 12mm;
+    @bottom-center {
+        content: "Self-recorded data. Not a medical device. Contains no diagnosis. — "
+                 "engine " string(engine-version) " · " string(period);
+        font-size: 7.5pt;
+        color: #666;
+    }
+}
+body {
+    font-family: "DejaVu Sans", sans-serif;
+    font-size: 9.5pt;
+    color: #1a1a1a;
+    line-height: 1.45;
+}
+h1 { font-size: 16pt; margin: 0 0 2mm 0; }
+h2 { font-size: 12pt; margin: 6mm 0 2mm 0; border-bottom: 0.5pt solid #ccc; }
+h3 { font-size: 10pt; margin: 4mm 0 1mm 0; }
+table { width: 100%; border-collapse: collapse; margin: 2mm 0; }
+th, td { text-align: left; padding: 1mm 2mm; border-bottom: 0.5pt solid #ddd; font-size: 8.5pt; }
+th { background: #f3f3f3; }
+.meta { color: #555; font-size: 8.5pt; margin-bottom: 4mm; }
+.finding { margin: 2mm 0; padding: 2mm 3mm; border-left: 2mm solid #4a7fb5; background: #f6f9fc; }
+.finding .conf { float: right; font-size: 8pt; color: #555; }
+.unknowns li { font-size: 9pt; margin: 1mm 0; }
+.ai-summary { border: 0.5pt dashed #999; padding: 2mm 3mm; margin-top: 4mm; }
+.ai-summary .label { font-size: 8pt; color: #666; text-transform: uppercase; }
+.verbatim { white-space: pre-wrap; background: #f8f8f8; padding: 2mm; font-size: 8.5pt; }
+ol.questions li { margin: 1mm 0; }
+.footer-note { font-size: 8pt; color: #666; }
+.card-section { margin: 2mm 0; }
+.card-section .entries { font-size: 8.5pt; }
+.wallet { page-break-before: always; }
+.wallet-box {
+    width: 85mm; height: 54mm; border: 0.5pt dashed #999; padding: 3mm;
+    font-size: 7.5pt; overflow: hidden;
+}

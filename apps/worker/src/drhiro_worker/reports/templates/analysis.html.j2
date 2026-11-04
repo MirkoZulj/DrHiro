@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+<head><meta charset="utf-8"><link rel="stylesheet" href="base.css"></head>
+<body>
+<h1>{% if lang == 'hr' %}Analiza podataka{% else %}Data analysis report{% endif %}</h1>
+<div class="meta">{{ run.period_start }} – {{ run.period_end }} ·
+engine {{ run.engine_version }} · thresholds {{ run.thresholds_version }} ·
+fingerprint {{ run.data_fingerprint }}</div>
+
+<h2>{% if lang == 'hr' %}Promjene u razdoblju{% else %}Changes in this period{% endif %}</h2>
+{% for f in findings %}
+  <div class="finding"><span class="conf">{{ f.confidence }}</span>
+    <strong>{{ f.metric_label }}</strong> — {{ f.text }}
+  </div>
+{% else %}
+  <p class="footer-note">{% if lang == 'hr' %}Nema pronađenih promjena.{% else %}No changes detected.{% endif %}</p>
+{% endfor %}
+
+<h2>{% if lang == 'hr' %}Pregled metrika{% else %}Metric overview{% endif %}</h2>
+<table>
+  <tr><th>{% if lang == 'hr' %}Metrika{% else %}Metric{% endif %}</th><th>median</th><th>IQR</th><th>coverage</th><th>n</th></tr>
+  {% for m in metrics %}
+  <tr><td>{{ labels.get(m.key, m.key) }}</td><td>{{ m.median }}</td><td>{{ m.iqr }}</td><td>{{ m.coverage }}</td><td>{{ m.n }}</td></tr>
+  {% endfor %}
+</table>
+
+<h2>{% if lang == 'hr' %}Što podaci ne mogu reći{% else %}What the data cannot tell{% endif %}</h2>
+<ul class="unknowns">
+  {% for u in unknowns %}<li>{{ u.text }}</li>{% endfor %}
+</ul>
+
+{% if narrative_status == 'ok' and narrative_text %}
+<div class="ai-summary"><div class="label">AI-written summary of the findings above</div>
+  {{ narrative_text }}</div>
+{% endif %}
+</body>
+</html>

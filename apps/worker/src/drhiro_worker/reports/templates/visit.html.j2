@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+<head><meta charset="utf-8"><link rel="stylesheet" href="base.css"></head>
+<body>
+<h1>{% if lang == 'hr' %}Sažetak za posjet liječniku{% else %}Visit summary{% endif %}</h1>
+{% set intent = visit.intent or {} %}
+<div class="meta">
+  Prepared for: {{ intent.provider_type }}{% if intent.facility %} — {{ intent.facility }}{% endif %}
+  {% if intent.visit_date %} · {{ intent.visit_date }}{% endif %}
+  · {{ run.period_start }} – {{ run.period_end }} · engine {{ run.engine_version }} ·
+  profile {{ visit.profile_version }} · fingerprint {{ run.data_fingerprint }}
+</div>
+
+{% set card = visit.health_card_snapshot or {} %}
+<h2>{% if lang == 'hr' %}Osnovni podaci{% else %}Patient header{% endif %}</h2>
+<table>
+  <tr><td>DOB</td><td>{{ card.date_of_birth or '—' }}</td>
+      <td>Blood type</td><td>{{ card.blood_type or '—' }}</td></tr>
+  <tr><td>Conditions</td><td colspan="3">
+      {% for c in card.conditions or [] %}{{ c.name }} ({{ c.status }}){% if not loop.last %}; {% endif %}{% endfor %}</td></tr>
+  <tr><td>Allergies</td><td colspan="3">
+      {% for a in card.allergies or [] %}{{ a.substance }} ({{ a.severity or '?' }}){% if not loop.last %}; {% endif %}{% endfor %}</td></tr>
+  <tr><td>Emergency</td><td colspan="3">
+      {% for c in card.emergency_contacts or [] %}{{ c.name }} ({{ c.relation }}) {{ c.phone or '' }}{% if not loop.last %}; {% endif %}{% endfor %}</td></tr>
+</table>
+
+<h2>{% if lang == 'hr' %}Svrha posjeta{% else %}Purpose of visit{% endif %}</h2>
+<div class="verbatim">{{ intent.purpose or '—' }}</div>
+
+<h2>{% if lang == 'hr' %}Moja pitanja{% else %}My questions{% endif %}</h2>
+<ol class="questions">
+  {% for q in intent.questions or [] %}<li>{{ q }}</li>
+  {% else %}<li>—</li>{% endfor %}
+</ol>
+
+<h2>{% if lang == 'hr' %}Promjene u razdoblju{% else %}Changes in this period{% endif %}</h2>
+{% for f in findings %}
+  <div class="finding"><span class="conf">{{ f.confidence }}</span>
+    <strong>{{ f.metric_label }}</strong> — {{ f.text }}</div>
+{% else %}
+  <p class="footer-note">No changes detected.</p>
+{% endfor %}
+
+<h2>{% if lang == 'hr' %}Lijekovi i suplementi{% else %}Medications &amp; supplements{% endif %}</h2>
+<table>
+  <tr><th>Name</th><th>Dose</th><th>Schedule</th><th>Since</th><th>Adherence</th></tr>
+  {% for m in visit.medications or [] %}
+  <tr><td>{{ m.name }}</td><td>{{ m.dose or '' }} {{ m.dose_unit or '' }}</td>
+      <td>{{ m.schedule }}</td><td>{{ m.start_date or '' }}</td>
+      <td>{% if m.adherence_known %}{{ m.adherence_pct_period }}%{% else %}
+          {% if lang == 'hr' %}nije bilježeno{% else %}not logged{% endif %}{% endif %}</td></tr>
+  {% endfor %}
+</table>
+{% if visit.medication_changes_in_period %}
+<p class="footer-note">Changes in period:
+  {% for c in visit.medication_changes_in_period %}{{ c.day }} {{ c.kind }}{% if not loop.last %}; {% endif %}{% endfor %}</p>
+{% endif %}
+
+{% if visit.encounters_in_period %}
+<h2>{% if lang == 'hr' %}Posjeti u razdoblju{% else %}Encounters in period{% endif %}</h2>
+<ul>{% for e in visit.encounters_in_period %}
+  <li>{{ e.date }} — {{ e.facility or '' }} {{ e.title or '' }}</li>{% endfor %}</ul>
+{% endif %}
+
+{% if visit.attached_records %}
+<h2>{% if lang == 'hr' %}Priloženi nalazi (doslovno){% else %}Attached records (verbatim){% endif %}</h2>
+{% for r in visit.attached_records %}
+<h3>{{ r.title or r.id }}</h3><div class="verbatim">{{ r.content }}</div>
+{% endfor %}
+{% endif %}
+
+<h2>{% if lang == 'hr' %}Što podaci ne mogu reći{% else %}What the data cannot tell{% endif %}</h2>
+<ul class="unknowns">{% for u in unknowns %}<li>{{ u.text }}</li>{% endfor %}</ul>
+
+{% if narrative_status == 'ok' and narrative_text %}
+<div class="ai-summary"><div class="label">AI-written summary of the findings above</div>
+  {{ narrative_text }}</div>
+{% endif %}
+</body>
+</html>

@@ -18,6 +18,7 @@ os.environ.setdefault(
 os.environ.setdefault("DRHIRO_REDIS_URL", "redis://localhost:6382/0")
 os.environ.setdefault("DRHIRO_JWT_SECRET", "test-secret-key-0123456789abcdefghijklmnopqrstuv")
 os.environ.setdefault("DRHIRO_TELEGRAM_BOT_TOKEN", "123456:test-bot-token-for-initdata")
+os.environ.setdefault("DRHIRO_GENERATED_FILES_DIR", "/tmp/drhiro-test-generated")
 
 from drhiro_api.db import Base, engine, SessionLocal  # noqa: E402
 from drhiro_api.main import app  # noqa: E402

@@ -9,6 +9,7 @@ Runs as a long-lived process (scheduler service). On each tick:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -23,6 +24,42 @@ from drhiro_api.routers.reminders import _compute_next_due
 logger = logging.getLogger(__name__)
 
 TICK_SECONDS = 30
+
+# Periodic daily jobs (spec §2.4): (name, local HH:MM in system tz, callable
+# returning a report dict). Fire-once bookkeeping is a Redis key
+# drhiro:periodic:<name>:<YYYY-MM-DD> SET NX EX 172800 — safe if the scheduler
+# restarts. Analytics is NOT scheduled (runs on demand only).
+PERIODIC = [
+    ("files_retention", "03:30", "drhiro_worker.files.expire_files"),
+    ("backup_staleness", "09:00", "drhiro_worker.jobs_backup.check_backup_staleness"),
+]
+
+
+def run_periodic(db) -> dict:
+    import importlib
+
+    from zoneinfo import ZoneInfo
+
+    settings = get_settings()
+    tz = ZoneInfo(os.environ.get("DRHIRO_SYSTEM_TZ", "Europe/Zagreb"))
+    now_local = datetime.now(tz)
+    today = now_local.strftime("%Y-%m-%d")
+    r = redis.Redis.from_url(settings.redis_url)
+    out = {}
+    for name, hhmm, func_ref in PERIODIC:
+        if now_local.strftime("%H:%M") < hhmm:
+            continue
+        key = f"drhiro:periodic:{name}:{today}"
+        if not r.set(key, "1", nx=True, ex=172800):
+            continue
+        try:
+            mod_name, fn_name = func_ref.rsplit(".", 1)
+            fn = getattr(importlib.import_module(mod_name), fn_name)
+            out[name] = fn()
+        except Exception as e:  # a failed periodic job must not kill the tick
+            logger.error("periodic %s failed: %s", name, e)
+            out[name] = {"error": str(e)}
+    return out
 
 
 def generate_occurrences(db) -> int:
@@ -58,6 +95,7 @@ def run_once() -> dict:
     db = SessionLocal()
     try:
         created = generate_occurrences(db)
+        periodic = run_periodic(db)
         due = due_occurrences(db)
         settings = get_settings()
         r = redis.Redis.from_url(settings.redis_url)
@@ -86,7 +124,7 @@ def run_once() -> dict:
                 )
                 occ.status = "pending"
                 db.commit()
-        return {"occurrences_created": created, "due_delivered": delivered}
+        return {"occurrences_created": created, "due_delivered": delivered, "periodic": periodic}
     finally:
         db.close()
 
