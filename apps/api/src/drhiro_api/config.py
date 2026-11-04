@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DRHIRO_", env_file=".env", extra="ignore")
 
     app_name: str = "drHiro Core API"
-    version: str = "0.8.1"
+    version: str = "0.9.0"
     debug: bool = False
 
     database_url: str = "postgresql+psycopg://drhiro:drhiro@localhost:5432/drhiro"

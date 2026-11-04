@@ -66,3 +66,51 @@ def recompute_alerts_for_user(db: Session, user_id: uuid.UUID) -> list[Alert]:
     if created:
         db.commit()
     return created
+
+
+def recompute_medication_alerts(db: Session, user_id: uuid.UUID) -> list[Alert]:
+    """Evaluate the medication rules (duplicate ingredients across ACTIVE
+    items) after any medication write. Spec §5.4."""
+    from drhiro_api.models import MedicationItem
+    from drhiro_rules.medications import evaluate_medication_rules
+
+    items = (
+        db.query(MedicationItem)
+        .filter(MedicationItem.user_id == user_id, MedicationItem.status == "active")
+        .all()
+    )
+    rows = [
+        {"id": str(m.id), "name": m.name, "ingredients_json": m.ingredients_json}
+        for m in items
+    ]
+    candidates = evaluate_medication_rules(rows)
+    existing_open = {
+        a.params_json.get("ingredient")
+        for a in db.query(Alert)
+        .filter(
+            Alert.user_id == user_id,
+            Alert.rule_code == "MED_DUPLICATE_INGREDIENT",
+            Alert.status == "open",
+        )
+        .all()
+        if isinstance(a.params_json, dict)
+    }
+    created = []
+    for cand in candidates:
+        if cand.params["ingredient"] in existing_open:
+            continue
+        alert = Alert(
+            user_id=user_id,
+            rule_code=cand.rule_code,
+            rule_version=cand.rule_version,
+            trigger_record_ids=cand.trigger_record_ids,
+            severity=cand.severity,
+            status="open",
+            explanation_template=cand.explanation_template,
+            params_json=cand.params,
+        )
+        db.add(alert)
+        created.append(alert)
+    if created:
+        db.commit()
+    return created
