@@ -146,10 +146,16 @@ def adherence(db: Session, user: User, item: MedicationItem, start: date, end: d
         .all()
     )
     slot_status = {}
+    tz = ZoneInfo(user.timezone)
     for ev in events:
         # nearest slot within ±4h of the event's scheduled_for
         best = min(slots, key=lambda s: abs((ev.scheduled_for - s).total_seconds()), default=None)
         if best is not None and abs((ev.scheduled_for - best).total_seconds()) <= SLOT_MATCH_WINDOW_HOURS * 3600:
+            slot_status[best] = ev.status
+        elif best is not None and ev.scheduled_for.astimezone(tz).date() == best.astimezone(tz).date():
+            # Taken the same local day but outside the tight window (e.g.
+            # logged mid-afternoon for an 08:00 slot): still counts for that
+            # day's slot — a taken dose must never read as "not logged".
             slot_status[best] = ev.status
     taken = sum(1 for st in slot_status.values() if st == "taken")
     skipped = sum(1 for st in slot_status.values() if st == "skipped")
