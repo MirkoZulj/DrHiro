@@ -209,7 +209,7 @@ class Reminder(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    type: Mapped[str] = mapped_column(String(32), nullable=False)  # bp, weight, meal, water, sync, activity, bedtime, weekly
+    type: Mapped[str] = mapped_column(String(32), nullable=False)  # bp, weight, meal, water, sync, activity, bedtime, weekly, medication
     schedule_json: Mapped[dict] = mapped_column(JSON, nullable=False)  # {"cron": "0 8 * * *"} or {"days": [...], "time": "08:00"}
     timezone: Mapped[str] = mapped_column(String(64), default="UTC", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

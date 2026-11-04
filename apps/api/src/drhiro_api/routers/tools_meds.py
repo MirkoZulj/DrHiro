@@ -331,6 +331,11 @@ def tool_log_dose(req: LogDoseRequest, user: User = Depends(_resolve_user), db: 
         return ToolResponse(ok=True, data={"already_logged": True, "dose": None, "message": "Already logged for this slot."})
     if req.status == "taken":
         medsvc.decrement_stock(item, dose.amount or 1.0)
+    # Dose-based reminder completion via the existing reminder engine (spec §5.5).
+    from drhiro_api.services.task_queue import enqueue
+
+    enqueue("reminders", "drhiro_worker.jobs.complete_reminders_by_dose",
+            str(user.id), str(item.id), str(dose.id), taken_at)
     _tool_audit(db, user, "tools.log_dose", "dose_event", str(dose.id), {"status": req.status, "item": item.name})
     db.commit()
     db.refresh(dose)
