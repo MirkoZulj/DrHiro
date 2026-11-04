@@ -188,6 +188,22 @@ def _ingredient_amount(entry: dict, canon_unit: str, key: str):
     return None
 
 
+def _omega3_kind(name: str) -> str | None:
+    """Classify an omega-3-mapping component name.
+
+    'specific' = names EPA/DHA explicitly (counted toward EPA+DHA);
+    'generic' = fish oil / total omega-3 totals (a container amount that
+    already includes EPA/DHA, so adding it alongside specific entries
+    double-counts); 'dpa' = DPA alone, which is neither EPA nor DHA and
+    must never be counted toward the EPA+DHA total.
+    """
+    if "epa" in name or "dha" in name:
+        return "specific"
+    if "dpa" in name or "docosapentaenoic" in name:
+        return "dpa"
+    return "generic"
+
+
 def ingredient_to_rda(entry: dict) -> tuple[str, float] | None:
     """Map one ingredients_json entry to (rda_key, per-1 amount canonical)."""
     if not isinstance(entry, dict):
@@ -199,6 +215,8 @@ def ingredient_to_rda(entry: dict) -> tuple[str, float] | None:
     key = next((k for kw, k in _INGREDIENT_KEYWORDS if kw in name), None)
     if key is None or key not in RDA_TABLE:
         return None
+    if key == "omega3_epa_dha" and _omega3_kind(name) == "dpa":
+        return None  # DPA is not EPA/DHA; never count it toward EPA+DHA
     amt = _ingredient_amount(entry, RDA_TABLE[key][2], key)
     if amt is None:
         return None
@@ -223,11 +241,30 @@ def supplement_intake_for_day(db, user, day: date, tz) -> dict[str, float]:
         if item is None or not item.ingredients_json:
             continue
         amount = dose.amount if dose.amount is not None else (item.dose_amount or 1.0)
+        mapped_entries = []
         for entry in item.ingredients_json:
             mapped = ingredient_to_rda(entry)
             if mapped is None:
                 continue
             key, per_one = mapped
+            name = str(entry.get("component") or entry.get("name")
+                       or entry.get("ingredient") or "").lower() if isinstance(entry, dict) else ""
+            mapped_entries.append((key, per_one, _omega3_kind(name) if key == "omega3_epa_dha" else None))
+        # Per ITEM: generic omega-3 totals (fish oil, total omega-3) are
+        # container amounts that already include EPA/DHA. When specific
+        # EPA/DHA entries are present, skip generics so EPA+DHA count
+        # exactly once; with only generics, count them as before. DPA
+        # entries are already excluded by ingredient_to_rda.
+        has_specific_omega3 = any(
+            key == "omega3_epa_dha" and kind == "specific"
+            for key, _per_one, kind in mapped_entries
+        )
+        for key, per_one, kind in mapped_entries:
+            if key == "omega3_epa_dha":
+                if kind == "dpa":
+                    continue
+                if kind == "generic" and has_specific_omega3:
+                    continue
             totals[key] = totals.get(key, 0.0) + per_one * float(amount or 1.0)
     return totals
 

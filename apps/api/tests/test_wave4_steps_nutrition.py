@@ -1,7 +1,7 @@
 """Wave 4 (0.10.3): steps=0 bug + nutrition coverage + med composition."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from drhiro_api.services.series import _dedup_steps
 from tests.conftest import auth_headers, make_user
@@ -101,3 +101,74 @@ def test_composition_endpoint_per_capsule_vs_rda(client, db):
     mg = rows["Magnesium (citrate)"]
     assert mg["nutrient_key"] == "magnesium" and mg["rda"] == 420
     assert rows["Mystery blend"]["nutrient_key"] is None  # unmapped, not dropped
+
+
+def _omega3_item(db, user, name, ingredients, dose_amount=2):
+    from drhiro_api.models import DoseEvent, MedicationItem
+
+    item = MedicationItem(
+        user_id=user.id, kind="supplement", name=name,
+        ingredients_json=ingredients, dose_amount=dose_amount,
+        dose_unit="softgel", status="active",
+    )
+    db.add(item)
+    db.flush()
+    db.add(DoseEvent(
+        user_id=user.id, item_id=item.id, status="taken",
+        taken_at=datetime(2026, 11, 4, 8, 0, tzinfo=timezone.utc),
+        amount=dose_amount, source="telegram",
+    ))
+    db.commit()
+    return item
+
+
+def test_omega3_epa_dha_not_double_counted_when_epa_dha_present(db):
+    """Viva Naturals style label: fish oil + total omega-3 + EPA + DHA per
+    softgel must count EPA+DHA exactly once ((750+285) x2 = 2070), not
+    6820 from summing all four generic+specific components."""
+    from drhiro_api.services.nutrition_rda import supplement_intake_for_day
+
+    user = make_user(db, "omega3-double@test.local")
+    _omega3_item(db, user, "Omega-3", [
+        {"component": "Fish oil", "per_1_softgel_mg": 1250},
+        {"component": "Total omega-3", "per_1_softgel_mg": 1125},
+        {"component": "EPA", "per_1_softgel_mg": 750},
+        {"component": "DHA", "per_1_softgel_mg": 285},
+    ], dose_amount=2)
+    totals = supplement_intake_for_day(db, user, date(2026, 11, 4), timezone.utc)
+    assert totals["omega3_epa_dha"] == 2070
+
+
+def test_omega3_generic_only_counts_generic(db):
+    """An item with ONLY a generic fish-oil total still counts it."""
+    from drhiro_api.services.nutrition_rda import supplement_intake_for_day
+
+    user = make_user(db, "omega3-generic@test.local")
+    _omega3_item(db, user, "Fish oil", [
+        {"component": "Fish oil", "per_1_softgel_mg": 1200},
+    ], dose_amount=1)
+    totals = supplement_intake_for_day(db, user, date(2026, 11, 4), timezone.utc)
+    assert totals["omega3_epa_dha"] == 1200
+
+
+def test_omega3_dpa_not_double_counted(db):
+    """DPA is not EPA/DHA: it must not add to the EPA+DHA total, alone or
+    alongside EPA/DHA + generic components."""
+    from drhiro_api.services.nutrition_rda import supplement_intake_for_day
+
+    user = make_user(db, "omega3-dpa-only@test.local")
+    _omega3_item(db, user, "DPA only", [
+        {"component": "DPA", "per_1_softgel_mg": 100},
+    ], dose_amount=1)
+    totals = supplement_intake_for_day(db, user, date(2026, 11, 4), timezone.utc)
+    assert totals.get("omega3_epa_dha", 0.0) == 0.0
+
+    user2 = make_user(db, "omega3-dpa-mix@test.local")
+    _omega3_item(db, user2, "Omega-3 + DPA", [
+        {"component": "Fish oil", "per_1_softgel_mg": 1250},
+        {"component": "EPA", "per_1_softgel_mg": 750},
+        {"component": "DHA", "per_1_softgel_mg": 285},
+        {"component": "DPA", "per_1_softgel_mg": 100},
+    ], dose_amount=1)
+    totals = supplement_intake_for_day(db, user2, date(2026, 11, 4), timezone.utc)
+    assert totals["omega3_epa_dha"] == 1035
