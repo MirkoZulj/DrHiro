@@ -172,3 +172,15 @@ def test_omega3_dpa_not_double_counted(db):
     ], dose_amount=1)
     totals = supplement_intake_for_day(db, user2, date(2026, 11, 4), timezone.utc)
     assert totals["omega3_epa_dha"] == 1035
+
+
+def test_vitamin_b12_not_swallowed_by_b1_keyword():
+    """\"vitamin b1\" is a substring of \"vitamin b12\"; B12 must map to B12."""
+    from drhiro_api.services.nutrition_rda import ingredient_to_rda
+
+    assert ingredient_to_rda({"component": "Vitamin B12", "per_1_tablet_mcg": 10}) == (
+        "vitamin_b12", 10.0,  # canonical unit = mcg
+    )
+    assert ingredient_to_rda({"component": "Thiamin (B1)", "per_1_tablet_mg": 6}) == (
+        "vitamin_b1", 6.0,
+    )

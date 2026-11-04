@@ -83,8 +83,9 @@ _INGREDIENT_KEYWORDS: list[tuple[str, str]] = [
     ("ergocalciferol", "vitamin_d"), ("vitamin e", "vitamin_e"),
     ("tocopher", "vitamin_e"), ("vitamin k", "vitamin_k"), ("menaquinone", "vitamin_k"),
     ("phylloquinone", "vitamin_k"),
-    ("thiamin", "vitamin_b1"), ("vitamin b1", "vitamin_b1"),
+    # b12 before b1: "vitamin b1" is a substring of "vitamin b12"
     ("vitamin b12", "vitamin_b12"), ("cobalamin", "vitamin_b12"),
+    ("thiamin", "vitamin_b1"), ("vitamin b1", "vitamin_b1"),
     ("riboflavin", "vitamin_b2"), ("vitamin b2", "vitamin_b2"),
     ("niacin", "vitamin_b3"), ("vitamin b3", "vitamin_b3"),
     ("pyridoxine", "vitamin_b6"), ("vitamin b6", "vitamin_b6"),
