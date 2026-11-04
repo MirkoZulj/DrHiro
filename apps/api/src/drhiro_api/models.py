@@ -683,6 +683,41 @@ class DoseEvent(Base, TimestampMixin):
     note: Mapped[str | None] = mapped_column(Text)
 
 
+# ── Health card (0.10.0 wave 3, spec §6) ────────────────────────────────────
+
+
+class HealthProfile(Base, TimestampMixin):
+    """One row per user: the self-maintained health card.
+
+    JSON sections keep the schema flexible; every list entry carries its own
+    `id` (uuid4 string) so the agent and UI can edit a single entry. Derived
+    fields (display name, DOB, age, sex, height, latest weight, current
+    medications) are computed at read time from `users`, the weight series and
+    `medication_items` — never stored here (spec §6.1).
+    """
+
+    __tablename__ = "health_profiles"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_health_profile_user"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # A+, A-, B+, B-, AB+, AB-, 0+, 0-, unknown
+    blood_type: Mapped[str | None] = mapped_column(String(8))
+    organ_donor: Mapped[str | None] = mapped_column(String(8))  # yes|no|unknown
+    conditions_json: Mapped[list] = mapped_column(JSON, default=list)
+    allergies_json: Mapped[list] = mapped_column(JSON, default=list)
+    intolerances_json: Mapped[list] = mapped_column(JSON, default=list)
+    implants_devices_json: Mapped[list] = mapped_column(JSON, default=list)
+    vaccinations_json: Mapped[list] = mapped_column(JSON, default=list)
+    surgeries_json: Mapped[list] = mapped_column(JSON, default=list)
+    family_history_json: Mapped[list] = mapped_column(JSON, default=list)
+    emergency_contacts_json: Mapped[list] = mapped_column(JSON, default=list)
+    care_team_json: Mapped[list] = mapped_column(JSON, default=list)
+    insurance_json: Mapped[dict | None] = mapped_column(JSON)  # {provider, number}
+    notes: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # "card is up to date"
+
+
 # ── Analytics runs (0.9.0 wave 2, spec §3.4) ────────────────────────────────
 
 
@@ -715,3 +750,59 @@ class AnalysisRun(Base, TimestampMixin):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
+
+    files: Mapped[list["GeneratedFile"]] = relationship(
+        primaryjoin="AnalysisRun.id == foreign(GeneratedFile.analysis_run_id)",
+        viewonly=True,
+    )
+
+
+# ── Generated artefacts (0.10.0 wave 3, spec §2.2) ──────────────────────────
+
+
+class GeneratedFile(Base, TimestampMixin):
+    """One downloadable artefact: analysis/visit/health-card PDFs, data-export
+    bundles, system backups, restore tests. Files live on the filesystem under
+    generated_files_dir (layout: generated/<user_id>/<uuid>.<ext>); this row is
+    the metadata + status record."""
+
+    __tablename__ = "generated_files"
+    __table_args__ = (Index("ix_generated_files_user_kind", "user_id", "kind", "created_at"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    # analysis_report | visit_report | health_card | data_export | system_backup | restore_test
+    status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False)  # queued|running|ready|failed|expired
+    rel_path: Mapped[str | None] = mapped_column(String(512))  # relative to generated_files_dir (or backups_dir for system_backup)
+    filename: Mapped[str | None] = mapped_column(String(255))  # download name
+    mime: Mapped[str | None] = mapped_column(String(64))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    params_json: Mapped[dict | None] = mapped_column(JSON)
+    analysis_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_runs.id", ondelete="SET NULL")
+    )
+    error: Mapped[str | None] = mapped_column(Text)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    job_id: Mapped[str | None] = mapped_column(String(64))
+
+# ── Runtime settings singleton (restores the AppSetting model that
+#    services/settings_store.py always imported but which was missing from
+#    models.py — a latent import-time break exposed when routers/backups.py
+#    started importing the settings gate). Table matches the guarded SQL in
+#    migration b8c9d0e1f2a3.
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)  # "singleton"
+    ai_backend_url: Mapped[str | None] = mapped_column(String(512))
+    model_name: Mapped[str | None] = mapped_column(String(255))
+    ai_api_key: Mapped[str | None] = mapped_column(Text)
+    telegram_bot_token: Mapped[str | None] = mapped_column(Text)
+    telegram_allowed_username: Mapped[str | None] = mapped_column(String(255))
+    telegram_allowed_user_id: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
