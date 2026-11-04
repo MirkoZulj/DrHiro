@@ -14,6 +14,7 @@ COPY packages/health-schema /app/packages/health-schema
 COPY packages/rule-engine /app/packages/rule-engine
 COPY packages/nutrition-core /app/packages/nutrition-core
 COPY packages/drhiro-mcp /app/packages/drhiro-mcp
+COPY packages/analytics-engine /app/packages/analytics-engine
 COPY apps/api /app/apps/api
 COPY apps/worker /app/apps/worker
 
@@ -22,6 +23,7 @@ RUN pip install --no-cache-dir \
     /app/packages/rule-engine \
     /app/packages/nutrition-core \
     /app/packages/drhiro-mcp \
+    /app/packages/analytics-engine \
     /app/apps/api \
     /app/apps/worker
 
