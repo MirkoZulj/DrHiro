@@ -1,0 +1,7 @@
+{
+  "id": "drhiro-medical-ingest",
+  "name": "DrHiro Medical Ingest",
+  "description": "Deterministically stages medical photo batches (ONE encounter + ONE record, scans bound) BEFORE the LLM turn, so storage never depends on model tool discipline.",
+  "activation": { "onStartup": true },
+  "configSchema": { "type": "object", "additionalProperties": false }
+}
