@@ -158,11 +158,15 @@
   "plugins": {
     "load": {
       "paths": [
-        "/home/node/.openclaw/plugins/drhiro-msgid"
+        "/home/node/.openclaw/plugins/drhiro-msgid",
+        "/home/node/.openclaw/plugins/drhiro-medical-ingest"
       ]
     },
     "entries": {
       "drhiro-msgid": {
+        "enabled": true
+      },
+      "drhiro-medical-ingest": {
         "enabled": true
       }
     }

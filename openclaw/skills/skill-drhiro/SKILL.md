@@ -93,6 +93,9 @@ Tool list:
 | list_mifitness_archives | POST | /tools/list_mifitness_archives |
 | import_mifitness_export | POST | /tools/import_mifitness_export |
 | get_mifitness_import_status | POST | /tools/get_mifitness_import_status |
+| ingest_medical_batch | POST | /tools/ingest_medical_batch |
+| get_staged_medical_batch | POST | (bridge-local) |
+| update_medical_record | POST | /tools/update_medical_record |
 | add_medical_record | POST | /tools/add_medical_record |
 | add_medical_encounter | POST | /tools/add_medical_encounter |
 | list_medical_encounters | POST | /tools/list_medical_encounters |
@@ -541,46 +544,62 @@ member's data without an active consent grant.
     response. The MCP tool injects the inbound message id automatically —
     never invent or pass a telegram_message_id.
 
-## Medical records — transcribe the document, confirm, then store
+## Medical records — batch first: stage, transcribe, enrich, verify (non-negotiable)
 
-When the user sends a PHOTO of a medical document (lab report, prescription,
-doctor's letter, referral, discharge summary), use the medical-record tools:
+A medical photo batch is ALWAYS stored deterministically — storage never
+depends on you choosing a storage tool. The gateway/bridge stages every batch
+BEFORE your turn (encounter + ONE record, all scans bound, placeholder
+content) and tells you the ids (staged_batch on tool results /
+`get_staged_medical_batch` / turn context). Your job is to enrich and verify,
+never to re-create.
 
-1. **Read the photo and transcribe it FAITHFULLY** into text:
+**One-vs-split rule (user instruction wins):** photos sent as one batch
+(album, or "these are one report") are logged as ONE record under ONE
+encounter — never one record per photo. Separate visits/documents the user
+treats as separate stay separate; re-group with `update_medical_record`
+(encounter_id) when the user corrects the grouping. Never split a batch the
+user said was one.
+
+Flow (follow in order):
+
+1. **STAGE.** If photos are pending, `ingest_medical_batch` must have run —
+   check `get_staged_medical_batch`. If it returns null and photos were sent,
+   call `ingest_medical_batch` yourself FIRST (before transcribing). It
+   returns `encounter_id` + `record_id` + `photo_count`. The record now
+   provably exists; no "Done" is possible without it.
+2. **TRANSCRIBE the whole batch FAITHFULLY** into text:
    - keep the document's ORIGINAL language — never translate;
    - preserve every number, unit, date, name and dosage EXACTLY as printed;
    - transcribe the whole document, not a summary; do not add interpretations,
      diagnoses or advice of your own;
    - if a word is genuinely unreadable, mark it `[unreadable]` and say so.
-2. **Show the transcription to the user and WAIT for their confirmation**
-   before storing anything. Medical text must be stored only after the user
-   has checked it. If they correct you, fix the transcription, re-confirm,
-   then store.
-3. **Store it** with `add_medical_record`:
-   - `content` = the confirmed transcription;
-   - `title` = optional short label (e.g. "Lab blood panel", "Prescription");
-   - `recorded_at` = optional ISO date/datetime the document itself is dated
-     (its printed date, not today);
-   - `encounter_id` = optional — group the document under a medical encounter
-     (see below);
-   - `attach_latest_media` = set `true` so the photo the user just sent is
-     stored as the record's source scan (the bridge relays the image bytes
-     server-side — you never handle the image data yourself).
-4. Confirm back with the stored `id` and `title`.
+3. **Show the transcription to the user and WAIT for their confirmation**
+   before enriching. If they correct you, fix the transcription, re-confirm,
+   then enrich.
+4. **ENRICH the staged record** with `update_medical_record`:
+   `record_id` = staged id, `content` = confirmed transcription,
+   `title`/`recorded_at` as read from the document. Never call
+   `add_medical_record` for a batch that was staged — that would duplicate it.
+   (`add_medical_record` is only for a single document with no staged batch;
+   it is still ONE record per batch, never one per photo.)
+5. **SELF-VERIFY before announcing anything.** Call `get_medical_encounter`
+   (staged encounter_id) — or `list_medical_records` if only the record id is
+   known — and confirm the record is present with your transcription and its
+   scans bound. Quote the verification: encounter id, record id, photo count.
+6. **Only then confirm back** to the user with the verified ids.
 
-**Encounters — grouping documents from the same visit.** When the user sends
-ONE OR MORE document photos that belong to the same visit (same facility/date,
-or pages of one report), propose a grouping AFTER transcribing: default
-proposal is the facility + date read from the documents ("Domaća laboratorija,
-2026-05-11 — group these together?"). On confirmation:
-
-1. `add_medical_encounter` with `encounter_date` (YYYY-MM-DD), `facility`,
-   optional `title`/`notes` — keep the original language of the document for
-   facility/title;
-2. store each transcription with `add_medical_record` + that `encounter_id`
-   (and `attach_latest_media: true` when the user sent the photo in this
-   conversation);
-3. confirm back with the encounter id and how many documents were stored.
+Hard rules:
+- NEVER say "Done", "logged", "saved" or "stored" for a medical batch unless
+  step 5's verification payload shows the record. If verification returns
+  nothing, say storage failed and retry — never fabricate success.
+- NEVER end a turn with "tool run finished" and no summary: end with the
+  verified encounter/record ids, or with an explicit failure + retry plan.
+- NEVER create one record per photo for a batch, and NEVER concatenate
+  separate documents the user treats as separate into one record.
+- Encounter first, record second: for a new batch the encounter exists before
+  the record is enriched. Propose facility + date from the documents ONLY to
+  correct the staged encounter via `update_medical_record` grouping — do not
+  create a second encounter for the same batch.
 
 To revisit an encounter ("what was in that blood panel", "all documents from
 the clinic visit"), use `list_medical_encounters` (newest first, each with a

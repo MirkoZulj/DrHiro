@@ -349,9 +349,13 @@ services:
       - ./openclaw/openclaw.json:/seed/openclaw.json:ro
       - ./openclaw/skill-drhiro:/seed/skills:ro
       - ./openclaw/workspace:/seed/workspace:ro
+      - ./openclaw/plugins:/seed/plugins:ro
+      - ./openclaw/mcp:/seed/mcp:ro
       - openclaw_state:/home/node/.openclaw
     command: ["sh", "-lc",
-      "mkdir -p /home/node/.openclaw/skills /home/node/.openclaw/workspace/drhiro /home/node/.openclaw/mcp
+      "mkdir -p /home/node/.openclaw/skills /home/node/.openclaw/workspace/drhiro /home/node/.openclaw/mcp /home/node/.openclaw/plugins
+      && cp -rn /seed/plugins/. /home/node/.openclaw/plugins/ 2>/dev/null || true
+      ; cp -n /seed/mcp/drhiro-mcp-server.js /home/node/.openclaw/mcp/drhiro-mcp-server.js 2>/dev/null || cp /seed/mcp/drhiro-mcp-server.js /home/node/.openclaw/mcp/drhiro-mcp-server.js
       && cp -n /seed/openclaw.json /home/node/.openclaw/openclaw.json 2>/dev/null || true
       ; cp -rn /seed/skills/. /home/node/.openclaw/skills/ 2>/dev/null || true
       ; for f in /seed/workspace/*.md; do t=/home/node/.openclaw/workspace/drhiro/$(basename \"$$f\"); [ -s \"$$t\" ] || cp \"$$f\" \"$$t\" 2>/dev/null || true; done

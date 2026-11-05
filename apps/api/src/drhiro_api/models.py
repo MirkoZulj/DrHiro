@@ -515,6 +515,10 @@ class MedicalRecord(Base, TimestampMixin):
     # scanned document image this record was transcribed from. Served only to
     # the owning user via /api/v1/medical/scan/{record_id}.
     source_image_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Additional scan paths for a multi-photo batch logged as ONE record
+    # (source_image_path holds the first scan; this JSON list holds ALL scans
+    # including the first, in upload order). NULL for legacy/single records.
+    source_image_paths_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     user: Mapped["User"] = relationship()
     encounter: Mapped["MedicalEncounter | None"] = relationship(back_populates="records")

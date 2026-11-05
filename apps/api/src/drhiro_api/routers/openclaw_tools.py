@@ -1043,6 +1043,7 @@ def _medical_record_out(rec: MedicalRecord) -> dict:
         "recorded_at": rec.recorded_at.isoformat() if rec.recorded_at else None,
         "encounter_id": str(rec.encounter_id) if rec.encounter_id else None,
         "source_image_path": rec.source_image_path,
+        "source_image_paths": rec.source_image_paths_json or ([rec.source_image_path] if rec.source_image_path else []),
         "created_at": rec.created_at.isoformat() if rec.created_at else None,
     }
 
@@ -1235,6 +1236,194 @@ async def tool_upload_medical_scan(
         ok=True,
         message="Scan stored." + (" Bound to record." if rid else ""),
         data={"path": rel, "record_id": rid},
+    )
+
+
+class UpdateMedicalRecordTool(BaseModel):
+    record_id: str
+    title: str | None = None
+    content: str | None = None
+    recorded_at: datetime | None = None
+    encounter_id: str | None = None  # re-group under another encounter (owner-scoped)
+
+
+@router.post("/update_medical_record", response_model=ToolResponse)
+def tool_update_medical_record(req: UpdateMedicalRecordTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Enrich an EXISTING medical record in place (title/content/recorded_at and/or
+    encounter grouping).
+
+    This is the deterministic counterpart of add_medical_record: a photo batch
+    is first staged by ingest_medical_batch (encounter + ONE record with scans
+    bound, placeholder content), then the agent replaces the placeholder with
+    the faithful transcription via this tool — never by creating a second
+    record. At least one field must be provided; other users' records 404.
+    """
+    rec = (
+        db.query(MedicalRecord)
+        .filter(MedicalRecord.id == _maybe_uuid(req.record_id), MedicalRecord.user_id == user.id)
+        .first()
+    )
+    if not rec:
+        raise HTTPException(status_code=404, detail="Medical record not found")
+    changed: list[str] = []
+    if req.title is not None:
+        rec.title = (req.title.strip() or None)
+        changed.append("title")
+    if req.content is not None:
+        content = req.content.strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="content must not be empty")
+        rec.content = content
+        changed.append("content")
+    if req.recorded_at is not None:
+        ra = req.recorded_at
+        if ra.tzinfo is None:
+            ra = ra.replace(tzinfo=resolve_tz(user.timezone))
+        rec.recorded_at = ra
+        changed.append("recorded_at")
+    if req.encounter_id is not None:
+        encounter = (
+            db.query(MedicalEncounter)
+            .filter(MedicalEncounter.id == _maybe_uuid(req.encounter_id), MedicalEncounter.user_id == user.id)
+            .first()
+        )
+        if not encounter:
+            raise HTTPException(status_code=404, detail="Encounter not found (encounter_id must come from list_medical_encounters)")
+        rec.encounter_id = encounter.id
+        changed.append("encounter_id")
+    if not changed:
+        raise HTTPException(status_code=400, detail="Provide at least one of title, content, recorded_at, encounter_id")
+    _tool_audit(db, user, "tools.update_medical_record", "medical_record", str(rec.id),
+                metadata={"changed": changed})
+    db.commit()
+    db.refresh(rec)
+    return ToolResponse(ok=True, message="Medical record updated.", data=_medical_record_out(rec))
+
+
+@router.post("/ingest_medical_batch", response_model=ToolResponse)
+async def tool_ingest_medical_batch(
+    files: list[UploadFile] = File(...),
+    encounter_date: str | None = Form(default=None),
+    facility: str | None = Form(default=None),
+    title: str | None = Form(default=None),
+    notes: str | None = Form(default=None),
+    caption: str | None = Form(default=None),
+    batch_key: str | None = Form(default=None),
+    user: User = Depends(_resolve_user),
+    db: Session = Depends(get_db),
+):
+    """Deterministically stage a medical photo batch as ONE encounter + ONE record.
+
+    This is the structural guarantee that a medical photo batch is ALWAYS
+    stored, independent of whether the LLM ever calls a storage tool: the
+    gateway/bridge calls this BEFORE the LLM turn (or on the first tool call)
+    with every photo of the batch. The endpoint stores ALL scans, creates the
+    encounter and a single record whose content is a placeholder
+    ("transcription pending"); the agent later replaces the placeholder with
+    the faithful transcription via update_medical_record. No 'Done' can be
+    fabricated because the record provably exists before the model speaks.
+
+    Idempotent: callers pass ``batch_key`` (stable per batch, e.g. a hash of
+    the staged media paths); a replay returns the original ids with
+    deduplicated=true and stores nothing new.
+    """
+    from drhiro_api.routers.medical import store_scan
+
+    if not files:
+        raise HTTPException(status_code=400, detail="files must contain at least one photo")
+    if len(files) > 50:
+        raise HTTPException(status_code=400, detail="batch too large (max 50 photos)")
+
+    key = (batch_key or "").strip() or None
+    if key:
+        existing = (
+            db.query(IngestBatch)
+            .filter(IngestBatch.user_id == user.id, IngestBatch.batch_id == key)
+            .first()
+        )
+        if existing is not None:
+            prior = existing.result_json or {}
+            return ToolResponse(
+                ok=True,
+                message="Batch already staged — returning the original encounter/record.",
+                data={**prior, "deduplicated": True},
+            )
+
+    # Encounter date defaults to the user's LOCAL day (never the UTC clock).
+    if encounter_date and encounter_date.strip():
+        try:
+            enc_date = date.fromisoformat(encounter_date.strip()[:10])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="encounter_date must be YYYY-MM-DD")
+    else:
+        enc_date = nutrition_date(datetime.now(timezone.utc), user.timezone)
+
+    # Store first (all scans), then create encounter + ONE record atomically.
+    scan_paths: list[str] = []
+    for f in files:
+        data = await f.read()
+        scan_paths.append(store_scan(user, data, f.content_type))
+
+    encounter = MedicalEncounter(
+        user_id=user.id,
+        encounter_date=enc_date,
+        facility=((facility or "").strip() or None),
+        title=((title or "").strip() or None),
+        notes=((notes or "").strip() or None),
+    )
+    db.add(encounter)
+    db.flush()
+
+    n = len(scan_paths)
+    rec_title = ((title or "").strip() or f"Medical photo batch ({n} photo{'s' if n != 1 else ''})")
+    placeholder = (
+        f"[Medical photo batch — {n} photo(s) staged automatically; "
+        f"transcription pending. Original scans preserved.]"
+    )
+    if caption and caption.strip():
+        placeholder += f"\nCaption: {caption.strip()}"
+    rec = MedicalRecord(
+        user_id=user.id,
+        title=rec_title,
+        content=placeholder,
+        source_type="telegram_photo_batch",
+        recorded_at=datetime.now(timezone.utc),
+        encounter_id=encounter.id,
+        source_image_path=scan_paths[0],
+        source_image_paths_json=scan_paths,
+    )
+    db.add(rec)
+    db.flush()
+
+    result = {
+        "encounter_id": str(encounter.id),
+        "record_id": str(rec.id),
+        "photo_count": n,
+        "scan_paths": scan_paths,
+        "source_image_path": scan_paths[0],
+        "encounter_date": enc_date.isoformat(),
+        "deduplicated": False,
+        "status": "staged_transcription_pending",
+    }
+    if key:
+        db.add(IngestBatch(
+            user_id=user.id,
+            installation_id="medical_batch_ingest",
+            batch_id=key,
+            result_json=result,
+        ))
+    _tool_audit(db, user, "tools.ingest_medical_batch", "medical_encounter", str(encounter.id),
+                metadata={"record_id": str(rec.id), "photo_count": n, "batch_key": key})
+    db.commit()
+    return ToolResponse(
+        ok=True,
+        message=(
+            f"Staged {n} photo(s) as ONE record under a new encounter. "
+            f"record_id={rec.id} encounter_id={encounter.id}. "
+            "Enrich it with update_medical_record (transcription), then verify "
+            "with get_medical_encounter before confirming."
+        ),
+        data=result,
     )
 
 

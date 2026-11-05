@@ -65,6 +65,12 @@ function writeConsumedSet(set) {
 
 /** Newest unconsumed inbound media file within TTL; marks it consumed. */
 function takeLatestInboundMedia() {
+  const all = takeAllInboundMedia();
+  return all.length ? all[all.length - 1] : null;
+}
+
+/** ALL unconsumed inbound media files within TTL (oldest first); marks them consumed. */
+function takeAllInboundMedia() {
   let entries = [];
   try {
     entries = fs.readdirSync(MEDIA_DIR).map((name) => {
@@ -72,15 +78,81 @@ function takeLatestInboundMedia() {
       const st = fs.statSync(p);
       return { path: p, name, mtime: st.mtimeMs, size: st.size };
     });
-  } catch (_) { return null; }
+  } catch (_) { return []; }
   entries = entries.filter((e) => e.mtime > Date.now() - MEDIA_TTL_MS && e.size > 0 && e.size <= MEDIA_MAX_BYTES);
-  entries.sort((a, b) => b.mtime - a.mtime);
+  entries.sort((a, b) => a.mtime - b.mtime);
   const consumed = new Set(readConsumedSet().consumed);
-  const candidate = entries.find((e) => !consumed.has(e.path));
-  if (!candidate) return null;
-  consumed.add(candidate.path);
-  writeConsumedSet({ consumed: Array.from(consumed).slice(-50), at: Date.now() });
-  return candidate;
+  const fresh = entries.filter((e) => !consumed.has(e.path));
+  for (const e of fresh) consumed.add(e.path);
+  if (fresh.length) writeConsumedSet({ consumed: Array.from(consumed).slice(-200), at: Date.now() });
+  return fresh;
+}
+
+function peekUnconsumedMediaCount() {
+  try {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(MEDIA_DIR).map((name) => {
+        const p = require("path").join(MEDIA_DIR, name);
+        const st = fs.statSync(p);
+        return { path: p, mtime: st.mtimeMs, size: st.size };
+      });
+    } catch (_) { return 0; }
+    const consumed = new Set(readConsumedSet().consumed);
+    return entries.filter((e) => e.mtime > Date.now() - MEDIA_TTL_MS && e.size > 0 && e.size <= MEDIA_MAX_BYTES && !consumed.has(e.path)).length;
+  } catch (_) { return 0; }
+}
+
+const BATCH_FILE = process.env.DRHIRO_MEDICAL_BATCH_FILE || "/home/node/.openclaw/tmp/drhiro-medical-batch.json";
+function writeBatchStage(stage) {
+  try {
+    fs.mkdirSync(require("path").dirname(BATCH_FILE), { recursive: true });
+    fs.writeFileSync(BATCH_FILE, JSON.stringify({ ...stage, at: Date.now() }));
+  } catch (e) { try { console.warn("[drhiro-mcp] batch stage write failed: " + e); } catch (_) {} }
+}
+function readBatchStage() {
+  try {
+    const j = JSON.parse(fs.readFileSync(BATCH_FILE, "utf8"));
+    if (j && j.record_id && j.encounter_id && Number.isFinite(j.at) && Date.now() - j.at < BATCH_TTL_MS) return j;
+  } catch (_) {}
+  return null;
+}
+const BATCH_TTL_MS = 30 * 60 * 1000;
+
+/** Deterministic batch staging: upload ALL pending photos as ONE encounter + ONE record. */
+async function ingestPendingBatch(args, extra) {
+  const media = takeAllInboundMedia();
+  if (!media.length) return { ok: false, error: "No pending inbound medical photos to ingest." };
+  const crypto = require("crypto");
+  const hash = crypto.createHash("sha256");
+  for (const m of media) hash.update(m.path + ":" + m.size + ":" + Math.round(m.mtime));
+  const batchKey = "medbatch-" + hash.digest("hex").slice(0, 32);
+  const up = await uploadBatchScans(args, media.map((m) => m.path), {
+    encounter_date: (extra && extra.encounter_date) || undefined,
+    facility: (extra && extra.facility) || undefined,
+    title: (extra && extra.title) || undefined,
+    notes: (extra && extra.notes) || undefined,
+    caption: (extra && extra.caption) || undefined,
+    batch_key: batchKey,
+  });
+  if (up && up.ok === true && up.data) writeBatchStage(up.data);
+  return up;
+}
+
+/**
+ * Safety net: before ANY tool runs (except deletes / the ingest itself),
+ * deterministically stage any pending medical photos. This makes storage
+ * independent of the model choosing the right tool — a record always exists
+ * before the LLM can claim success. Failures never block the real tool call.
+ */
+async function ensureBatchIngested(toolName) {
+  const SKIP = new Set(["ingest_medical_batch", "delete_medical_record", "delete_medical_encounter", "undo_last_user_action"]);
+  if (SKIP.has(toolName)) return null;
+  if (peekUnconsumedMediaCount() === 0) return null;
+  try {
+    const r = await ingestPendingBatch({ telegram_id: CONFIGURED_TELEGRAM_ID }, {});
+    return (r && r.ok === true && r.data) ? r.data : null;
+  } catch (_) { return null; }
 }
 
 const MEDIA_MIME = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".heic": "image/heic" };
@@ -125,6 +197,49 @@ async function uploadScan(args, filePath, recordId) {
   }
 }
 
+
+/** Multipart upload of MULTIPLE media files as one batch. */
+async function uploadBatchScans(args, filePaths, fields) {
+  if (!SERVICE_TOKEN) return { ok: false, error: "DRHIRO_OPENCLAW_SERVICE_TOKEN not set" };
+  const telegramId = resolveTelegramId(args && args.telegram_id);
+  if (!telegramId) return { ok: false, error: "No configured Telegram identity (DRHIRO_TELEGRAM_ID not set)" };
+  const boundary = "----drhiroBatch" + Date.now();
+  const parts = [];
+  for (const [k, v] of Object.entries(fields || {})) {
+    if (v !== undefined && v !== null && String(v) !== "") {
+      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
+    }
+  }
+  for (const filePath of filePaths) {
+    let bytes;
+    try { bytes = fs.readFileSync(filePath); } catch (e) { return { ok: false, error: "Cannot read media file: " + e }; }
+    const extMatch = filePath.match(/\.([a-z0-9]+)$/i);
+    const ext = extMatch ? "." + extMatch[1].toLowerCase() : "";
+    const mime = MEDIA_MIME[ext] || "application/octet-stream";
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="scan${ext}"\r\nContent-Type: ${mime}\r\n\r\n`));
+    parts.push(bytes);
+    parts.push(Buffer.from("\r\n"));
+  }
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  const body = Buffer.concat(parts);
+  try {
+    const res = await fetch(API_BASE + "/tools/ingest_medical_batch", {
+      method: "POST",
+      headers: {
+        "X-Service-Token": SERVICE_TOKEN,
+        "X-Telegram-Id": telegramId,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": String(body.length),
+      },
+      body,
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: `API ${res.status}: ${text.slice(0, 300)}` };
+    try { return JSON.parse(text); } catch { return { ok: true, raw: text }; }
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+}
 
 function tool(name, description, inputSchema, handler) {
   return { name, description, inputSchema, handler };
@@ -232,7 +347,21 @@ const TOOLS = [
   tool("get_mifitness_import_status", "Status/report of a Mi Fitness import job. Pass job_id from import_mifitness_export (omit for latest). wait_seconds (0-50) waits for completion in one call.",
     { type: "object", properties: { telegram_id: { type: "string" }, job_id: { type: "string" }, wait_seconds: { type: "integer" } }, required: ["telegram_id"] },
     (a) => call("POST", "/tools/get_mifitness_import_status", a, { job_id: a.job_id, wait_seconds: a.wait_seconds || 0 })),
-  tool("add_medical_record", "Store a medical document the user photographed (lab report, prescription, letter). First transcribe the photo FAITHFULLY — original language, exact numbers/units/dates, no summarizing and no translation — then SHOW the transcription to the user and get their confirmation BEFORE calling this. content = the confirmed transcription; title = optional short label (e.g. 'Lab blood panel'); recorded_at = optional ISO date/datetime the document is dated; encounter_id = optional encounter id from list_medical_encounters to group this document under a visit; attach_latest_media = set true to store the photo the user just sent as the record's source scan (the bridge relays the image bytes server-side).",
+  tool("ingest_medical_batch", "DETERMINISTIC batch staging — call this FIRST whenever the user sent medical photos (even before transcribing). It uploads ALL pending photos as ONE encounter + ONE record (placeholder content, all scans bound) and returns encounter_id/record_id. Storage is then GUARANTEED: enrich that record with update_medical_record — do NOT create separate records. Optional: encounter_date (YYYY-MM-DD), facility, title, notes, caption.",
+    { type: "object", properties: { telegram_id: { type: "string" }, encounter_date: { type: "string" }, facility: { type: "string" }, title: { type: "string" }, notes: { type: "string" }, caption: { type: "string" } }, required: ["telegram_id"] },
+    async (a) => ingestPendingBatch(a, a)),
+  tool("get_staged_medical_batch", "Return the currently staged medical photo batch (encounter_id/record_id/photo_count) created deterministically by the gateway/bridge, or null if none. Call this to learn the record you must enrich with update_medical_record instead of creating new records.",
+    { type: "object", properties: { telegram_id: { type: "string" } }, required: ["telegram_id"] },
+    async (a) => {
+      // If photos are still pending, stage them first so this never returns null while photos wait.
+      await ensureBatchIngested("get_staged_medical_batch");
+      const stage = readBatchStage();
+      return { ok: true, data: stage || null };
+    }),
+  tool("update_medical_record", "Enrich an EXISTING medical record in place: title, content (the faithful transcription), recorded_at, and/or encounter_id (re-group). Use this to enrich the record staged by ingest_medical_batch — never create a second record for the same batch. At least one field is required.",
+    { type: "object", properties: { telegram_id: { type: "string" }, record_id: { type: "string" }, title: { type: "string" }, content: { type: "string" }, recorded_at: { type: "string" }, encounter_id: { type: "string" } }, required: ["telegram_id", "record_id"] },
+    (a) => call("POST", "/tools/update_medical_record", a, { record_id: a.record_id, title: a.title, content: a.content, recorded_at: a.recorded_at, encounter_id: a.encounter_id })),
+  tool("add_medical_record", "Store a medical document the user photographed (lab report, prescription, letter). ONE record per batch: if the user sent several photos as one batch (an album, or 'these are one report'), store ONE record whose content covers the whole batch — NEVER one record per photo. The user's explicit instruction wins: if they say it is one batch, log one record. First transcribe the photo FAITHFULLY — original language, exact numbers/units/dates, no summarizing and no translation — then SHOW the transcription to the user and get their confirmation BEFORE calling this. content = the confirmed transcription; title = optional short label (e.g. 'Lab blood panel'); recorded_at = optional ISO date/datetime the document is dated; encounter_id = optional encounter id from list_medical_encounters to group this document under a visit; attach_latest_media = set true to store the photo the user just sent as the record's source scan (the bridge relays the image bytes server-side). If a batch was already staged by ingest_medical_batch, enrich THAT record with update_medical_record instead of calling this.",
     { type: "object", properties: { telegram_id: { type: "string" }, title: { type: "string" }, content: { type: "string" }, recorded_at: { type: "string" }, encounter_id: { type: "string" }, attach_latest_media: { type: "boolean" } }, required: ["telegram_id", "content"] },
     async (a) => {
       const r = await call("POST", "/tools/add_medical_record", a, { title: a.title, content: a.content, recorded_at: a.recorded_at, encounter_id: a.encounter_id });
@@ -244,7 +373,7 @@ const TOOLS = [
       if (!up || up.ok !== true) return { ...r, data: { ...(r.data || {}), scan: { error: (up && up.error) || "upload failed" } } };
       return { ...r, data: { ...(r.data || {}), scan: up.data } };
     }),
-  tool("add_medical_encounter", "Create a medical encounter (a visit, lab draw or prescription pickup) that groups related medical records. encounter_date = YYYY-MM-DD of the visit; facility = optional clinic/hospital name; title = optional short label; notes = optional free text. Propose facility + date from the documents and CONFIRM with the user before creating. Then store each document with add_medical_record + the returned encounter_id.",
+  tool("add_medical_encounter", "Create a medical encounter (a visit, lab draw or prescription pickup) that groups related medical records. For a photo batch, create the encounter FIRST, then store the batch as ONE record under it (grouped multi-photo batches are one record, not one per photo). encounter_date = YYYY-MM-DD of the visit; facility = optional clinic/hospital name; title = optional short label; notes = optional free text. Propose facility + date from the documents and CONFIRM with the user before creating. Then store the batch with add_medical_record + the returned encounter_id — or enrich the already-staged batch record with update_medical_record (encounter_id) instead of creating duplicates.",
     { type: "object", properties: { telegram_id: { type: "string" }, encounter_date: { type: "string" }, facility: { type: "string" }, title: { type: "string" }, notes: { type: "string" } }, required: ["telegram_id", "encounter_date"] },
     (a) => call("POST", "/tools/add_medical_encounter", a, { encounter_date: a.encounter_date, facility: a.facility, title: a.title, notes: a.notes })),
   tool("list_medical_encounters", "List the user's medical encounters, newest first, each with its record_count. Use the returned id with get_medical_encounter (details + its records) or delete_medical_encounter.",
@@ -351,8 +480,15 @@ rl.on("line", async (line) => {
     const t = TOOLS.find(x => x.name === name);
     if (!t) { respondError(msg.id, -32602, `Unknown tool: ${name}`); return; }
     try {
+      // Structural guarantee: stage any pending medical photos BEFORE the
+      // requested tool runs, so a record provably exists independent of the
+      // model choosing a storage tool. Never blocks the real call on failure.
+      const staged = await ensureBatchIngested(name);
       const result = await t.handler(args);
-      respond(msg.id, { content: [{ type: "text", text: JSON.stringify(result) }] });
+      const out = (staged && result && typeof result === "object" && !Array.isArray(result))
+        ? { ...result, staged_batch: staged }
+        : result;
+      respond(msg.id, { content: [{ type: "text", text: JSON.stringify(out) }] });
     } catch (e) {
       respondError(msg.id, -32603, String(e && e.message || e));
     }

@@ -206,7 +206,7 @@ def test_dashboard_encounters_contract(client, service_headers, db):
     assert body["encounter"]["id"] == eid
     rec = body["records"][0]
     assert set(rec.keys()) == {"id", "title", "content", "source_type", "recorded_at",
-                               "encounter_id", "source_image_path", "created_at"}
+                               "encounter_id", "source_image_path", "source_image_paths", "created_at"}
     assert rec["encounter_id"] == eid
 
     # no anonymous access

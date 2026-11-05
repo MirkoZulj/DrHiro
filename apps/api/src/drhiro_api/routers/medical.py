@@ -110,6 +110,7 @@ def _record_out(r: MedicalRecord) -> dict:
         "recorded_at": r.recorded_at.isoformat() if r.recorded_at else None,
         "encounter_id": str(r.encounter_id) if r.encounter_id else None,
         "source_image_path": r.source_image_path,
+        "source_image_paths": r.source_image_paths_json or ([r.source_image_path] if r.source_image_path else []),
         "created_at": r.created_at.isoformat() if r.created_at else None,
     }
 
