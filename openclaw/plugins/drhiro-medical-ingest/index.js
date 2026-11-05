@@ -10,18 +10,27 @@
  * WHAT IT DOES (deterministically, BEFORE the LLM turn):
  *   1. On every inbound message, scan the gateway inbound-media dir for
  *      unconsumed photos (same consumed-marker file the MCP bridge uses).
- *   2. If photos are pending, upload ALL of them to
- *      POST /api/v1/tools/ingest_medical_batch, which atomically creates ONE
- *      encounter + ONE record with every scan bound (placeholder content).
- *   3. Write the staged ids to drhiro-medical-batch.json (shared with the MCP
+ *   2. DEBOUNCE: buffer photos and wait for a quiet window
+ *      (DRHIRO_MEDICAL_DEBOUNCE_MS, default 3000ms — aligned with the
+ *      gateway collect debounce) before uploading, so one Telegram album
+ *      resend that arrives as several message_received fragments stages
+ *      as ONE batch, not one placeholder per fragment. Each new fragment
+ *      resets the timer; buffered paths are only marked consumed after a
+ *      successful upload, so a crash before flush loses nothing and a
+ *      retry re-derives the same stable batch_key (idempotent replay via
+ *      IngestBatch.batch_key on the API survives).
+ *   3. Upload ALL buffered photos to POST /api/v1/tools/ingest_medical_batch,
+ *      which atomically creates ONE encounter + ONE record with every scan
+ *      bound (placeholder content).
+ *   4. Write the staged ids to drhiro-medical-batch.json (shared with the MCP
  *      bridge) and inject them into the turn context via agent_turn_prepare,
  *      so the model knows a record already exists and must enrich THAT record
  *      with update_medical_record + verify before claiming success.
  *
- * Grouping rule: all photos pending in one message_received event = ONE
- * batch = ONE record. If the user later says separate messages were one
- * batch (or vice versa), the model re-groups via update_medical_record
- * (encounter_id) — the plugin never splits a batch on its own.
+ * Grouping rule: all photos buffered within one debounce window = ONE batch
+ * = ONE record. If the user later says separate messages were one batch (or
+ * vice versa), the model re-groups via update_medical_record (encounter_id,
+ * merge_record_ids) — the plugin never splits a batch on its own.
  *
  * Failure mode: fail-open. Any error is logged and the turn proceeds; the
  * MCP bridge's ensureBatchIngested safety net stages the batch on the first
@@ -30,7 +39,7 @@
  * Config via env (same names as the MCP bridge):
  *   DRHIRO_MCP_API / OPENCLAW_DRHIRO_API, DRHIRO_OPENCLAW_SERVICE_TOKEN,
  *   DRHIRO_TELEGRAM_ID, DRHIRO_MEDIA_DIR, DRHIRO_MEDIA_CONSUMED_FILE,
- *   DRHIRO_MEDICAL_BATCH_FILE.
+ *   DRHIRO_MEDICAL_BATCH_FILE, DRHIRO_MEDICAL_DEBOUNCE_MS.
  */
 "use strict";
 
@@ -44,11 +53,15 @@ const TELEGRAM_ID = process.env.DRHIRO_TELEGRAM_ID || "";
 const MEDIA_DIR = process.env.DRHIRO_MEDIA_DIR || "/home/node/.openclaw/media/inbound";
 const CONSUMED_FILE = process.env.DRHIRO_MEDIA_CONSUMED_FILE || "/home/node/.openclaw/tmp/drhiro-media-consumed.json";
 const BATCH_FILE = process.env.DRHIRO_MEDICAL_BATCH_FILE || "/home/node/.openclaw/tmp/drhiro-medical-batch.json";
+const DEBOUNCE_MS = Math.max(0, parseInt(process.env.DRHIRO_MEDICAL_DEBOUNCE_MS || "3000", 10) || 0);
 const MEDIA_TTL_MS = 30 * 60 * 1000;
 const MEDIA_MAX_BYTES = 25 * 1024 * 1024;
 const MEDIA_MIME = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".heic": "image/heic" };
 
 let lastStage = null; // in-memory copy for agent_turn_prepare context injection
+let pending = []; // buffered media entries awaiting the debounce flush
+let flushTimer = null;
+let flushing = false;
 
 function warn(msg) {
   try { console.warn("[drhiro-medical-ingest] " + msg); } catch (_) {}
@@ -69,7 +82,15 @@ function writeConsumedSet(set) {
   } catch (e) { warn("consumed write failed: " + e); }
 }
 
-function takeAllInboundMedia() {
+function markConsumed(entries) {
+  if (!entries.length) return;
+  const set = readConsumedSet();
+  const consumed = new Set(set.consumed);
+  for (const e of entries) consumed.add(e.path);
+  writeConsumedSet({ consumed: Array.from(consumed).slice(-500), at: Date.now() });
+}
+
+function peekInboundMedia() {
   let entries = [];
   try {
     entries = fs.readdirSync(MEDIA_DIR).map((name) => {
@@ -81,19 +102,25 @@ function takeAllInboundMedia() {
   entries = entries.filter((e) => e.mtime > Date.now() - MEDIA_TTL_MS && e.size > 0 && e.size <= MEDIA_MAX_BYTES);
   entries.sort((a, b) => a.mtime - b.mtime);
   const consumed = new Set(readConsumedSet().consumed);
-  const fresh = entries.filter((e) => !consumed.has(e.path));
-  for (const e of fresh) consumed.add(e.path);
-  if (fresh.length) writeConsumedSet({ consumed: Array.from(consumed).slice(-200), at: Date.now() });
-  return fresh;
+  const buffered = new Set(pending.map((e) => e.path));
+  return entries.filter((e) => !consumed.has(e.path) && !buffered.has(e.path));
+}
+
+function takeAllInboundMedia() {
+  // Back-compat name: peeks without consuming; consumption happens only
+  // after a successful upload (see flushPendingBatch).
+  return peekInboundMedia();
 }
 
 async function uploadBatch(filePaths) {
   const boundary = "----drhiroBatch" + Date.now();
   const hash = crypto.createHash("sha256");
   const parts = [];
-  // batch_key computed after reading stats below; placeholder fields first.
   const stats = filePaths.map((p) => { const st = fs.statSync(p); return { p, size: st.size, mtime: st.mtimeMs }; });
-  for (const s of stats) hash.update(s.p + ":" + s.size + ":" + Math.round(s.mtime));
+  // Stable batch_key: sorted by path so a retry of the same file set
+  // re-derives the identical key and the API deduplicates via batch_key.
+  const ordered = [...stats].sort((a, b) => a.p.localeCompare(b.p));
+  for (const s of ordered) hash.update(s.p + ":" + s.size + ":" + Math.round(s.mtime));
   const batchKey = "medbatch-" + hash.digest("hex").slice(0, 32);
   parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="batch_key"\r\n\r\n${batchKey}\r\n`));
   for (const filePath of filePaths) {
@@ -130,22 +157,59 @@ function writeBatchStage(stage) {
   } catch (e) { warn("batch stage write failed: " + e); }
 }
 
-async function stagePendingBatch() {
+async function flushPendingBatch() {
+  flushTimer = null;
+  if (flushing) return null;
+  if (!pending.length) return null;
   if (!SERVICE_TOKEN || !TELEGRAM_ID) { warn("missing service token / telegram id — skipping deterministic ingest"); return null; }
-  const media = takeAllInboundMedia();
-  if (!media.length) return null;
+  flushing = true;
+  const batch = pending;
+  pending = [];
   try {
-    const r = await uploadBatch(media.map((m) => m.path));
+    // Only upload files that still exist (a file could vanish mid-burst).
+    const existing = batch.filter((e) => { try { fs.statSync(e.path); return true; } catch (_) { return false; } });
+    if (!existing.length) return null;
+    const r = await uploadBatch(existing.map((m) => m.path));
     if (r && r.ok === true && r.data) {
+      markConsumed(existing);
       writeBatchStage(r.data);
       return r.data;
     }
+    // Not-ok: leave un-consumed so the MCP safety net / next event retries
+    // with the same batch_key (idempotent).
+    pending = batch.concat(pending);
     warn("ingest returned not-ok: " + JSON.stringify(r).slice(0, 200));
     return null;
   } catch (e) {
+    pending = batch.concat(pending);
     warn("deterministic ingest failed (MCP bridge safety net remains): " + e);
     return null;
+  } finally {
+    flushing = false;
   }
+}
+
+function scheduleFlush() {
+  if (flushTimer) clearTimeout(flushTimer);
+  if (DEBOUNCE_MS <= 0) {
+    // Zero debounce: flush on the next tick (still one upload per event loop).
+    flushTimer = setTimeout(() => { flushPendingBatch().catch(() => {}); }, 0);
+  } else {
+    flushTimer = setTimeout(() => { flushPendingBatch().catch(() => {}); }, DEBOUNCE_MS);
+  }
+  if (flushTimer && typeof flushTimer.unref === "function") flushTimer.unref();
+}
+
+async function stagePendingBatch() {
+  // Buffer newly arrived media and (re)start the debounce timer. Returns
+  // the staged batch only when called after a flush (tests) — in the live
+  // hook path the flush happens asynchronously after the quiet window.
+  const media = peekInboundMedia();
+  if (media.length) {
+    pending = pending.concat(media);
+    scheduleFlush();
+  }
+  return null;
 }
 
 function stageContextText() {
@@ -160,7 +224,7 @@ function stageContextText() {
     `[DRHIRO_MEDICAL_BATCH] A medical photo batch was ALREADY staged deterministically before this turn: ` +
     `encounter_id=${lastStage.encounter_id} record_id=${lastStage.record_id} photo_count=${lastStage.photo_count || "?"} ` +
     `(status: ${lastStage.status || "staged_transcription_pending"}). The record exists — do NOT create a new record for these photos. ` +
-    `Transcribe faithfully, then enrich THAT record via update_medical_record (record_id above), then VERIFY with get_medical_encounter ` +
+    `Transcribe faithfully, then enrich THAT record via update_medical_record (record_id above, merge_record_ids for any same-burst placeholder fragments), then VERIFY with get_medical_encounter ` +
     `before telling the user it is done. Never claim "Done" without the verification payload.`
   );
 }
@@ -172,8 +236,6 @@ async function onMessageReceived(_event) {
 function onAgentTurnPrepare() {
   const text = stageContextText();
   if (!text) return undefined;
-  // OpenClaw context-injection shapes vary by version; return text-bearing
-  // objects defensively — unknown fields are ignored by older hosts.
   return { prependContext: text, appendContext: text, context: text, text };
 }
 
@@ -185,7 +247,6 @@ const plugin = {
     agent_turn_prepare: onAgentTurnPrepare,
     before_prompt_build: onAgentTurnPrepare,
   },
-  // Callbacks-style hosts: api.on('message_received', fn)
   activate(api) {
     if (api && typeof api.on === "function") {
       api.on("message_received", onMessageReceived);
@@ -195,8 +256,12 @@ const plugin = {
   },
   // Direct-test helpers (used by the throwaway-stack verification script).
   _stagePendingBatch: stagePendingBatch,
+  _flushPendingBatch: flushPendingBatch,
   _stageContextText: stageContextText,
   _takeAllInboundMedia: takeAllInboundMedia,
+  _peekInboundMedia: peekInboundMedia,
+  _pendingCount: () => pending.length,
+  _debounceMs: DEBOUNCE_MS,
 };
 
 if (typeof module !== "undefined" && module.exports) module.exports = plugin;

@@ -119,13 +119,38 @@ function readBatchStage() {
 }
 const BATCH_TTL_MS = 30 * 60 * 1000;
 
+/** Burst coalescing: wait until inbound media has been quiet for the
+ *  debounce window (aligned with the gateway collect debounce ~3s), so an
+ *  album arriving as several fragments stages as ONE batch. Bounded so a
+ *  never-quiet burst cannot block a tool call indefinitely. */
+async function waitForBurstQuiet(maxWaitMs) {
+  const debounceMs = Math.max(0, parseInt(process.env.DRHIRO_MEDICAL_DEBOUNCE_MS || "3000", 10) || 0);
+  if (debounceMs <= 0) return;
+  const deadline = Date.now() + (maxWaitMs || 8000);
+  while (Date.now() < deadline) {
+    let newest = 0;
+    try {
+      const consumed = new Set(readConsumedSet().consumed);
+      for (const name of fs.readdirSync(MEDIA_DIR)) {
+        const p = require("path").join(MEDIA_DIR, name);
+        if (consumed.has(p)) continue;
+        try { newest = Math.max(newest, fs.statSync(p).mtimeMs); } catch (_) {}
+      }
+    } catch (_) { return; }
+    if (!newest || Date.now() - newest >= debounceMs) return;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
 /** Deterministic batch staging: upload ALL pending photos as ONE encounter + ONE record. */
 async function ingestPendingBatch(args, extra) {
+  await waitForBurstQuiet();
   const media = takeAllInboundMedia();
   if (!media.length) return { ok: false, error: "No pending inbound medical photos to ingest." };
   const crypto = require("crypto");
   const hash = crypto.createHash("sha256");
-  for (const m of media) hash.update(m.path + ":" + m.size + ":" + Math.round(m.mtime));
+  const ordered = [...media].sort((a, b) => a.path.localeCompare(b.path));
+  for (const m of ordered) hash.update(m.path + ":" + m.size + ":" + Math.round(m.mtime));
   const batchKey = "medbatch-" + hash.digest("hex").slice(0, 32);
   const up = await uploadBatchScans(args, media.map((m) => m.path), {
     encounter_date: (extra && extra.encounter_date) || undefined,
@@ -358,9 +383,9 @@ const TOOLS = [
       const stage = readBatchStage();
       return { ok: true, data: stage || null };
     }),
-  tool("update_medical_record", "Enrich an EXISTING medical record in place: title, content (the faithful transcription), recorded_at, and/or encounter_id (re-group). Use this to enrich the record staged by ingest_medical_batch — never create a second record for the same batch. At least one field is required.",
-    { type: "object", properties: { telegram_id: { type: "string" }, record_id: { type: "string" }, title: { type: "string" }, content: { type: "string" }, recorded_at: { type: "string" }, encounter_id: { type: "string" } }, required: ["telegram_id", "record_id"] },
-    (a) => call("POST", "/tools/update_medical_record", a, { record_id: a.record_id, title: a.title, content: a.content, recorded_at: a.recorded_at, encounter_id: a.encounter_id })),
+  tool("update_medical_record", "Enrich an EXISTING medical record in place: title, content (the faithful transcription), recorded_at, and/or encounter_id (re-group). Use this to enrich the record staged by ingest_medical_batch — never create a second record for the same batch. At least one field is required. merge_record_ids: optional list of same-burst placeholder record ids whose scans should fold into this canonical record (completion pass — single canonical record per burst). Surgery encounters: recorded_at is forced to the surgery day (encounter_date) automatically.",
+    { type: "object", properties: { telegram_id: { type: "string" }, record_id: { type: "string" }, title: { type: "string" }, content: { type: "string" }, recorded_at: { type: "string" }, encounter_id: { type: "string" }, merge_record_ids: { type: "array", items: { type: "string" } } }, required: ["telegram_id", "record_id"] },
+    (a) => call("POST", "/tools/update_medical_record", a, { record_id: a.record_id, title: a.title, content: a.content, recorded_at: a.recorded_at, encounter_id: a.encounter_id, merge_record_ids: a.merge_record_ids })),
   tool("add_medical_record", "Store a medical document the user photographed (lab report, prescription, letter). ONE record per batch: if the user sent several photos as one batch (an album, or 'these are one report'), store ONE record whose content covers the whole batch — NEVER one record per photo. The user's explicit instruction wins: if they say it is one batch, log one record. First transcribe the photo FAITHFULLY — original language, exact numbers/units/dates, no summarizing and no translation — then SHOW the transcription to the user and get their confirmation BEFORE calling this. content = the confirmed transcription; title = optional short label (e.g. 'Lab blood panel'); recorded_at = optional ISO date/datetime the document is dated; encounter_id = optional encounter id from list_medical_encounters to group this document under a visit; attach_latest_media = set true to store the photo the user just sent as the record's source scan (the bridge relays the image bytes server-side). If a batch was already staged by ingest_medical_batch, enrich THAT record with update_medical_record instead of calling this.",
     { type: "object", properties: { telegram_id: { type: "string" }, title: { type: "string" }, content: { type: "string" }, recorded_at: { type: "string" }, encounter_id: { type: "string" }, attach_latest_media: { type: "boolean" } }, required: ["telegram_id", "content"] },
     async (a) => {

@@ -144,3 +144,81 @@ def test_ingest_requires_auth(client, scans_dir):
     files = [("files", ("page0.png", PNG, "image/png"))]
     r = client.post("/api/v1/tools/ingest_medical_batch", files=files, data={})
     assert r.status_code == 401
+
+
+def _batch_key(client, headers, key, n=2):
+    files = [("files", (f"page{i}.png", PNG, "image/png")) for i in range(n)]
+    return client.post("/api/v1/tools/ingest_medical_batch", files=files, data={"batch_key": key}, headers=headers)
+
+
+def test_completion_merges_same_burst_placeholders(client, service_headers, scans_dir, db):
+    # Two fragments of one burst + the canonical stage.
+    a = _batch_key(client, service_headers, "burst-a", n=2).json()["data"]
+    b = _batch_key(client, service_headers, "burst-b", n=3).json()["data"]
+    assert db.query(MedicalRecord).count() == 2
+    # Enrich A with explicit merge of B (completion pass).
+    r = client.post(
+        "/api/v1/tools/update_medical_record",
+        json={"record_id": a["record_id"], "content": "SYNTHETIC transcription of the burst", "merge_record_ids": [b["record_id"]]},
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["merged_record_ids"] == [b["record_id"]]
+    assert data["merged_scan_count"] == 3
+    assert data["total_scan_count"] == 5
+    assert len(data["source_image_paths"]) == 5
+    assert len(set(data["source_image_paths"])) == 5  # no duplicates
+    # Single canonical record per burst; B and its encounter are gone.
+    assert db.query(MedicalRecord).count() == 1
+    from drhiro_api.models import MedicalEncounter
+    assert db.query(MedicalEncounter).count() == 1
+    assert db.query(MedicalRecord).filter(MedicalRecord.content.ilike("%transcription pending%")).count() == 0
+
+
+def test_completion_auto_merges_within_burst_window(client, service_headers, scans_dir, db):
+    a = _batch_key(client, service_headers, "auto-a", n=1).json()["data"]
+    b = _batch_key(client, service_headers, "auto-b", n=2).json()["data"]
+    # B created moments after A -> auto-merge on enrichment, no explicit ids.
+    r = client.post(
+        "/api/v1/tools/update_medical_record",
+        json={"record_id": a["record_id"], "content": "SYNTHETIC auto-merged transcription"},
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert b["record_id"] in data["merged_record_ids"]
+    assert data["total_scan_count"] == 3
+    assert db.query(MedicalRecord).count() == 1
+
+
+def test_surgery_day_rule_forces_recorded_at(client, service_headers, scans_dir, db):
+    # Surgery encounter dated 2019-05-15.
+    r = client.post(
+        "/api/v1/tools/add_medical_encounter",
+        json={"encounter_date": "2019-05-15", "title": "Tonsillectomia bilateralis + UPPP (operacija OSAS-a)", "facility": "Sveti Duh"},
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    enc_id = r.json()["data"]["id"]
+    staged = _batch_key(client, service_headers, "surg-1", n=1).json()["data"]
+    # Enrich, explicitly supplying the WRONG (day-before) date + surgery encounter.
+    r = client.post(
+        "/api/v1/tools/update_medical_record",
+        json={
+            "record_id": staged["record_id"],
+            "content": "SYNTHETIC surgery transcription",
+            "recorded_at": "2019-05-14T22:00:00+00:00",
+            "encounter_id": enc_id,
+        },
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    # Local date of recorded_at must be the surgery day, not 2019-05-14.
+    assert data["recorded_at"][:10] in ("2019-05-15", "2019-05-16")  # noon local -> UTC date may shift, local file below
+    rec = db.query(MedicalRecord).filter(MedicalRecord.id == data["id"]).first()
+    from zoneinfo import ZoneInfo
+    local = rec.recorded_at.astimezone(ZoneInfo("Europe/Zagreb"))
+    assert local.date().isoformat() == "2019-05-15", local.isoformat()
+    assert str(rec.encounter_id) == enc_id

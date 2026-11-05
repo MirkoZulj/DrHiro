@@ -52,6 +52,109 @@ def _maybe_uuid(value):
         return None
 
 
+# Surgery-day dating rule: when a batch/record belongs to a surgery
+# encounter, recorded_at must be the surgery day itself (encounter_date,
+# noon in the user's timezone so the local date is unambiguous), never
+# the day before/after produced by UTC-midnight arithmetic.
+_SURGERY_KEYWORDS = (
+    "operac", "kirur", "surgery", "surgical", "operation",
+    "tonsillectom", "tonsilektom", "uppp", "osas",
+)
+
+
+def _is_surgery_encounter(enc) -> bool:
+    if enc is None:
+        return False
+    hay = " ".join(str(x or "") for x in (enc.title, enc.facility, enc.notes)).lower()
+    return any(k in hay for k in _SURGERY_KEYWORDS)
+
+
+def _surgery_recorded_at(enc, user) -> datetime:
+    tz = resolve_tz(user.timezone)
+    return datetime(enc.encounter_date.year, enc.encounter_date.month, enc.encounter_date.day, 12, 0, tzinfo=tz)
+
+
+_PLACEHOLDER_MARKER = "transcription pending"
+_BURST_MERGE_WINDOW = timedelta(minutes=15)
+
+
+def _merge_placeholder_siblings(db: Session, user: User, canonical, explicit_ids=None) -> dict:
+    """Completion pass: fold leftover placeholder batches from the same burst
+    into the canonical (enriched) record. Single canonical record per burst:
+    scans are unioned (deduped by path) onto the canonical record, the
+    placeholder records are deleted, and their encounters are deleted when
+    they hold no other records. Returns merge stats for the response/audit.
+
+    Sibling selection: explicit ``merge_record_ids`` (caller's burst knowledge,
+    owner-scoped) PLUS auto-detected placeholders of the same user whose
+    created_at is within +-15 min of the canonical record's created_at.
+    """
+    canonical_scans = list(canonical.source_image_paths_json or ([canonical.source_image_path] if canonical.source_image_path else []))
+    seen = set(canonical_scans)
+    siblings = []
+    seen_ids = {canonical.id}
+    if explicit_ids:
+        for raw in explicit_ids:
+            rid = _maybe_uuid(raw)
+            if rid is None or rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            sib = db.query(MedicalRecord).filter(MedicalRecord.id == rid, MedicalRecord.user_id == user.id).first()
+            if sib is not None:
+                siblings.append(sib)
+    # Auto-merge same-burst placeholders (Telegram album fragments).
+    if canonical.created_at is not None:
+        lo = canonical.created_at - _BURST_MERGE_WINDOW
+        hi = canonical.created_at + _BURST_MERGE_WINDOW
+        auto = (
+            db.query(MedicalRecord)
+            .filter(
+                MedicalRecord.user_id == user.id,
+                MedicalRecord.source_type == "telegram_photo_batch",
+                MedicalRecord.id != canonical.id,
+                MedicalRecord.content.ilike(f"%{_PLACEHOLDER_MARKER}%"),
+                MedicalRecord.created_at >= lo,
+                MedicalRecord.created_at <= hi,
+            )
+            .all()
+        )
+        for sib in auto:
+            if sib.id not in seen_ids:
+                seen_ids.add(sib.id)
+                siblings.append(sib)
+    merged_ids: list[str] = []
+    merged_scans = 0
+    empty_encounters: list = []
+    for sib in siblings:
+        sib_scans = list(sib.source_image_paths_json or ([sib.source_image_path] if sib.source_image_path else []))
+        for p in sib_scans:
+            if p and p not in seen:
+                seen.add(p)
+                canonical_scans.append(p)
+                merged_scans += 1
+        merged_ids.append(str(sib.id))
+        sib_enc_id = sib.encounter_id
+        db.delete(sib)
+        if sib_enc_id is not None:
+            empty_encounters.append(sib_enc_id)
+    if merged_ids:
+        canonical.source_image_paths_json = canonical_scans
+        canonical.source_image_path = canonical_scans[0] if canonical_scans else canonical.source_image_path
+        db.flush()
+        # Delete now-empty sibling encounters (placeholder encounters only
+        # ever held their single placeholder record).
+        for enc_id in set(empty_encounters):
+            if enc_id == canonical.encounter_id:
+                continue
+            remaining = db.query(MedicalRecord).filter(MedicalRecord.encounter_id == enc_id).count()
+            if remaining == 0:
+                enc = db.query(MedicalEncounter).filter(MedicalEncounter.id == enc_id, MedicalEncounter.user_id == user.id).first()
+                if enc is not None:
+                    db.delete(enc)
+        db.flush()
+    return {"merged_record_ids": merged_ids, "merged_scan_count": merged_scans, "total_scan_count": len(canonical_scans)}
+
+
 def _local_preview_kcal(db: Session, item) -> float | None:
     """Best-effort LOCAL-ONLY kcal for a draft meal item.
 
@@ -959,6 +1062,10 @@ def tool_add_medical_record(req: AddMedicalRecordTool, user: User = Depends(_res
     recorded_at = req.recorded_at
     if recorded_at is not None and recorded_at.tzinfo is None:
         recorded_at = recorded_at.replace(tzinfo=resolve_tz(user.timezone))
+    # Surgery-day rule: a record under a surgery encounter is dated the
+    # surgery day itself, regardless of any off-by-one supplied date.
+    if encounter is not None and _is_surgery_encounter(encounter):
+        recorded_at = _surgery_recorded_at(encounter, user)
     rec = MedicalRecord(
         user_id=user.id,
         title=((req.title or "").strip() or None),
@@ -1245,6 +1352,7 @@ class UpdateMedicalRecordTool(BaseModel):
     content: str | None = None
     recorded_at: datetime | None = None
     encounter_id: str | None = None  # re-group under another encounter (owner-scoped)
+    merge_record_ids: list[str] | None = None  # same-burst placeholder ids to fold in
 
 
 @router.post("/update_medical_record", response_model=ToolResponse)
@@ -1293,11 +1401,24 @@ def tool_update_medical_record(req: UpdateMedicalRecordTool, user: User = Depend
         changed.append("encounter_id")
     if not changed:
         raise HTTPException(status_code=400, detail="Provide at least one of title, content, recorded_at, encounter_id")
+    # Surgery-day rule + completion pass (merge same-burst placeholders).
+    effective_enc = None
+    if rec.encounter_id is not None:
+        effective_enc = db.query(MedicalEncounter).filter(MedicalEncounter.id == rec.encounter_id, MedicalEncounter.user_id == user.id).first()
+    if effective_enc is not None and _is_surgery_encounter(effective_enc):
+        rec.recorded_at = _surgery_recorded_at(effective_enc, user)
+        if "recorded_at" not in changed:
+            changed.append("recorded_at(surgery-day)")
+    merge_info = {"merged_record_ids": [], "merged_scan_count": 0, "total_scan_count": len(rec.source_image_paths_json or [])}
+    # Run the completion pass when enriching content (transcription) or when
+    # the caller explicitly names same-burst placeholders to fold in.
+    if req.content is not None or req.merge_record_ids:
+        merge_info = _merge_placeholder_siblings(db, user, rec, explicit_ids=req.merge_record_ids)
     _tool_audit(db, user, "tools.update_medical_record", "medical_record", str(rec.id),
-                metadata={"changed": changed})
+                metadata={"changed": changed, **merge_info})
     db.commit()
     db.refresh(rec)
-    return ToolResponse(ok=True, message="Medical record updated.", data=_medical_record_out(rec))
+    return ToolResponse(ok=True, message="Medical record updated.", data={**_medical_record_out(rec), **merge_info})
 
 
 @router.post("/ingest_medical_batch", response_model=ToolResponse)
@@ -1387,7 +1508,9 @@ async def tool_ingest_medical_batch(
         title=rec_title,
         content=placeholder,
         source_type="telegram_photo_batch",
-        recorded_at=datetime.now(timezone.utc),
+        # Anchor the staged record to the encounter day (noon, user tz) so
+        # dating never drifts to the UTC day boundary.
+        recorded_at=datetime(enc_date.year, enc_date.month, enc_date.day, 12, 0, tzinfo=resolve_tz(user.timezone)),
         encounter_id=encounter.id,
         source_image_path=scan_paths[0],
         source_image_paths_json=scan_paths,
