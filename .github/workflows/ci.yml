@@ -38,7 +38,7 @@ jobs:
         run: |
           python -m venv .venv
           . .venv/bin/activate
-          pip install -e packages/health-schema -e packages/rule-engine -e packages/nutrition-core -e "apps/api[dev]" -e apps/worker
+          pip install -e packages/health-schema -e packages/rule-engine -e packages/nutrition-core -e packages/analytics-engine -e "apps/api[dev]" -e apps/worker
       - name: Package tests
         run: |
           . .venv/bin/activate

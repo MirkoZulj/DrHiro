@@ -18,6 +18,7 @@ dependencies = [
     "drhiro-health-schema>=0.1.0,<1",
     "drhiro-rule-engine>=0.1.0,<1",
     "drhiro-nutrition-core>=0.1.0,<1",
+    "drhiro-analytics>=0.1.0,<1",
 ]
 
 [project.optional-dependencies]
