@@ -22,6 +22,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -208,7 +209,7 @@ class Reminder(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    type: Mapped[str] = mapped_column(String(32), nullable=False)  # bp, weight, meal, water, sync, activity, bedtime, weekly
+    type: Mapped[str] = mapped_column(String(32), nullable=False)  # bp, weight, meal, water, sync, activity, bedtime, weekly, medication
     schedule_json: Mapped[dict] = mapped_column(JSON, nullable=False)  # {"cron": "0 8 * * *"} or {"days": [...], "time": "08:00"}
     timezone: Mapped[str] = mapped_column(String(64), default="UTC", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -577,3 +578,231 @@ class LogWriteFingerprint(Base, TimestampMixin):
     # is testable without freezing wall time.
     seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     result_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+
+# ── Supplements & medications (0.9.0, spec §5) ──────────────────────────────
+
+
+class MedicationItem(Base, TimestampMixin):
+    """A supplement or medication the user says they take.
+
+    Records ONLY what the user stated — the agent never suggests starting,
+    stopping or changing a dose. An expected dose with no log is "not logged",
+    never "missed" and never 0% adherence. Interaction checking is out of
+    scope; the only deterministic check is duplicate ingredients (rule engine,
+    MED_DUPLICATE_INGREDIENT).
+    """
+
+    __tablename__ = "medication_items"
+    __table_args__ = (
+        Index("ix_med_items_user_status", "user_id", "status"),
+        CheckConstraint("kind IN ('supplement','medication')", name="ck_med_kind"),
+        CheckConstraint("status IN ('draft','active','paused','stopped')", name="ck_med_status"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    brand: Mapped[str | None] = mapped_column(String(255))
+    form: Mapped[str | None] = mapped_column(String(24))
+    # [{"name":"cholecalciferol","amount":50,"unit":"µg","per":"unit"}]  per = unit|serving|ml
+    ingredients_json: Mapped[list | None] = mapped_column(JSON)
+    dose_amount: Mapped[float | None] = mapped_column()
+    dose_unit: Mapped[str | None] = mapped_column(String(16))
+    # {"type":"daily","times":["08:00"]} | {"type":"weekly","days":["mon","thu"],"times":["08:00"]}
+    # | {"type":"interval","every_days":3,"times":["08:00"],"anchor":"2026-11-03"} | {"type":"prn"}
+    # optional: "with_food": "with|before|after|any"
+    schedule_json: Mapped[dict | None] = mapped_column(JSON)
+    timezone: Mapped[str | None] = mapped_column(String(64))  # None = follow user.timezone
+    start_date: Mapped[date | None] = mapped_column(Date)
+    end_date: Mapped[date | None] = mapped_column(Date)  # planned end (course), may be None
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    prescribed_by: Mapped[str | None] = mapped_column(String(255))
+    medical_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("medical_records.id", ondelete="SET NULL")
+    )
+    source: Mapped[str] = mapped_column(String(24), default="manual", nullable=False)
+    label_image_path: Mapped[str | None] = mapped_column(String(512))
+    # D1 reminder design (owner decision 2026-11-03): ONE Reminder per time
+    # slot, built with the existing `_compute_next_due` semantics (which
+    # handles exactly one `{"days":[...],"time":"HH:MM"}` or one cron slot).
+    # A schedule with multiple times therefore needs multiple Reminder rows,
+    # so the slot→reminder mapping is stored as a JSON list of reminder ids
+    # (spec §5.5 `reminder_ids_json`). Single-slot schedules carry exactly one.
+    reminder_ids_json: Mapped[list | None] = mapped_column(JSON)
+    stock_quantity: Mapped[float | None] = mapped_column()
+    stock_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
+class MedicationItemEvent(Base):
+    """Append-only history: start/stop/pause/resume/dose change. Feeds analytics timeline."""
+
+    __tablename__ = "medication_item_events"
+    __table_args__ = (Index("ix_med_item_events_user_day", "user_id", "effective_date"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("medication_items.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # started|stopped|paused|resumed|dose_changed|schedule_changed|edited
+    effective_date: Mapped[date] = mapped_column(Date, nullable=False)
+    before_json: Mapped[dict | None] = mapped_column(JSON)
+    after_json: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class DoseEvent(Base, TimestampMixin):
+    """One logged dose. An expected dose with no event stays "not logged" —
+    never "missed", never 0% adherence ("missing stays missing")."""
+
+    __tablename__ = "dose_events"
+    __table_args__ = (
+        Index("ix_dose_events_user_time", "user_id", "taken_at"),
+        # one record per scheduled slot; PRN/ad-hoc doses have scheduled_for NULL (not constrained)
+        Index(
+            "uq_dose_slot",
+            "item_id",
+            "scheduled_for",
+            unique=True,
+            postgresql_where=text("scheduled_for IS NOT NULL"),
+        ),
+        CheckConstraint("status IN ('taken','skipped')", name="ck_dose_status"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("medication_items.id", ondelete="CASCADE"), nullable=False)
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # slot this answers
+    taken_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="taken", nullable=False)
+    amount: Mapped[float | None] = mapped_column()  # defaults to item.dose_amount
+    unit: Mapped[str | None] = mapped_column(String(16))
+    source: Mapped[str] = mapped_column(String(24), default="telegram", nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+
+
+# ── Health card (0.10.0 wave 3, spec §6) ────────────────────────────────────
+
+
+class HealthProfile(Base, TimestampMixin):
+    """One row per user: the self-maintained health card.
+
+    JSON sections keep the schema flexible; every list entry carries its own
+    `id` (uuid4 string) so the agent and UI can edit a single entry. Derived
+    fields (display name, DOB, age, sex, height, latest weight, current
+    medications) are computed at read time from `users`, the weight series and
+    `medication_items` — never stored here (spec §6.1).
+    """
+
+    __tablename__ = "health_profiles"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_health_profile_user"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # A+, A-, B+, B-, AB+, AB-, 0+, 0-, unknown
+    blood_type: Mapped[str | None] = mapped_column(String(8))
+    organ_donor: Mapped[str | None] = mapped_column(String(8))  # yes|no|unknown
+    conditions_json: Mapped[list] = mapped_column(JSON, default=list)
+    allergies_json: Mapped[list] = mapped_column(JSON, default=list)
+    intolerances_json: Mapped[list] = mapped_column(JSON, default=list)
+    implants_devices_json: Mapped[list] = mapped_column(JSON, default=list)
+    vaccinations_json: Mapped[list] = mapped_column(JSON, default=list)
+    surgeries_json: Mapped[list] = mapped_column(JSON, default=list)
+    family_history_json: Mapped[list] = mapped_column(JSON, default=list)
+    emergency_contacts_json: Mapped[list] = mapped_column(JSON, default=list)
+    care_team_json: Mapped[list] = mapped_column(JSON, default=list)
+    insurance_json: Mapped[dict | None] = mapped_column(JSON)  # {provider, number}
+    notes: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # "card is up to date"
+
+
+# ── Analytics runs (0.9.0 wave 2, spec §3.4) ────────────────────────────────
+
+
+class AnalysisRun(Base, TimestampMixin):
+    """One deterministic analytics run. Findings stay in result_json —
+    immutable per run, stable ids comparable across runs."""
+
+    __tablename__ = "analysis_runs"
+    __table_args__ = (
+        Index("ix_analysis_runs_user_created", "user_id", "created_at"),
+        UniqueConstraint("user_id", "idempotency_key", name="uq_analysis_run_idem"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # general | visit
+    status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False)  # queued|running|succeeded|failed
+    requested_via: Mapped[str] = mapped_column(String(16), default="web", nullable=False)  # web | telegram
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    params_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    data_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    engine_version: Mapped[str | None] = mapped_column(String(16))
+    thresholds_version: Mapped[str | None] = mapped_column(String(32))
+    result_json: Mapped[dict | None] = mapped_column(JSON)
+    narrative_text: Mapped[str | None] = mapped_column(Text)
+    narrative_status: Mapped[str] = mapped_column(String(16), default="none", nullable=False)  # none|ok|rejected|unavailable
+    job_id: Mapped[str | None] = mapped_column(String(64))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+
+    files: Mapped[list["GeneratedFile"]] = relationship(
+        primaryjoin="AnalysisRun.id == foreign(GeneratedFile.analysis_run_id)",
+        viewonly=True,
+    )
+
+
+# ── Generated artefacts (0.10.0 wave 3, spec §2.2) ──────────────────────────
+
+
+class GeneratedFile(Base, TimestampMixin):
+    """One downloadable artefact: analysis/visit/health-card PDFs, data-export
+    bundles, system backups, restore tests. Files live on the filesystem under
+    generated_files_dir (layout: generated/<user_id>/<uuid>.<ext>); this row is
+    the metadata + status record."""
+
+    __tablename__ = "generated_files"
+    __table_args__ = (Index("ix_generated_files_user_kind", "user_id", "kind", "created_at"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    # analysis_report | visit_report | health_card | data_export | system_backup | restore_test
+    status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False)  # queued|running|ready|failed|expired
+    rel_path: Mapped[str | None] = mapped_column(String(512))  # relative to generated_files_dir (or backups_dir for system_backup)
+    filename: Mapped[str | None] = mapped_column(String(255))  # download name
+    mime: Mapped[str | None] = mapped_column(String(64))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    params_json: Mapped[dict | None] = mapped_column(JSON)
+    analysis_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_runs.id", ondelete="SET NULL")
+    )
+    error: Mapped[str | None] = mapped_column(Text)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    job_id: Mapped[str | None] = mapped_column(String(64))
+
+# ── Runtime settings singleton (restores the AppSetting model that
+#    services/settings_store.py always imported but which was missing from
+#    models.py — a latent import-time break exposed when routers/backups.py
+#    started importing the settings gate). Table matches the guarded SQL in
+#    migration b8c9d0e1f2a3.
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)  # "singleton"
+    ai_backend_url: Mapped[str | None] = mapped_column(String(512))
+    model_name: Mapped[str | None] = mapped_column(String(255))
+    ai_api_key: Mapped[str | None] = mapped_column(Text)
+    telegram_bot_token: Mapped[str | None] = mapped_column(Text)
+    telegram_allowed_username: Mapped[str | None] = mapped_column(String(255))
+    telegram_allowed_user_id: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)

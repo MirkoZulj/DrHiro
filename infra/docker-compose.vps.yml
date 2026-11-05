@@ -13,6 +13,10 @@ services:
   api:
     ports:
       - "127.0.0.1:8010:8000"
+    # Medical scans + generated files. Bind mount matching the existing prod
+    # layout (/opt/drhiro/data on the VPS) — NOT a named volume.
+    volumes:
+      - ${DRHIRO_DATA_DIR:-/opt/drhiro/data}:/opt/drhiro/data
     # No build needed in prod after images are built; keep build for first deploy.
     build:
       context: ..
@@ -22,6 +26,9 @@ services:
     build:
       context: ..
       dockerfile: infra/docker/Dockerfile.worker
+    # Data dir read-write: the worker writes reports/exports here (0.9+).
+    volumes:
+      - ${DRHIRO_DATA_DIR:-/opt/drhiro/data}:/opt/drhiro/data
 
   scheduler:
     build:

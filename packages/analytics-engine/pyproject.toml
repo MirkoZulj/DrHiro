@@ -1,0 +1,17 @@
+[project]
+name = "drhiro-analytics"
+version = "0.1.0"
+description = "drHiro deterministic analytics engine: change points, trends, variability, unknowns, rendered facts. No DB, no FastAPI, no LLM."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26,<3",
+    "pandas>=2.0,<3",
+    "scipy>=1.11,<2",
+    "ruptures>=1.1.9,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

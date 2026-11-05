@@ -99,7 +99,8 @@ export default function Records() {
     setError(null)
     try {
       const res = await authClient.api('/medical/encounters')
-      setEncounters(Array.isArray(res) ? res : [])
+      const list = Array.isArray(res) ? res : (res?.encounters ?? [])
+      setEncounters(list)
     } catch (e: any) {
       setError(e?.message ?? String(e))
     } finally {

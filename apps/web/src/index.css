@@ -2082,3 +2082,99 @@ button.link:hover { background: none; text-decoration: underline; }
     border-radius: var(--radius-lg);
   }
 }
+
+/* =========================================================================
+   Meds & Supplements (/medications) — clean card list + composition detail
+   Consumes design/tokens.css primitives (with fallbacks matching the
+   index.css palette, as elsewhere in this file). No new design system.
+   ========================================================================= */
+.meds-view { max-width: 720px; }
+.meds-header {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: var(--space-3); margin-bottom: var(--space-3);
+}
+.meds-header h2 { margin: 0; }
+.meds-add-grid { display: grid; gap: var(--space-2); grid-template-columns: 1fr 1fr; }
+.meds-add-grid label { display: block; font-size: 13px; font-weight: 600; color: var(--color-text-muted, #66707A); }
+.meds-add-grid input, .meds-add-grid select {
+  margin-top: 4px; padding: 10px 12px; border: 1px solid var(--color-border-strong, #AEB6BF);
+  border-radius: var(--radius-sm, 8px); font-size: 15px; background: var(--color-surface, #fff);
+  color: var(--color-text, #1A1D21); font-family: inherit;
+}
+
+/* Inner tabs: reuse the app's pill tab pattern (.tabs/.tab above). */
+.meds-tabs-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-3);
+}
+.meds-tabs { margin-bottom: 0; }
+.meds-tabs .tab { background: transparent; }
+.meds-tabs .tab.active { background: var(--color-accent-subtle, #E3F1EC); color: var(--color-accent-text, #0B5F4E); font-weight: 600; }
+.meds-count { font-size: 13px; color: var(--color-text-muted, #66707A); }
+
+/* Item rows: one card per item, single action row. */
+.meds-list { display: flex; flex-direction: column; gap: var(--space-3); }
+.meds-item {
+  background: var(--color-surface, #fff); border: 1px solid var(--color-border, #D5DAE0);
+  border-radius: var(--radius-lg, 16px); padding: var(--space-4); box-shadow: var(--shadow-sm, 0 1px 2px rgba(16,24,32,.06));
+}
+.meds-item-main { display: flex; align-items: flex-start; gap: var(--space-3); }
+.meds-item-icon {
+  flex: 0 0 auto; width: 40px; height: 40px; border-radius: var(--radius-full, 999px);
+  background: var(--color-accent-subtle, #E3F1EC); display: grid; place-items: center; font-size: 19px;
+}
+.meds-item-body { flex: 1; min-width: 0; }
+.meds-item-title { font-size: 15px; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+.meds-item-brand { color: var(--color-text-muted, #66707A); font-weight: 500; }
+.meds-item-meta { font-size: 14px; color: var(--color-text-secondary, #4A5158); margin-top: 2px; }
+.meds-item-sub { font-size: 13px; color: var(--color-text-muted, #66707A); margin-top: 1px; }
+.meds-dot { margin: 0 4px; color: var(--color-text-muted, #66707A); }
+
+/* Status badges: semantic tints from tokens (color + text label, not color alone). */
+.meds-badge {
+  flex: 0 0 auto; font-size: 12px; font-weight: 600; padding: 2px 10px;
+  border-radius: var(--radius-full, 999px); line-height: 1.5;
+}
+.meds-badge--active { background: var(--color-success-tint, #E6F4EA); color: var(--color-success-text, #1E7B34); }
+.meds-badge--paused { background: var(--color-warning-tint, #FBF0DB); color: var(--color-warning-text, #8A5A00); }
+.meds-badge--stopped { background: var(--color-danger-tint, #FCEBEA); color: var(--color-danger-text, #B02A20); }
+
+/* The ONE action row per item: Taken / Skip / Pause / Stop / Detail. */
+.meds-actions {
+  display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: center;
+  margin-top: var(--space-3); padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border, #D5DAE0);
+}
+.meds-actions button { min-height: 40px; }
+.meds-detail-btn { margin-left: auto; }
+
+/* Composition detail (modal). */
+.meds-detail { max-width: 640px; }
+.meds-detail-sub { font-size: 13px; color: var(--color-text-muted, #66707A); margin-bottom: var(--space-3); }
+.meds-detail-note { font-size: 12px; color: var(--color-text-muted, #66707A); margin-top: var(--space-3); }
+.meds-comp-wrap { overflow-x: auto; }
+.meds-comp { min-width: 360px; }
+.meds-comp th, .meds-comp td { padding: var(--space-2) var(--space-3); font-size: 13px; }
+.meds-comp thead th { white-space: normal; overflow-wrap: anywhere; line-height: 1.25; }
+.meds-comp tbody tr:nth-child(even) { background: var(--color-surface-subtle, #F1F3F5); }
+.meds-comp .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.meds-comp thead th.num { text-align: right; }
+.meds-comp-name { font-weight: 500; overflow-wrap: anywhere; }
+.meds-comp td { vertical-align: middle; }
+
+/* Adherence table: keep numeric columns aligned + tabular. */
+.meds-adherence .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.meds-adherence thead th.num { text-align: right; }
+
+/* Mobile: down to 400px — stack header/actions, shrink table, full-width modal. */
+@media (max-width: 560px) {
+  .meds-item-main { gap: var(--space-2); }
+  .meds-item-icon { width: 36px; height: 36px; font-size: 17px; }
+  .meds-actions { gap: var(--space-1); }
+  .meds-actions button { padding: 9px 12px; font-size: 14px; }
+  .meds-detail-btn { margin-left: 0; }
+  .meds-detail { padding: var(--space-4); }
+  .meds-comp { min-width: 320px; }
+  .meds-comp th, .meds-comp td { padding: 8px; font-size: 12px; }
+  .meds-add-grid { grid-template-columns: 1fr; }
+}

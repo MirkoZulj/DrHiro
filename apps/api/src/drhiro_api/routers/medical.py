@@ -45,9 +45,10 @@ ALLOWED_MIME = {
 MAX_SCAN_BYTES = 25 * 1024 * 1024
 
 
-def store_scan(user: User, data: bytes, content_type: str | None) -> str:
-    """Persist scan bytes under <medical_scans_dir>/<user>/<uuid>.<ext> and
-    return the RELATIVE path stored in medical_records.source_image_path."""
+def store_scan(user: User, data: bytes, content_type: str | None, subdir: str = "scans") -> str:
+    """Persist scan bytes under <medical_scans_dir>/<subdir>/<user>/<uuid>.<ext> and
+    return the RELATIVE path stored in medical_records.source_image_path.
+    Legacy documents stay in scans/<user>/...; medication labels use subdir="labels"."""
     ext = ALLOWED_MIME.get((content_type or "").split(";")[0].strip().lower())
     if not ext:
         raise HTTPException(status_code=415, detail="Unsupported image type — jpg, png, webp or heic expected")
@@ -56,7 +57,7 @@ def store_scan(user: User, data: bytes, content_type: str | None) -> str:
     if len(data) > MAX_SCAN_BYTES:
         raise HTTPException(status_code=413, detail="Image too large (max 25 MB)")
     settings = get_settings()
-    rel = os.path.join("scans", str(user.id), f"{uuid_mod.uuid4()}{ext}")
+    rel = os.path.join(subdir, str(user.id), f"{uuid_mod.uuid4()}{ext}")
     abs_dir = os.path.join(settings.medical_scans_dir, os.path.dirname(rel))
     abs_path = os.path.join(settings.medical_scans_dir, rel)
     os.makedirs(abs_dir, exist_ok=True)

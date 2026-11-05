@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from drhiro_api.db import get_db
 from drhiro_api.deps import get_user_by_telegram_id
-from drhiro_api.models import Activity, Alert, Goal, IngestBatch, Meal, MealItem, Measurement, MedicalEncounter, MedicalRecord, Reminder, ReminderOccurrence, User
+from drhiro_api.models import Activity, Alert, DoseEvent, Goal, IngestBatch, Meal, MealItem, Measurement, MedicalEncounter, MedicalRecord, MedicationItem, Reminder, ReminderOccurrence, User
 from drhiro_api.routers.auth import mint_web_login_code
 from drhiro_api.routers.dashboard import _measurements_since
 from drhiro_api.security import audit, validate_service_token
@@ -1267,19 +1267,35 @@ def tool_undo_last_action(user: User = Depends(_resolve_user), db: Session = Dep
         candidates.append((last_meal.created_at, "meal", last_meal))
     if last_activity:
         candidates.append((last_activity.created_at, "activity", last_activity))
+    # 0.9.0 (spec §5.7): dose events are always undoable; a medication item
+    # only within 10 minutes of creation.
+    last_dose = (
+        db.query(DoseEvent)
+        .filter(DoseEvent.user_id == user.id)
+        .order_by(DoseEvent.created_at.desc())
+        .first()
+    )
+    if last_dose:
+        candidates.append((last_dose.created_at, "dose", last_dose))
+    last_item = (
+        db.query(MedicationItem)
+        .filter(
+            MedicationItem.user_id == user.id,
+            MedicationItem.created_at >= datetime.now(timezone.utc) - timedelta(minutes=10),
+        )
+        .order_by(MedicationItem.created_at.desc())
+        .first()
+    )
+    if last_item:
+        candidates.append((last_item.created_at, "medication_item", last_item))
     if not candidates:
         return ToolResponse(ok=False, message="Nothing to undo.")
     _, kind, obj = max(candidates, key=lambda c: c[0])
-    if kind == "measurement":
+    if kind in ("measurement", "activity", "dose", "medication_item"):
         db.delete(obj)
-        _tool_audit(db, user, "tools.undo", "measurement", str(obj.id))
+        _tool_audit(db, user, "tools.undo", kind, str(obj.id))
         db.commit()
-        return ToolResponse(ok=True, message="Last measurement undone.")
-    if kind == "activity":
-        db.delete(obj)
-        _tool_audit(db, user, "tools.undo", "activity", str(obj.id))
-        db.commit()
-        return ToolResponse(ok=True, message="Last activity undone.")
+        return ToolResponse(ok=True, message=f"Last {kind.replace('_', ' ')} undone.")
     obj.status = "deleted"
     _tool_audit(db, user, "tools.undo", "meal", str(obj.id))
     db.commit()

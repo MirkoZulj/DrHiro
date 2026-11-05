@@ -106,6 +106,9 @@ services:
       RESTART_FLAGS_DIR: ${RESTART_FLAGS_DIR:-/var/lib/drhiro/restart-flags}
     volumes:
       - ${RESTART_FLAGS_DIR:-/var/lib/drhiro/restart-flags}:/var/lib/drhiro/restart-flags
+      # Medical scans + generated files. Bind mount matching the existing prod
+      # layout (/opt/drhiro/data on the VPS) — NOT a named volume.
+      - ${DRHIRO_DATA_DIR:-/opt/drhiro/data}:/opt/drhiro/data
     expose: ["8000"]
     ports: ["8010:8000"]
     depends_on:
@@ -129,6 +132,10 @@ services:
     environment:
       DRHIRO_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DRHIRO_REDIS_URL: redis://redis:6379/0
+    # Needs the data dir read-write for future reports/exports (0.9+ worker
+    # jobs write PDFs and export bundles under /opt/drhiro/data/generated).
+    volumes:
+      - ${DRHIRO_DATA_DIR:-/opt/drhiro/data}:/opt/drhiro/data
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }

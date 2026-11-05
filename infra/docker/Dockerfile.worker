@@ -4,9 +4,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+# Wave 3 (spec §3.9): PDF rendering needs pango + dejavu (hr diacritics);
+# §4.3: in-app backups shell out to pg_dump/gpg via infra/backup scripts.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpango-1.0-0 libpangoft2-1.0-0 fonts-dejavu-core \
+    postgresql-client gnupg \
+    && rm -rf /var/lib/apt/lists/*
+COPY infra/backup /app/infra/backup
+
 COPY packages/health-schema /app/packages/health-schema
 COPY packages/rule-engine /app/packages/rule-engine
 COPY packages/nutrition-core /app/packages/nutrition-core
+COPY packages/analytics-engine /app/packages/analytics-engine
 COPY apps/api /app/apps/api
 COPY apps/worker /app/apps/worker
 
@@ -14,6 +23,7 @@ RUN pip install --no-cache-dir \
     /app/packages/health-schema \
     /app/packages/rule-engine \
     /app/packages/nutrition-core \
+    /app/packages/analytics-engine \
     /app/apps/api \
     /app/apps/worker
 

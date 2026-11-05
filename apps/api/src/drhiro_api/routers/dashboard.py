@@ -16,6 +16,16 @@ from drhiro_api.db import get_db
 from drhiro_api.deps import get_current_user
 from drhiro_api.models import Activity, Goal, Meal, Measurement, User
 from drhiro_api.security import audit
+from drhiro_api.services.series import (  # noqa: F401  (single source of series semantics)
+    LIQUID_CANONICAL_CATS,
+    LIQUID_CATEGORY_MAP,
+    LIQUID_LEGACY_CATS,
+    _dedup_sleep,
+    _dedup_steps,
+    _ledger_soft_delete_available,
+    daily_series,
+    liquid_category_buckets,
+)
 from drhiro_api.services.day_boundary import (
     day_start_hour,
     local_calendar_date,
@@ -42,17 +52,10 @@ from drhiro_schema.metrics import MetricType
 router = APIRouter(tags=["dashboard"])
 
 
-def _ledger_soft_delete_available(db: Session) -> bool:
-    """True only when the ledger soft-delete migration has been applied.
-
-    On a schema without `measurements.deleted_at` (production today) the filter is
-    omitted entirely rather than referencing a column that does not exist.
-    """
-    try:
-        from drhiro_api.services.log_intents import schema_capabilities
-        return bool(schema_capabilities(db)["ledger_deleted_at"])
-    except Exception:
-        return False
+# _ledger_soft_delete_available, _dedup_sleep and _dedup_steps now live in
+# services/series.py (single source of daily-series semantics) and are
+# re-imported above under their historical names so existing callers (and any
+# test reaching into dashboard._dedup_steps) keep working.
 
 
 def _measurements_since(db: Session, user_id: uuid.UUID, days: int) -> list[dict]:
@@ -80,114 +83,7 @@ def _measurements_since(db: Session, user_id: uuid.UUID, days: int) -> list[dict
 
 
 
-def _dedup_sleep(records):
-    """Compute total sleep from potentially overlapping records.
-    Health Connect sends full sessions + sub-stages that overlap.
-    Keeps only the longest coverage per time period.
-    """
-    if not records:
-        return 0.0
-    sorted_recs = sorted(records, key=lambda r: ((r.get('end_at') or r['start_at']) - r['start_at'], r['start_at']))
-    total_min = 0.0
-    occupied = []
-    for rec in sorted_recs:
-        start = rec['start_at']
-        end = rec.get('end_at') or start
-        dur = (rec.get('value_json') or {}).get('duration_min', 0) or 0
-        uncovered = [(start, end)]
-        for occ_start, occ_end in occupied:
-            new_unc = []
-            for u_s, u_e in uncovered:
-                if occ_end <= u_s or occ_start >= u_e:
-                    new_unc.append((u_s, u_e))
-                else:
-                    if u_s < occ_start:
-                        new_unc.append((u_s, occ_start))
-                    if u_e > occ_end:
-                        new_unc.append((occ_end, u_e))
-            uncovered = new_unc
-            if not uncovered:
-                break
-        if not uncovered:
-            continue
-        unc_sec = sum((e - s).total_seconds() for s, e in uncovered)
-        total_sec = (end - start).total_seconds()
-        if total_sec > 0 and unc_sec > 0:
-            total_min += dur * unc_sec / total_sec
-            occupied.append((start, end))
-    return round(total_min, 0)
-
-
-def _dedup_steps(records: list[dict]) -> int:
-    """Sum step counts without double-counting overlapping intervals.
-
-    Health Connect returns the SAME steps at two levels:
-      1. 30-minute AGGREGATE buckets (spans ~1799s / 29:59, matching what the
-         user's band shows), and
-      2. finer per-minute / per-second detail records inside those buckets.
-    Summing both double-counts (observed ~13.5k vs the band's ~7.1k).
-
-    The 30-minute aggregate buckets are authoritative — their sum matches the
-    device.  So we count buckets FULLY, and only credit a detail record for
-    time NOT already covered by a bucket (gap-filling).  A detail record that
-    sits entirely inside a bucket contributes nothing.
-
-    A bucket is recognised by its long span: Health Connect 30-min summaries
-    land at ~1799s, just UNDER a naive 1800s (30 min) cutoff — which is exactly
-    why the old code misclassified them as granular and double-counted.  We use
-    a ~28-minute threshold so the real summaries are treated as buckets.
-    """
-    if not records:
-        return 0
-
-    BUCKET_SECS = 28 * 60  # ~30-min Health Connect aggregate summaries
-
-    detail = [
-        r for r in records
-        if (r.get("end_at") or r["start_at"]) - r["start_at"] < timedelta(seconds=BUCKET_SECS)
-    ]
-    buckets = [
-        r for r in records
-        if (r.get("end_at") or r["start_at"]) - r["start_at"] >= timedelta(seconds=BUCKET_SECS)
-    ]
-
-    # Buckets are authoritative: count fully, occupy their whole interval.
-    occupied: list[tuple[datetime, datetime]] = []
-    total = 0
-    for rec in buckets:
-        start = rec["start_at"]
-        end = rec.get("end_at") or start
-        total += (rec.get("value_json") or {}).get("count", 0)
-        occupied.append((start, end))
-
-    # Detail records: only credit the portion NOT covered by any bucket.
-    for rec in detail:
-        start = rec["start_at"]
-        end = rec.get("end_at") or start
-        count = (rec.get("value_json") or {}).get("count", 0)
-        uncovered = [(start, end)]
-        for occ_start, occ_end in occupied:
-            new_uncovered: list[tuple[datetime, datetime]] = []
-            for u_start, u_end in uncovered:
-                if occ_end <= u_start or occ_start >= u_end:
-                    new_uncovered.append((u_start, u_end))
-                else:
-                    if u_start < occ_start:
-                        new_uncovered.append((u_start, occ_start))
-                    if u_end > occ_end:
-                        new_uncovered.append((occ_end, u_end))
-            uncovered = new_uncovered
-            if not uncovered:
-                break
-        if not uncovered:
-            continue  # fully covered by buckets
-        unc_sec = sum((e - s).total_seconds() for s, e in uncovered)
-        total_sec = (end - start).total_seconds()
-        if total_sec > 0 and unc_sec > 0:
-            total += int(count * unc_sec / total_sec)
-            occupied.extend(uncovered)
-
-    return total
+# _dedup_sleep and _dedup_steps moved to services/series.py (imported above).
 
 
 def _local_day_start(user: User) -> datetime:
@@ -1003,106 +899,31 @@ def trends_daily(metric: str, days: int = Query(7, ge=1, le=90),
     steps -> summed steps/day; water_ml -> summed; sleep_duration_min -> max;
     heart_rate_bpm -> avg; weight_kg -> last of day; calories_kcal -> meal kcal/day.
     """
+    key_map = {
+        "steps": "steps",
+        "water_ml": "water_ml",
+        "sleep_duration_min": "sleep_duration_min",
+        "heart_rate_bpm": "heart_rate_bpm",
+        "weight_kg": "weight_kg",
+    }
+    key = key_map.get(metric)
+    if key is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported metric: {metric}")
+
     tz = resolve_tz(user.timezone)
     end = datetime.now(tz).date()
     start = end - timedelta(days=days - 1)
-    start_dt = datetime.combine(start, datetime.min.time(), tzinfo=tz)
-    end_dt = datetime.combine(end + timedelta(days=1), datetime.min.time(), tzinfo=tz)
 
-    rows = (db.query(Measurement)
-            .filter(Measurement.user_id == user.id,
-                    Measurement.start_at >= start_dt, Measurement.start_at < end_dt))
-    if _ledger_soft_delete_available(db):
-        # A soft-deleted liquid must not appear in any daily total. Expressed as
-        # guarded raw SQL because the column is not ORM-mapped (a schema without
-        # it must never see it referenced).
-        rows = rows.filter(text("measurements.deleted_at IS NULL"))
-    rows = rows.order_by(Measurement.start_at.asc()).all()
-
-    metric_map = {
-        "steps": MetricType.STEPS,
-        "water_ml": MetricType.WATER,
-        "sleep_duration_min": MetricType.SLEEP,
-        "heart_rate_bpm": MetricType.HEART_RATE,
-        "weight_kg": MetricType.WEIGHT,
-    }
-    mt = metric_map.get(metric)
-    if mt is None:
-        raise HTTPException(status_code=400, detail=f"Unsupported metric: {metric}")
-
-    buckets: dict[str, list] = {}
-    for m in rows:
-        if m.metric_type != mt:
-            continue
-        if mt == MetricType.SLEEP:
-            # Sleep is keyed to the WAKE-UP day (Xiaomi/Mi Fitness convention),
-            # not to the date the wearer went to bed.
-            wd = wake_date(m.start_at, (m.value_json or {}).get("duration_min"),
-                           getattr(m, "end_at", None), tz)
-            if wd is None:
-                continue
-            day = wd.isoformat()
-        else:
-            day = m.start_at.astimezone(tz).date().isoformat()
-        vj = m.value_json or {}
-        v = vj.get("value")
-        if v is None:
-            # metric-specific keys
-            if mt == MetricType.STEPS:
-                v = vj.get("count")
-            elif mt == MetricType.WEIGHT:
-                v = vj.get("weight_kg")
-            elif mt == MetricType.SLEEP:
-                v = vj.get("duration_min")
-            elif mt == MetricType.WATER:
-                v = vj.get("amount_ml") or vj.get("volume_ml") or vj.get("water_ml")
-            elif mt == MetricType.HEART_RATE:
-                v = vj.get("bpm") or vj.get("heart_rate")
-        if v is None:
-            continue
-        buckets.setdefault(day, []).append(float(v))
+    # Single source of per-day semantics (0.9.0): services/series.py. The old
+    # handler-level bucketing is preserved verbatim there.
+    series = {dv.day: dv.value for dv in daily_series(db, user, key, start, end)}
 
     points = []
     for i in range(days):
-        d = (start + timedelta(days=i)).isoformat()
-        vals = buckets.get(d, [])
-        if not vals:
-            # Missing data is never zero — use null so the chart shows a gap
-            points.append({"date": d, "value": None})
-            continue
-        if metric == "steps":
-            # Steps: dedup the ACTUAL records for this day (not fake ones).
-            day_rows = [m for m in rows
-                        if m.metric_type == mt
-                        and m.start_at.astimezone(tz).date().isoformat() == d]
-            day_records = [
-                {"start_at": m.start_at,
-                 "end_at": getattr(m, "end_at", None) or m.start_at,
-                 "value_json": m.value_json or {}}
-                for m in day_rows
-            ]
-            v = _dedup_steps(day_records)
-        elif metric in ("weight_kg",):
-            v = vals[-1]  # last reading of the day
-        elif metric == "sleep_duration_min":
-            day_sleep_recs = []
-            for m in rows:
-                if m.metric_type != mt:
-                    continue
-                wd = wake_date(m.start_at, (m.value_json or {}).get("duration_min"),
-                               getattr(m, "end_at", None), tz)
-                if wd is not None and wd.isoformat() == d:
-                    day_sleep_recs.append({
-                        "start_at": m.start_at,
-                        "end_at": getattr(m, "end_at", None) or m.start_at,
-                        "value_json": m.value_json or {},
-                    })
-            v = _dedup_sleep(day_sleep_recs)  # TOTAL sleep time (all sessions), not longest
-        elif metric == "heart_rate_bpm":
-            v = sum(vals) / len(vals)
-        else:
-            v = sum(vals)
-        points.append({"date": d, "value": round(v, 1)})
+        d = start + timedelta(days=i)
+        v = series.get(d)
+        # Missing data is never zero — use null so the chart shows a gap
+        points.append({"date": d.isoformat(), "value": None if v is None else round(v, 1)})
 
     return {"metric_type": metric, "days": days, "points": points}
 
@@ -1328,7 +1149,7 @@ def trends_bucketed(
                 active[day] = active.get(day, 0.0) + v
                 active_avail = True
             elif m.metric_type == MetricType.STEPS:
-                steps_by_day[day] = steps_by_day.get(day, 0.0) + float((m.value_json or {}).get("count") or 0)
+                steps_by_day[day] = steps_by_day.get(day, 0.0) + float((m.value_json or {}).get("count") or (m.value_json or {}).get("value") or (m.value_json or {}).get("steps") or 0)
         # walking kcal: prefer tracker active energy, else steps*0.04
         buckets: list[list[float]] = [[] for _ in range(n)]
         for i in range(n):
@@ -1403,6 +1224,31 @@ def trends_bucketed(
     if metric not in metric_map:
         raise HTTPException(status_code=400, detail=f"Unsupported metric: {metric}")
     mt, agg = metric_map[metric]
+
+    if granularity == "day":
+        # Day granularity: each bucket is exactly one local day, so the
+        # per-bucket aggregation is identical to the per-day series. Use the
+        # single source (0.9.0) instead of re-implementing it here.
+        key = {"steps": "steps", "water_ml": "water_ml",
+               "sleep_duration_min": "sleep_duration_min",
+               "heart_rate_bpm": "heart_rate_bpm", "weight_kg": "weight_kg"}[metric]
+        series = {dv.day: dv.value
+                  for dv in daily_series(db, user, key, start, end - timedelta(days=1))}
+        points = []
+        for i in range(n):
+            d = day_at(i)
+            lab = bucket_of(datetime.combine(d, datetime.min.time(), tzinfo=tz) + timedelta(hours=h))[1]
+            v = series.get(d)
+            points.append({"date": d.isoformat(), "value": None if v is None else round(v, 1),
+                           "label": lab})
+        return {"granularity": granularity, "metric": metric, "period_label": period_label,
+                "period_key": period_key, "points": points}
+
+    # WEEK/MONTH granularity: steps and sleep are deduplicated ACROSS the whole
+    # bucket's records (_dedup_steps / _dedup_sleep), which cannot be reproduced
+    # by re-aggregating per-day values (a bucket's daily dedups do not sum to
+    # the bucket-level dedup). Keep the record-level path below for those
+    # granularities.
 
     # WATER is consumption -> keeps the eating-day window/bucket. Every other
     # metric here is a device MEASUREMENT -> LOCAL CALENDAR day (sleep is bucketed
@@ -1486,44 +1332,8 @@ def trends_bucketed(
             "period_key": period_key, "points": points}
 
 
-# --------------------------------------------------------------------------- #
-# Liquid category bucketing (single source of truth)
-# --------------------------------------------------------------------------- #
-# Stored `value_json.category` -> (canonical bucket, legacy bucket or None).
-# Each millilitre is counted ONCE in the canonical buckets; the legacy keys are
-# an additional view kept because the deployed web bundle's chart reads them.
-LIQUID_CANONICAL_CATS = [
-    "water", "coffee", "tea", "juice", "soda", "milk", "alcohol",
-    "smoothie", "broth", "other",
-]
-LIQUID_LEGACY_CATS = [
-    "water", "non_alcoholic", "beer", "wine", "spirits", "other_alcohol",
-]
-LIQUID_CATEGORY_MAP: dict[str, tuple[str, str | None]] = {
-    "water": ("water", None),
-    "juice": ("juice", "non_alcoholic"),
-    "soda": ("soda", "non_alcoholic"),
-    "coffee": ("coffee", "non_alcoholic"),
-    "tea": ("tea", "non_alcoholic"),
-    "milk": ("milk", "non_alcoholic"),
-    "smoothie": ("smoothie", "non_alcoholic"),
-    "broth": ("broth", "non_alcoholic"),
-    "non_alcoholic": ("other", "non_alcoholic"),
-    "beer": ("alcohol", "beer"),
-    "wine": ("alcohol", "wine"),
-    "spirits": ("alcohol", "spirits"),
-    "other_alcohol": ("alcohol", "other_alcohol"),
-    "alcohol": ("alcohol", "other_alcohol"),
-}
-
-
-def liquid_category_buckets(cat: str | None) -> tuple[str, str | None]:
-    """Map a stored liquid category to (canonical bucket, legacy bucket).
-
-    Unknown categories fall back to the non-alcoholic bucket rather than to
-    water, so an unrecognised drink is never silently counted as water.
-    """
-    return LIQUID_CATEGORY_MAP.get(cat or "water", ("other", "non_alcoholic"))
+# LIQUID_* category maps and liquid_category_buckets moved to
+# services/series.py (single source; imported above).
 
 
 @router.get("/trends/liquids")

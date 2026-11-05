@@ -52,7 +52,11 @@ function renderTarget(g: Goal): string {
   const t = g.target_json ?? {}
   const keys = Object.keys(t)
   if (keys.length === 0) return '—'
-  return keys.map((k) => `${k}: ${String((t as Record<string, unknown>)[k])}`).join(', ')
+  // "Target: target: 8000" duplication: goal target_json keys are often just
+  // "target" — drop them so the label from the line above carries the meaning.
+  return keys
+    .map((k) => String((t as Record<string, unknown>)[k]))
+    .join(', ')
 }
 
 export default function Goals() {

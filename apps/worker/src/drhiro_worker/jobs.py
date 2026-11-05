@@ -136,13 +136,85 @@ def _build_reminder_message(reminder: Reminder, user: User) -> str:
         "activity": "Activity",
         "bedtime": "Bedtime",
         "weekly": "Weekly Check-in",
+        "medication": "Medication",
     }
+    # Medication reminders (0.9.0, spec §5.5): "💊 {name} {dose} {unit} ({time}).
+    # Reply 'taken' or 'skip'." The occurrence id is included so the agent can
+    # resolve it.
+    if reminder.type == "medication":
+        from drhiro_api.models import MedicationItem
+
+        db = SessionLocal()
+        try:
+            item = (
+                db.query(MedicationItem)
+                .filter(MedicationItem.user_id == user.id, MedicationItem.status == "active")
+                .all()
+            )
+            item = next((i for i in item if str(reminder.id) in [str(x) for x in (i.reminder_ids_json or [])]), None)
+        finally:
+            db.close()
+        if item:
+            time = (reminder.schedule_json or {}).get("time", "")
+            dose = f" {item.dose_amount:g} {item.dose_unit}" if item.dose_amount else ""
+            return (
+                f"💊 <b>{item.name}{dose}</b> ({time}).\n\n"
+                f"Reply 'taken' or 'skip'."
+            )
     label = type_labels.get(reminder.type, reminder.type.replace("_", " ").title())
     return (
         f"🔔 <b>{label} Reminder</b>\n\n"
         f"Hi {user.display_name}, this is your scheduled reminder "
         f"to check in on your {label.lower()}."
     )
+
+
+def complete_reminders_by_dose(user_id: str, item_id: str, dose_id: str, taken_at: datetime) -> dict:
+    """Auto-complete a medication reminder occurrence when a dose event arrives
+    inside its completion window (spec §5.5). Reuses the
+    complete_reminders_by_measurement pattern; sets
+    ReminderOccurrence.completed_by_record_id = dose_event.id."""
+    from drhiro_api.models import MedicationItem
+
+    db = SessionLocal()
+    try:
+        item = (
+            db.query(MedicationItem)
+            .filter(MedicationItem.id == uuid.UUID(item_id), MedicationItem.user_id == uuid.UUID(user_id))
+            .first()
+        )
+        if not item:
+            return {"completed": 0}
+        reminder_ids = [uuid.UUID(str(x)) for x in (item.reminder_ids_json or [])]
+        if not reminder_ids:
+            return {"completed": 0}
+        completed = 0
+        for r in (
+            db.query(Reminder)
+            .filter(Reminder.id.in_(reminder_ids), Reminder.enabled.is_(True))
+            .all()
+        ):
+            window = (r.schedule_json or {}).get("completion_window_minutes", 240)
+            occ = (
+                db.query(ReminderOccurrence)
+                .filter(
+                    ReminderOccurrence.reminder_id == r.id,
+                    ReminderOccurrence.status.in_(["pending", "sent", "snoozed"]),
+                )
+                .order_by(ReminderOccurrence.due_at.desc())
+                .first()
+            )
+            if not occ:
+                continue
+            delta_min = abs((taken_at - occ.due_at).total_seconds()) / 60
+            if delta_min <= window:
+                occ.status = "completed"
+                occ.completed_by_record_id = dose_id
+                completed += 1
+        db.commit()
+        return {"completed": completed}
+    finally:
+        db.close()
 
 
 def complete_reminders_by_measurement(user_id: str, metric_type: str, measurement_id: str, measured_at: datetime) -> dict:

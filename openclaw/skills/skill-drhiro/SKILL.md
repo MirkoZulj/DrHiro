@@ -100,6 +100,18 @@ Tool list:
 | delete_medical_encounter | POST | /tools/delete_medical_encounter |
 | list_medical_records | POST | /tools/list_medical_records |
 | delete_medical_record | POST | /tools/delete_medical_record |
+| add_medication_item | POST | /tools/add_medication_item |
+| list_medication_items | POST | /tools/list_medication_items |
+| update_medication_item | POST | /tools/update_medication_item |
+| stop_medication_item | POST | /tools/stop_medication_item |
+| resume_medication_item | POST | /tools/resume_medication_item |
+| upload_medication_label | POST | /tools/upload_medication_label |
+| log_dose | POST | /tools/log_dose |
+| list_doses | POST | /tools/list_doses |
+| delete_dose | POST | /tools/delete_dose |
+| list_analyzable_metrics | POST | /tools/list_analyzable_metrics |
+| get_metric_summary | POST | /tools/get_metric_summary |
+| get_metric_changes | POST | /tools/get_metric_changes |
 
 The script is `chmod +x`. If `exec` is unavailable, fall back to the
 equivalent curl command with the two headers.
@@ -312,42 +324,22 @@ at 0 kcal with nothing behind it is a data error, not an acceptable outcome.
 
 ### Important: search_food vs parser output
 
-The deterministic parser in `text_meal_parser.py` has known weaknesses:
-- It matches by substring and may pick "Chicken fat" over "Chicken breast"
-- It has a CANONICAL dict for common foods but the fallback resolver overrides it
-- Short names like "cheese" may match "Cheese, blue" instead of the intended type
-
-When in doubt, search and let the nutrition data guide you — if the user said "low fat cheese" and the parser matched "Cheese, blue" (353 kcal/100g), search for "cheese low fat" to find a better match.
+The parser matches by substring and its fallback resolver can override its
+own canonical dict, so short names misfire ("cheese" → "Cheese, blue"). When
+in doubt, search more specifically ("cheese low fat") and let the data decide.
 
 ### Common Parser Mistakes to Watch For
 
-- "chicken" → should be `Chicken, breast, boneless, skinless, raw` (NOT
-  `Chicken fat`, `Chicken skin`, or `Chicken giblets`)
-- "sweet potato" → should be `Sweet potato, raw` (NOT `Potatoes, russet` or
-  `Sweet potato leaves`)
-- "grana padano" / "parmesan" → should match the cheese (NOT spirits or
-  alcoholic beverages — the old fuzzy matcher sometimes created phantom
-  liquid entries)
-- "aubergine" / "eggplant" → should match `Eggplant, raw` (not oil-based
-  preparations)
-- "rice" → should be `Rice, white, raw` or similar (not `Rice cake` or
-  `Rice milk`)
-
-### Verification Heuristic
-
-For each parsed item, ask: "Does `display_name` accurately describe the
-food the user mentioned?" If NO — correct it via `update_meal_item` before
-confirming.
+Matched names must describe the food the user said: "chicken" → `Chicken,
+breast, boneless, skinless, raw` (not fat/skin/giblets); "sweet potato" →
+`Sweet potato, raw`; "parmesan" → the cheese (not a spirit); "eggplant" →
+`Eggplant, raw`; "rice" → `Rice, white, raw` (not rice cake/milk).
 
 ### Date Handling
 
-`create_meal_from_text` resolves relative dates ("yesterday", "last night",
-"on Monday", "this morning", "2 days ago") in the user's timezone, SERVER-SIDE.
-NEVER do date arithmetic yourself and NEVER strip the user's date words out of
-the `text` argument: pass the user's own words through. "For dinner last night I
-had 4 beers" must be sent as text="dinner last night, 4 beers", not as
-text="4 beers". Dropping the date words records a meal eaten last night as
-happening this morning. The returned `eaten_at` is what was logged — check it
+`create_meal_from_text` resolves relative dates SERVER-SIDE in the user's
+timezone. Never do date arithmetic; never strip date words from `text`
+("dinner last night, 4 beers" — not "4 beers"). Check the returned `eaten_at`
 against the user's words and correct it if they disagree.
 
 ### Nutrition day boundary (which day a meal belongs to)
@@ -434,10 +426,9 @@ Never claim readings were imported unless the script output shows
 
 ## Mi Fitness export import (VPS inbox — large files)
 
-A Telegram bot cannot download a file larger than 20 MB and a real Mi Fitness
-manual export is ~23 MB, so the user drops the ZIP into the VPS inbox by hand
-and asks you to import it BY NAME. NEVER ask the user to send the ZIP as a
-Telegram attachment, and NEVER ask for the archive password in chat.
+A Telegram bot cannot download >20 MB and a Mi Fitness export is ~23 MB, so
+the user drops the ZIP into the VPS inbox and asks you to import it BY NAME.
+Never ask for the ZIP as a Telegram attachment or for the archive password.
 
 The flow (follow it in order):
 
@@ -458,52 +449,36 @@ The flow (follow it in order):
 Rules:
 
 - The archive password is read SERVER-SIDE from the sibling `.zip_pw` file
-  (mode 600) in the inbox. It is never a tool argument. Never request it,
-  never accept it, never mention its value, and never repeat it in a reply.
-  If a tool reports the password file is missing, tell the user to place it in
-  the inbox `.zip_pw` file — do NOT ask for it in chat.
-- `filename` is a BARE name: no folder, no `/`, no `..`. Paths are rejected.
-- The import is gap-filling and idempotent: it NEVER overwrites a day another
-  source (e.g. Health Connect) already owns, and re-importing the same archive
-  inserts 0 new rows (every row comes back as a duplicate). Say this when the
-  user worries about "overrunning existing data".
-- It runs as a background job because the gateway's MCP request timeout
-  (60 s) is shorter than the run.
+  (mode 600) in the inbox — never a tool argument, never quoted in chat. If
+  missing, tell the user to place it there.
+- `filename` is a BARE name (no folders/`..`); paths are rejected.
+- Gap-filling and idempotent: never overwrites a day another source owns;
+  re-importing inserts 0 new rows (all duplicates). Runs as a background job
+  (MCP timeout is 60 s).
 
 ## Device linking (Android bridge)
 
-When the user asks to pair/link their phone, connect a device, get a
-device code, or "set up the app", CALL the tool:
+When the user wants to pair a phone, CALL the tool:
 
 ```
 exec drhiro_api.sh <telegram_id> POST /tools/issue_device_code '{}'
 ```
 
-The response contains the one-time device code. Reply with the code and
-tell the user: open the drHiro Bridge app, enter this code once, and
-grant Health Connect permissions. The code expires in 10 minutes.
-
-You DO have this capability. Do not say "I don't have access to a
-device pairing system" — the tool exists and is available.
+Reply with the one-time code (expires in 10 minutes): open the drHiro Bridge
+app, enter it once, grant Health Connect permissions. Never say you lack
+device-pairing access — the tool exists.
 
 ## Dashboard access (magic login link)
 
-When the user asks for access to the web dashboard / web app / their data
-online ("open my dashboard", "give me a login link", "let me see my data
-on the web", "how do I get into the app"), CALL the tool:
+When the user wants the web dashboard ("open my dashboard", "give me a login
+link"), CALL the tool:
 
 ```
 exec drhiro_api.sh <telegram_id> POST /tools/issue_web_login_link '{}'
 ```
 
-The response contains `data.url` — a one-click login link. Send that URL to
-the user unchanged. Tapping it opens the dashboard already signed in; the
-user does NOT need to enter a code or name. The link expires in 30 minutes;
-if the user says it expired or failed, just call the tool again.
-
-You DO have this capability. Do not say "I can't create links" or send a
-generic website URL instead — the tool mints a personal, pre-authenticated
-link and exists and is available.
+Send `data.url` unchanged — a personal pre-authenticated link (30 min expiry);
+if it expired, just re-issue. Never say you can't create links.
 
 ## Agent Instruction Outline
 
@@ -620,6 +595,29 @@ search across title AND content (a lab name, a medicine, a doctor). Use the
 returned `id` with `delete_medical_record` if the user asks to remove one
 (confirm first). Never ask the user for a record id — `list_medical_records`
 gives you the ids.
+
+## Medications & supplements (0.9.0)
+
+Store what the user takes with `add_medication_item` (kind
+`supplement`/`medication`, dose, schedule, dates, source; a medical record id
+or a label photo via `upload_medication_label` can be attached). List with
+`list_medication_items`; edit with `update_medication_item`; pause/resume with
+`stop_medication_item` / `resume_medication_item`. Confirm each save with the
+stored `id` and the schedule you recorded. Reminders are created server-side
+per time slot — never promise a reminder without the tool response confirming
+it. You may log doses the user reports with `log_dose`
+(status `taken`/`skipped`, from HIS words, in his timezone); list with
+`list_doses`, remove a wrong one with `delete_dose`. NEVER recommend starting,
+stopping, or changing a medication or dose — logging and reporting only
+(see Guardrails).
+
+## Analytics — use the tools, never improvise statistics
+
+`list_analyzable_metrics` first; then `get_metric_summary` (latest value,
+period averages, min/max/trend) and `get_metric_changes` (significant changes
+over a period) for a metric. Quote the tool's numbers verbatim; never compute
+trends or averages yourself from raw logs, and never present an analytics
+result as medical advice.
 
 ## Escalation Template (urgent)
 

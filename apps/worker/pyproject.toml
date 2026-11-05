@@ -9,6 +9,17 @@ dependencies = [
     "sqlalchemy>=2.0.30,<3",
     "psycopg[binary]>=3.2,<4",
     "drhiro-api>=0.1.0,<1",
+    "drhiro-analytics>=0.1.0,<1",
+    # analytics engine runtime (pinned per spec §8) — also duplicated here so
+    # the worker image resolves them even if drhiro-analytics metadata drifts
+    "numpy>=1.26,<3",
+    "pandas>=2.0,<3",
+    "scipy>=1.11,<2",
+    "ruptures>=1.1.9,<2",
+    # Wave 3: PDF reports + zip exports (spec §8). A5 bans new NPM deps only.
+    "weasyprint>=62,<64",
+    "jinja2>=3.1,<4",
+    "pyzipper>=0.3.6,<1",
 ]
 
 [tool.setuptools.packages.find]
