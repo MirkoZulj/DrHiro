@@ -590,7 +590,11 @@ Flow (follow in order):
    with `merge_record_ids` (or any resend), the scan count may exceed the
    number of unique photos (merges concatenate paths, each resend uploads
    fresh filenames for the same bytes). Call `dedupe_record_scans`
-   (record_id) whenever scan count > unique-photo count, then re-verify with
+   (record_id) mode='bytes' for byte-identical copies; if the count is still
+   above the unique-photo count, the extra scans are Telegram-recompressed
+   resends of the same pages (bytes differ) — call `dedupe_record_scans`
+   (record_id) mode='perceptual' (try dry_run=true first; keep-first per
+   aHash cluster, Hamming <=4). Then re-verify with
    `get_medical_encounter`: scan count MUST equal the unique-photo count
    before you confirm — transcription untouched.
 7. **Only then confirm back** to the user with the verified ids.
