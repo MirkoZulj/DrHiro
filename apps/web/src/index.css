@@ -2071,6 +2071,51 @@ button.link:hover { background: none; text-decoration: underline; }
 .records-lightbox-loading, .records-lightbox-error { color: #cfd8dc; font-size: 14px; }
 .records-lightbox-error { color: #f1948a; }
 
+/* --- Scan gallery (thumbnail strip per record) -------------------------- */
+.records-scan-gallery {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.records-scan-thumb {
+  width: 72px;
+  height: 72px;
+  padding: 0;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-2, #f0f4f5);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.records-scan-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.records-scan-thumb:hover { border-color: var(--color-accent); }
+.records-scan-thumb-ph {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-muted);
+}
+.records-lightbox-count { color: #cfd8dc; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.records-lightbox-nav {
+  flex: 0 0 auto;
+  background: rgba(255,255,255,0.08);
+  color: #fff;
+  font-size: 30px;
+  line-height: 1;
+  min-width: 48px;
+  min-height: 48px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.25);
+  cursor: pointer;
+  margin: 0 var(--space-2);
+}
+.records-lightbox-nav:disabled { opacity: 0.35; cursor: default; }
+
 /* Responsive: near-fullscreen popup <600px */
 @media (max-width: 600px) {
   .records-popup {
