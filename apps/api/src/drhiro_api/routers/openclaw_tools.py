@@ -1410,6 +1410,15 @@ def tool_update_medical_record(req: UpdateMedicalRecordTool, user: User = Depend
         rec.recorded_at = _surgery_recorded_at(effective_enc, user)
         if "recorded_at" not in changed:
             changed.append("recorded_at(surgery-day)")
+    # Card 8 title propagation (Kim qa-title-bug.md): Records.tsx renders the
+    # ENCOUNTER title as the card headline. When this record is the encounter's
+    # only record, keep the encounter headline in sync with the record title
+    # (e.g. stale 'Krvna kartica - zapis 2000' → 'Eye exam' on enrichment).
+    if req.title is not None and effective_enc is not None:
+        count = db.query(MedicalRecord).filter(MedicalRecord.encounter_id == effective_enc.id).count()
+        if count == 1 and effective_enc.title != rec.title:
+            effective_enc.title = rec.title
+            changed.append("encounter_title")
     merge_info = {"merged_record_ids": [], "merged_scan_count": 0, "total_scan_count": len(rec.source_image_paths_json or [])}
     # Run the completion pass when enriching content (transcription) or when
     # the caller explicitly names same-burst placeholders to fold in.

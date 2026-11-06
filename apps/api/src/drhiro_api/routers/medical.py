@@ -241,6 +241,14 @@ def patch_medical_record(record_id: str, req: MedicalRecordPatch, user: User = D
     if req.content is not None:
         if not req.content.strip(): raise HTTPException(status_code=400, detail="content must not be empty")
         rec.content = req.content
+    # Card 8 propagation: Records.tsx renders the ENCOUNTER title as the card
+    # headline. Keep it in sync when this record is the encounter's only record.
+    if req.title is not None and rec.encounter_id is not None:
+        enc = db.query(MedicalEncounter).filter(MedicalEncounter.id == rec.encounter_id, MedicalEncounter.user_id == user.id).first()
+        if enc is not None:
+            count = db.query(MedicalRecord).filter(MedicalRecord.encounter_id == enc.id).count()
+            if count == 1 and enc.title != rec.title:
+                enc.title = rec.title
     db.add(rec); db.commit(); db.refresh(rec)
     return _record_out(rec)
 

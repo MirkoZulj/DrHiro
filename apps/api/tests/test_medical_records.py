@@ -170,3 +170,43 @@ def test_delete_bad_id(client, service_headers):
 def test_requires_service_auth(client):
     r = client.post("/api/v1/tools/list_medical_records", json={})
     assert r.status_code == 401
+
+
+# ----------------------------------------------------------------
+# Card 8 regression (Kim qa-title-bug.md): stale encounter title
+# must not shadow the corrected record title in the single-record case.
+# SYNTHETIC content only.
+# ----------------------------------------------------------------
+
+def test_update_single_record_propagates_title_to_encounter(client, service_headers):
+    """Stage with stale title A, enrich to B -> encounter headline == B."""
+    # stage encounter with stale title
+    r = client.post(
+        "/api/v1/tools/add_medical_encounter",
+        json={"title": "Krvna kartica - zapis 2000", "encounter_date": "2026-05-11"},
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    eid = r.json()["data"]["id"]
+    # stage single record under it with same stale title (ingest_batch pattern)
+    r = client.post(
+        "/api/v1/tools/add_medical_record",
+        json={"title": "Krvna kartica - zapis 2000", "content": "SYNTHETIC PLACEHOLDER", "encounter_id": eid},
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    rid = r.json()["data"]["id"]
+    # enrich record to real title (tool path)
+    r = client.post(
+        "/api/v1/tools/update_medical_record",
+        json={"record_id": rid, "title": "Eye exam", "content": "SYNTHETIC EYE EXAM\nVisual acuity: 1.0"},
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["title"] == "Eye exam"
+    # encounter headline (what Records.tsx renders) must follow
+    r = client.post("/api/v1/tools/get_medical_encounter", json={"encounter_id": eid}, headers=service_headers)
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["encounter"]["title"] == "Eye exam", data["encounter"]
+    assert data["records"][0]["title"] == "Eye exam"
