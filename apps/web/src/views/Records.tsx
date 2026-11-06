@@ -132,13 +132,18 @@ export default function Records() {
       {encounters.length === 0 ? (
         <div className="empty">No medical records yet. Send a document photo to drHiro on Telegram.</div>
       ) : (
-        <EncounterTimeline encounters={encounters} />
+        <EncounterTimeline
+          encounters={encounters}
+          onUpdate={(updated) =>
+            setEncounters((prev) => prev.map((e) => (e.id === updated.id ? { ...e, ...updated } : e)))
+          }
+        />
       )}
     </div>
   )
 }
 
-function EncounterTimeline({ encounters }: { encounters: EncounterSummary[] }) {
+function EncounterTimeline({ encounters, onUpdate }: { encounters: EncounterSummary[]; onUpdate: (e: EncounterSummary) => void }) {
   // Contract returns the full list; sort newest first and group by year.
   const sorted = [...encounters].sort((a, b) =>
     (b.encounter_date || '').localeCompare(a.encounter_date || '')
@@ -160,7 +165,7 @@ function EncounterTimeline({ encounters }: { encounters: EncounterSummary[] }) {
           <div className="records-year-label">{g.year}</div>
           <div className="records-year-items">
             {g.items.map((enc) => (
-              <EncounterCard key={enc.id} encounter={enc} />
+              <EncounterCard key={enc.id} encounter={enc} onUpdate={onUpdate} />
             ))}
           </div>
         </section>
@@ -169,9 +174,11 @@ function EncounterTimeline({ encounters }: { encounters: EncounterSummary[] }) {
   )
 }
 
-function EncounterCard({ encounter }: { encounter: EncounterSummary }) {
+function EncounterCard({ encounter, onUpdate }: { encounter: EncounterSummary; onUpdate: (e: EncounterSummary) => void }) {
   const [open, setOpen] = useState(false)
-  const d = dayParts(encounter.encounter_date)
+  const [current, setCurrent] = useState(encounter)
+  useEffect(() => { setCurrent(encounter) }, [encounter])
+  const d = dayParts(current.encounter_date)
   // Scan presence: the summary contract doesn't include it, so start from an
   // optional `scan_count` the backend may add, and mark filled once the popup
   // reveals a record with source_image_path (persists for the session).
@@ -181,8 +188,8 @@ function EncounterCard({ encounter }: { encounter: EncounterSummary }) {
   const scanCount = Number((encounter as any).scan_count ?? 0)
 
   const subParts = [
-    encounter.facility,
-    `${encounter.record_count} document${encounter.record_count === 1 ? '' : 's'}`,
+    current.facility,
+    `${current.record_count} document${current.record_count === 1 ? '' : 's'}`,
   ]
   if (hasScans) subParts.push(`${scanCount || ''} ${scanCount === 1 ? 'scan' : 'scans'}`.trim())
 
@@ -194,27 +201,78 @@ function EncounterCard({ encounter }: { encounter: EncounterSummary }) {
           <div className="records-card-monyr">{d.mon} {d.year}</div>
         </div>
         <div className="records-card-main">
-          <div className="records-card-title">{encounter.title}</div>
+          <div className="records-card-title">{current.title}</div>
           <div className="records-card-sub">{subParts.filter(Boolean).join(' · ')}</div>
-          <div className="records-card-notes">{firstSentence(encounter.notes)}</div>
+          <div className="records-card-notes">{firstSentence(current.notes)}</div>
         </div>
         <span className="records-card-chevron" aria-hidden="true">›</span>
       </button>
-      {open && <EncounterPopup encounter={encounter} onClose={() => setOpen(false)} onScansSeen={() => setHasScans(true)} />}
+      {open && (
+        <EncounterPopup
+          encounter={current}
+          onClose={() => setOpen(false)}
+          onScansSeen={() => setHasScans(true)}
+          onUpdated={(updated) => { setCurrent(updated); onUpdate(updated) }}
+        />
+      )}
     </>
   )
 }
 
-function EncounterPopup({ encounter, onClose, onScansSeen }: { encounter: EncounterSummary; onClose: () => void; onScansSeen: () => void }) {
+function EncounterPopup({ encounter, onClose, onScansSeen, onUpdated }: { encounter: EncounterSummary; onClose: () => void; onScansSeen: () => void; onUpdated: (e: EncounterSummary) => void }) {
   const [detail, setDetail] = useState<EncounterDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const [editing, setEditing] = useState(false)
+  const [draftTitle, setDraftTitle] = useState(encounter.title ?? '')
+  const [draftNotes, setDraftNotes] = useState(encounter.notes ?? '')
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [headlineTitle, setHeadlineTitle] = useState(encounter.title)
+
+  async function saveEncounter() {
+    setSaving(true)
+    setSaveError(null)
+    try {
+      const res = await authClient.api(`/medical/encounters/${encounter.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title: draftTitle.trim() || encounter.title, notes: draftNotes || null }),
+      })
+      const updated: EncounterSummary = {
+        ...encounter,
+        title: res?.title ?? draftTitle,
+        notes: res?.notes ?? draftNotes,
+      }
+      setHeadlineTitle(updated.title)
+      setDetail((prev) => (prev ? { ...prev, title: updated.title, notes: updated.notes } : prev))
+      onUpdated(updated)
+      setEditing(false)
+    } catch (e: any) {
+      // Surface the failure and KEEP the draft text — never silently lose it.
+      setSaveError(e?.message ?? String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function startEditing() {
+    setDraftTitle(detail?.title ?? encounter.title ?? '')
+    setDraftNotes(detail?.notes ?? encounter.notes ?? '')
+    setSaveError(null)
+    setEditing(true)
+  }
 
   useEffect(() => {
     let cancelled = false
     authClient
       .api(`/medical/encounters/${encounter.id}`)
-      .then((res) => { if (!cancelled) setDetail(res) })
+      .then((res) => {
+        if (cancelled) return
+        // API returns { encounter, records } — normalise (old code used res
+        // directly, so encounter notes never rendered).
+        const enc = res?.encounter ?? res ?? {}
+        setDetail({ ...enc, records: res?.records ?? enc.records ?? [] })
+      })
       .catch((e) => { if (!cancelled) setError(e?.message ?? String(e)) })
     return () => { cancelled = true }
   }, [encounter.id])
@@ -238,7 +296,7 @@ function EncounterPopup({ encounter, onClose, onScansSeen }: { encounter: Encoun
         className="modal-popup records-popup"
         role="dialog"
         aria-modal="true"
-        aria-label={encounter.title}
+        aria-label={headlineTitle}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="records-popup-header">
@@ -247,15 +305,41 @@ function EncounterPopup({ encounter, onClose, onScansSeen }: { encounter: Encoun
             <div className="records-card-monyr">{d.mon} {d.year}</div>
           </div>
           <div className="records-popup-headline">
-            <div className="records-card-title">{encounter.title}</div>
-            <div className="records-card-sub">
-              {[encounter.facility, `${encounter.record_count} document${encounter.record_count === 1 ? '' : 's'}`]
-                .filter(Boolean)
-                .join(' · ')}
-            </div>
+            {editing ? (
+              <div className="records-edit-form">
+                <label>
+                  Title
+                  <input value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} aria-label="Encounter title" />
+                </label>
+                <label>
+                  Notes (text)
+                  <textarea value={draftNotes} onChange={(e) => setDraftNotes(e.target.value)} rows={3} aria-label="Encounter notes" />
+                </label>
+              </div>
+            ) : (
+              <>
+                <div className="records-card-title">{headlineTitle}</div>
+                <div className="records-card-sub">
+                  {[encounter.facility, `${encounter.record_count} document${encounter.record_count === 1 ? '' : 's'}`]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </div>
+              </>
+            )}
           </div>
           <button type="button" className="modal-close" onClick={onClose} aria-label="Close">✕</button>
         </div>
+        {editing ? (
+          <div className="records-edit-actions">
+            <button type="button" onClick={saveEncounter} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
+            <button type="button" className="secondary" onClick={() => { setEditing(false); setSaveError(null) }}>Cancel</button>
+            {saveError && <span className="error records-edit-error" role="alert">Save failed: {saveError}</span>}
+          </div>
+        ) : (
+          <div className="records-edit-actions">
+            <button type="button" className="secondary" onClick={startEditing}>Edit title / text</button>
+          </div>
+        )}
 
         <div className="records-popup-scroll" ref={scrollRef}>
           {error && <div className="error">{error}</div>}
@@ -268,7 +352,12 @@ function EncounterPopup({ encounter, onClose, onScansSeen }: { encounter: Encoun
               )}
               {(detail.records ?? []).map((rec, i) => (
                 <RecordSection key={rec.id} record={rec} index={i + 1} total={detail.records.length}
-                  onScanFound={scanPathsOf(rec).length ? onScansSeen : undefined} />
+                  onScanFound={scanPathsOf(rec).length ? onScansSeen : undefined}
+                  onUpdated={(updated) =>
+                    setDetail((prev) =>
+                      prev ? { ...prev, records: prev.records.map((r) => (r.id === updated.id ? updated : r)) } : prev,
+                    )
+                  } />
               ))}
             </>
           )}
@@ -299,20 +388,74 @@ async function fetchScanBlobUrl(recordId: string, index: number): Promise<string
   return URL.createObjectURL(blob)
 }
 
-function RecordSection({ record, index, total, onScanFound }: { record: RecordItem; index: number; total: number; onScanFound?: () => void }) {
+function RecordSection({ record, index, total, onScanFound, onUpdated }: { record: RecordItem; index: number; total: number; onScanFound?: () => void; onUpdated: (r: RecordItem) => void }) {
   const [scanIndex, setScanIndex] = useState<number | null>(null)
-  const paths = scanPathsOf(record)
+  const [current, setCurrent] = useState(record)
+  useEffect(() => { setCurrent(record) }, [record])
+  const [editing, setEditing] = useState(false)
+  const [draftTitle, setDraftTitle] = useState(record.title ?? '')
+  const [draftContent, setDraftContent] = useState(record.content ?? '')
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const paths = scanPathsOf(current)
   const hasScans = paths.length > 0
   useEffect(() => { if (onScanFound && hasScans) onScanFound() }, [onScanFound, hasScans])
-  const { paragraphs, conclusion } = splitContent(record.content ?? '')
+  const { paragraphs, conclusion } = splitContent(current.content ?? '')
+
+  async function saveRecord() {
+    setSaving(true)
+    setSaveError(null)
+    try {
+      const res = await authClient.api(`/medical/records/${current.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title: draftTitle.trim() || current.title, content: draftContent }),
+      })
+      const updated: RecordItem = {
+        ...current,
+        title: res?.title ?? draftTitle,
+        content: res?.content ?? draftContent,
+      }
+      setCurrent(updated)
+      onUpdated(updated)
+      setEditing(false)
+    } catch (e: any) {
+      // Surface the failure and KEEP the draft text — never silently lose it.
+      setSaveError(e?.message ?? String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
 
   return (
     <div className="records-doc">
       <div className="records-doc-header">
         <span className="records-doc-index">{String(index).padStart(2, '0')}</span>
-        <span className="records-doc-title">{record.title}</span>
-        <span className="badge records-doc-badge">{sourceLabel(record.source_type)}</span>
+        <span className="records-doc-title">{current.title}</span>
+        <span className="badge records-doc-badge">{sourceLabel(current.source_type)}</span>
+        {!editing && (
+          <button type="button" className="secondary records-edit-btn"
+            onClick={() => { setDraftTitle(current.title ?? ''); setDraftContent(current.content ?? ''); setSaveError(null); setEditing(true) }}>
+            Edit
+          </button>
+        )}
       </div>
+      {editing ? (
+        <div className="records-edit-form records-doc-body">
+          <label>
+            Title
+            <input value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} aria-label="Record title" />
+          </label>
+          <label>
+            Text
+            <textarea value={draftContent} onChange={(e) => setDraftContent(e.target.value)} rows={8} aria-label="Record text" />
+          </label>
+          <div className="records-edit-actions">
+            <button type="button" onClick={saveRecord} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
+            <button type="button" className="secondary" onClick={() => { setEditing(false); setSaveError(null) }}>Cancel</button>
+            {saveError && <span className="error records-edit-error" role="alert">Save failed: {saveError}</span>}
+          </div>
+        </div>
+      ) : (
       <div className="records-doc-body">
         {paragraphs.map((p, i) => (
           <p key={i}>{p}</p>
@@ -324,14 +467,15 @@ function RecordSection({ record, index, total, onScanFound }: { record: RecordIt
           </div>
         )}
       </div>
+      )}
       {hasScans && (
-        <div className="records-scan-gallery" aria-label={`Scans of ${record.title}`}>
+        <div className="records-scan-gallery" aria-label={`Scans of ${current.title}`}>
           {paths.map((p, i) => (
             <ScanThumb
               key={`${p}-${i}`}
-              recordId={record.id}
+              recordId={current.id}
               index={i}
-              label={`Scan ${i + 1} of ${paths.length} — ${record.title}`}
+              label={`Scan ${i + 1} of ${paths.length} — ${current.title}`}
               onOpen={() => setScanIndex(i)}
             />
           ))}
@@ -339,8 +483,8 @@ function RecordSection({ record, index, total, onScanFound }: { record: RecordIt
       )}
       {scanIndex !== null && (
         <ScanLightbox
-          recordId={record.id}
-          title={record.title}
+          recordId={current.id}
+          title={current.title}
           total={paths.length}
           initialIndex={scanIndex}
           onClose={() => setScanIndex(null)}
