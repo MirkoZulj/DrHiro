@@ -188,8 +188,19 @@ async def upload_scan(
 
 
 @router.get("/medical/scan/{record_id}")
-def serve_scan(record_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Stream the scan image of one of the caller's records. Owner-only."""
+def serve_scan(
+    record_id: str,
+    index: int | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Stream one scan image of a caller's record. Owner-only.
+
+    ``?index=N`` selects the Nth path in ``source_image_paths_json``
+    (0-based). Without an index (or when the list is absent) the legacy
+    ``source_image_path`` (index 0) is served, preserving prior behavior.
+    Out-of-range indexes are rejected with 404.
+    """
     try:
         rid = uuid_mod.UUID(record_id)
     except ValueError:
@@ -197,7 +208,14 @@ def serve_scan(record_id: str, user: User = Depends(get_current_user), db: Sessi
     rec = db.query(MedicalRecord).filter(MedicalRecord.id == rid, MedicalRecord.user_id == user.id).first()
     if not rec or not rec.source_image_path:
         raise HTTPException(status_code=404, detail="Record not found")
-    abs_path = resolve_scan_file(user, rec.source_image_path)
+    paths = rec.source_image_paths_json or [rec.source_image_path]
+    if index is None:
+        rel_path = rec.source_image_path
+    else:
+        if index < 0 or index >= len(paths):
+            raise HTTPException(status_code=404, detail="Scan index out of range")
+        rel_path = paths[index]
+    abs_path = resolve_scan_file(user, rel_path)
     if not abs_path:
         raise HTTPException(status_code=404, detail="Scan image missing")
     return FileResponse(abs_path)

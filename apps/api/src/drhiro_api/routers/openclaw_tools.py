@@ -1424,19 +1424,48 @@ def tool_update_medical_record(req: UpdateMedicalRecordTool, user: User = Depend
 
 class DedupeRecordScansTool(BaseModel):
     record_id: str
+    mode: str = "bytes"
+    hamming_threshold: int = 4
+    dry_run: bool = False
+
+
+def _ahash_64(abs_path) -> int | None:
+    """64-bit average hash of an image file. None if unreadable (caller keeps it)."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        with Image.open(abs_path) as im:
+            gray = im.convert("L").resize((8, 8))
+            pixels = [int(v) for v in gray.getdata()]
+        avg = sum(pixels) / len(pixels)
+        h = 0
+        for i, p in enumerate(pixels):
+            if p > avg:
+                h |= 1 << i
+        return h
+    except Exception:
+        return None
+
+
+def _hamming(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
 
 
 @router.post("/dedupe_record_scans", response_model=ToolResponse)
 def tool_dedupe_record_scans(req: DedupeRecordScansTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
     """Content-dedupe a medical record's bound scans (owner-scoped).
 
-    Hashes every bound scan file (sha256 of bytes), groups identical
-    content, keeps the FIRST path per hash (earliest-uploaded copy),
-    deletes duplicate files from disk, and rewrites
-    source_image_paths_json to the kept set. Idempotent: a re-run on an
-    already-deduped record removes nothing. Missing/unreadable files are
-    reported in ``missing`` and left out of the kept set only if no file
-    exists — never delete a path whose content hash is unique.
+    mode='bytes' (default, legacy): sha256 of bytes, keep first per hash.
+    mode='perceptual': 64-bit aHash per scan, greedy keep-first clustering
+    with Hamming distance <= hamming_threshold (default 4, range 0-16)
+    against cluster representatives. Keeps the earliest-uploaded path per
+    cluster; deletes only files clustered with a kept image. Files whose
+    aHash cannot be computed are NEVER deleted (kept, reported in
+    ``unhashed``). Missing files are reported in ``missing``. Idempotent.
+    dry_run=True computes clusters without deleting files or rewriting
+    source_image_paths_json.
     """
     from drhiro_api.routers.medical import resolve_scan_file
     rec = (
@@ -1446,8 +1475,71 @@ def tool_dedupe_record_scans(req: DedupeRecordScansTool, user: User = Depends(_r
     )
     if not rec:
         raise HTTPException(status_code=404, detail="Medical record not found")
+    mode = (req.mode or "bytes").lower()
+    if mode not in ("bytes", "perceptual"):
+        raise HTTPException(status_code=400, detail="mode must be 'bytes' or 'perceptual'")
+    threshold = int(req.hamming_threshold)
+    if not (0 <= threshold <= 16):
+        raise HTTPException(status_code=400, detail="hamming_threshold must be 0..16")
     paths = list(rec.source_image_paths_json or ([rec.source_image_path] if rec.source_image_path else []))
     before = len(paths)
+    if mode == "perceptual":
+        kept: list[str] = []
+        removed_paths: list[str] = []
+        missing: list[str] = []
+        unhashed: list[str] = []
+        # clusters: list of {kept, kept_hash, removed:[(path,dist)], max_dist}
+        clusters: list[dict] = []
+        for rel in paths:
+            if not rel:
+                continue
+            abs_path = resolve_scan_file(user, rel)
+            if abs_path is None:
+                missing.append(rel)
+                continue
+            ah = _ahash_64(abs_path)
+            if ah is None:
+                # Never delete a file we cannot hash.
+                unhashed.append(rel)
+                clusters.append({"kept": rel, "kept_hash": None, "removed": [], "max_distance": 0})
+                kept.append(rel)
+                continue
+            matched = None
+            matched_dist = None
+            for c in clusters:
+                if c["kept_hash"] is None:
+                    continue
+                d = _hamming(ah, c["kept_hash"])
+                if d <= threshold:
+                    matched = c
+                    matched_dist = d
+                    break
+            if matched is not None:
+                matched["removed"].append(rel)
+                matched["max_distance"] = max(matched["max_distance"], int(matched_dist or 0))
+                removed_paths.append(rel)
+                if not req.dry_run:
+                    try:
+                        os.unlink(abs_path)
+                    except FileNotFoundError:
+                        pass
+                continue
+            clusters.append({"kept": rel, "kept_hash": ah, "removed": [], "max_distance": 0})
+            kept.append(rel)
+        cluster_summary = [
+            {"kept": c["kept"], "kept_hash": (f"{c['kept_hash']:016x}" if c["kept_hash"] is not None else None), "removed": c["removed"], "max_distance": c["max_distance"]}
+            for c in clusters
+        ]
+        removed = len(removed_paths)
+        if not req.dry_run and kept != paths:
+            rec.source_image_paths_json = kept
+            rec.source_image_path = kept[0] if kept else rec.source_image_path
+        _tool_audit(db, user, "tools.dedupe_record_scans", "medical_record", str(rec.id),
+                    metadata={"before": before, "after": len(kept), "mode": mode, "clusters": len(clusters), "removed": removed, "missing": missing, "unhashed": unhashed, "dry_run": bool(req.dry_run)})
+        db.commit()
+        return ToolResponse(ok=True, message=f"Perceptual dedupe record scans: {before} -> {len(kept)} ({len(clusters)} clusters, removed {removed}).",
+                            data={"record_id": str(rec.id), "mode": mode, "before": before, "after": len(kept), "clusters": len(clusters), "cluster_summary": cluster_summary, "removed_files": removed, "removed_paths": removed_paths, "kept_paths": kept, "missing": missing, "unhashed": unhashed, "dry_run": bool(req.dry_run), "hamming_threshold": threshold})
+
     kept: list[str] = []
     seen_hashes: set[str] = set()
     groups = 0

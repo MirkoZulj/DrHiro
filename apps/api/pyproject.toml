@@ -15,6 +15,7 @@ dependencies = [
     "python-multipart>=0.0.9,<1",
     "rq>=1.16,<2",
     "redis>=5.0,<6",
+    "pillow>=10,<12",
     "drhiro-health-schema>=0.1.0,<1",
     "drhiro-rule-engine>=0.1.0,<1",
     "drhiro-nutrition-core>=0.1.0,<1",

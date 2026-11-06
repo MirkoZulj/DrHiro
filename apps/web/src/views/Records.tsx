@@ -26,6 +26,7 @@ interface RecordItem {
   source_type: string | null
   recorded_at: string | null
   source_image_path: string | null
+  source_image_paths?: string[] | null
 }
 
 interface EncounterDetail extends EncounterSummary {
@@ -267,7 +268,7 @@ function EncounterPopup({ encounter, onClose, onScansSeen }: { encounter: Encoun
               )}
               {(detail.records ?? []).map((rec, i) => (
                 <RecordSection key={rec.id} record={rec} index={i + 1} total={detail.records.length}
-                  onScanFound={rec.source_image_path ? onScansSeen : undefined} />
+                  onScanFound={scanPathsOf(rec).length ? onScansSeen : undefined} />
               ))}
             </>
           )}
@@ -277,9 +278,32 @@ function EncounterPopup({ encounter, onClose, onScansSeen }: { encounter: Encoun
   )
 }
 
+/** All scan paths for a record: every entry of source_image_paths, falling
+ *  back to the singular source_image_path for old records. */
+function scanPathsOf(record: RecordItem): string[] {
+  if (Array.isArray(record.source_image_paths) && record.source_image_paths.length > 0) {
+    return record.source_image_paths.filter(Boolean)
+  }
+  return record.source_image_path ? [record.source_image_path] : []
+}
+
+/** Authenticated fetch of one scan image (by index into the record's
+ *  source_image_paths) -> blob URL. */
+async function fetchScanBlobUrl(recordId: string, index: number): Promise<string> {
+  const token = authClient.token()
+  const res = await fetch(`${API_BASE}/medical/scan/${recordId}?index=${index}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (!res.ok) throw new Error(`Scan load failed (${res.status})`)
+  const blob = await res.blob()
+  return URL.createObjectURL(blob)
+}
+
 function RecordSection({ record, index, total, onScanFound }: { record: RecordItem; index: number; total: number; onScanFound?: () => void }) {
-  const [scanOpen, setScanOpen] = useState(false)
-  useEffect(() => { if (onScanFound) onScanFound() }, [onScanFound])
+  const [scanIndex, setScanIndex] = useState<number | null>(null)
+  const paths = scanPathsOf(record)
+  const hasScans = paths.length > 0
+  useEffect(() => { if (onScanFound && hasScans) onScanFound() }, [onScanFound, hasScans])
   const { paragraphs, conclusion } = splitContent(record.content ?? '')
 
   return (
@@ -288,16 +312,6 @@ function RecordSection({ record, index, total, onScanFound }: { record: RecordIt
         <span className="records-doc-index">{String(index).padStart(2, '0')}</span>
         <span className="records-doc-title">{record.title}</span>
         <span className="badge records-doc-badge">{sourceLabel(record.source_type)}</span>
-        {record.source_image_path && (
-          <button
-            type="button"
-            className="records-scan-pill"
-            onClick={() => setScanOpen(true)}
-            aria-label={`Open scan of ${record.title}`}
-          >
-            🖼 Scan
-          </button>
-        )}
       </div>
       <div className="records-doc-body">
         {paragraphs.map((p, i) => (
@@ -310,51 +324,118 @@ function RecordSection({ record, index, total, onScanFound }: { record: RecordIt
           </div>
         )}
       </div>
-      {scanOpen && <ScanLightbox recordId={record.id} title={record.title} onClose={() => setScanOpen(false)} />}
+      {hasScans && (
+        <div className="records-scan-gallery" aria-label={`Scans of ${record.title}`}>
+          {paths.map((p, i) => (
+            <ScanThumb
+              key={`${p}-${i}`}
+              recordId={record.id}
+              index={i}
+              label={`Scan ${i + 1} of ${paths.length} — ${record.title}`}
+              onOpen={() => setScanIndex(i)}
+            />
+          ))}
+        </div>
+      )}
+      {scanIndex !== null && (
+        <ScanLightbox
+          recordId={record.id}
+          title={record.title}
+          total={paths.length}
+          initialIndex={scanIndex}
+          onClose={() => setScanIndex(null)}
+        />
+      )}
       {index < total && <div className="records-doc-divider" role="presentation" />}
     </div>
   )
 }
 
-/** Full-screen dark lightbox. Authenticated image fetch -> blob URL. */
-function ScanLightbox({ recordId, title, onClose }: { recordId: string; title: string; onClose: () => void }) {
+/** One thumbnail in the scan gallery; fetches its image lazily on visibility. */
+function ScanThumb({ recordId, index, label, onOpen }: { recordId: string; index: number; label: string; onOpen: () => void }) {
+  const [url, setUrl] = useState<string | null>(null)
+  const [visible, setVisible] = useState(false)
+  const btnRef = useRef<HTMLButtonElement>(null)
+
+  useEffect(() => {
+    const el = btnRef.current
+    if (!el) return
+    const obs = new IntersectionObserver((entries) => {
+      if (entries[0]?.isIntersecting) { setVisible(true); obs.disconnect() }
+    }, { rootMargin: '200px' })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!visible) return
+    let objectUrl: string | null = null
+    let cancelled = false
+    fetchScanBlobUrl(recordId, index)
+      .then((u) => { if (cancelled) { URL.revokeObjectURL(u) } else { objectUrl = u; setUrl(u) } })
+      .catch(() => { /* leave placeholder; lightbox will surface the error */ })
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl) }
+  }, [visible, recordId, index])
+
+  return (
+    <button
+      type="button"
+      ref={btnRef}
+      className="records-scan-thumb records-scan-pill"
+      onClick={onOpen}
+      aria-label={label}
+    >
+      {url ? <img src={url} alt="" loading="lazy" /> : <span className="records-scan-thumb-ph">🖼 {index + 1}</span>}
+    </button>
+  )
+}
+
+/** Full-screen dark lightbox with prev/next paging through all scans. */
+function ScanLightbox({ recordId, title, total, initialIndex, onClose }: { recordId: string; title: string; total: number; initialIndex: number; onClose: () => void }) {
+  const [index, setIndex] = useState(initialIndex)
   const [url, setUrl] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const clamped = Math.min(Math.max(index, 0), Math.max(total - 1, 0))
+  const go = useCallback((d: number) => setIndex((i) => Math.min(Math.max(i + d, 0), Math.max(total - 1, 0))), [total])
 
   useEffect(() => {
     let objectUrl: string | null = null
-    const token = authClient.token()
-    fetch(`${API_BASE}/medical/scan/${recordId}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    })
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`Scan load failed (${res.status})`)
-        const blob = await res.blob()
-        objectUrl = URL.createObjectURL(blob)
-        setUrl(objectUrl)
-      })
-      .catch((e) => setError(e?.message ?? String(e)))
-    return () => { if (objectUrl) URL.revokeObjectURL(objectUrl) }
-  }, [recordId])
+    let cancelled = false
+    setUrl(null)
+    setError(null)
+    fetchScanBlobUrl(recordId, clamped)
+      .then((u) => { if (cancelled) URL.revokeObjectURL(u); else { objectUrl = u; setUrl(u) } })
+      .catch((e) => { if (!cancelled) setError(e?.message ?? String(e)) })
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl) }
+  }, [recordId, clamped])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') { e.stopPropagation(); onClose() }
+      else if (e.key === 'ArrowLeft') { e.stopPropagation(); go(-1) }
+      else if (e.key === 'ArrowRight') { e.stopPropagation(); go(1) }
     }
     document.addEventListener('keydown', onKey, true)
     return () => document.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  }, [onClose, go])
 
   return (
     <div className="records-lightbox" onClick={onClose}>
       <div className="records-lightbox-bar">
         <span className="records-lightbox-title">{title}</span>
+        <span className="records-lightbox-count">Scan {clamped + 1} of {total}</span>
         <button type="button" className="records-lightbox-close" onClick={onClose} aria-label="Close scan">✕</button>
       </div>
       <div className="records-lightbox-body" onClick={(e) => e.stopPropagation()}>
+        {total > 1 && (
+          <button type="button" className="records-lightbox-nav records-lightbox-prev" onClick={() => go(-1)} disabled={clamped === 0} aria-label="Previous scan">‹</button>
+        )}
         {error && <div className="records-lightbox-error">{error}</div>}
         {!url && !error && <div className="records-lightbox-loading">Loading scan…</div>}
-        {url && <img src={url} alt={title} />}
+        {url && <img src={url} alt={`${title} — scan ${clamped + 1} of ${total}`} />}
+        {total > 1 && (
+          <button type="button" className="records-lightbox-nav records-lightbox-next" onClick={() => go(1)} disabled={clamped >= total - 1} aria-label="Next scan">›</button>
+        )}
       </div>
     </div>
   )
