@@ -27,6 +27,8 @@ interface RecordItem {
   recorded_at: string | null
   source_image_path: string | null
   source_image_paths?: string[] | null
+  scan_count?: number | null
+  has_scans?: boolean | null
 }
 
 interface EncounterDetail extends EncounterSummary {
@@ -72,7 +74,9 @@ function firstSentence(s: string | null): string {
 /** Lines that start a conclusion-style callout. */
 const CONCLUSION_RE = /^(conclusion|impression|diagnosis|zaključak|dijagnoza)\s*[:\-—]?\s*/i
 
-function splitContent(content: string): { paragraphs: string[]; conclusion: string | null } {
+export function splitContent(content: string): { paragraphs: string[]; conclusion: string | null } {
+  // Split only on blank lines; single \n inside a paragraph is preserved
+  // verbatim (trim is outer-only) and rendered via white-space: pre-wrap.
   const paragraphs: string[] = []
   let conclusion: string | null = null
   for (const para of content.split(/\n{2,}|\r\n\r\n/)) {
@@ -352,7 +356,7 @@ function EncounterPopup({ encounter, onClose, onScansSeen, onUpdated }: { encoun
               )}
               {(detail.records ?? []).map((rec, i) => (
                 <RecordSection key={rec.id} record={rec} index={i + 1} total={detail.records.length}
-                  onScanFound={scanPathsOf(rec).length ? onScansSeen : undefined}
+                  onScanFound={(rec.has_scans != null ? Boolean(rec.has_scans) : scanPathsOf(rec).length > 0) ? onScansSeen : undefined}
                   onUpdated={(updated) =>
                     setDetail((prev) =>
                       prev ? { ...prev, records: prev.records.map((r) => (r.id === updated.id ? updated : r)) } : prev,
@@ -383,9 +387,18 @@ async function fetchScanBlobUrl(recordId: string, index: number): Promise<string
   const res = await fetch(`${API_BASE}/medical/scan/${recordId}?index=${index}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   })
-  if (!res.ok) throw new Error(`Scan load failed (${res.status})`)
+  if (!res.ok) {
+    const err = new Error(`Scan load failed (${res.status})`) as Error & { status?: number }
+    err.status = res.status
+    throw err
+  }
   const blob = await res.blob()
   return URL.createObjectURL(blob)
+}
+
+function isScanMissingError(e: unknown): boolean {
+  const err = e as { status?: number; message?: string } | null
+  return err?.status === 404 || /scan image missing|scan load failed \(404\)/i.test(err?.message ?? String(e ?? ''))
 }
 
 function RecordSection({ record, index, total, onScanFound, onUpdated }: { record: RecordItem; index: number; total: number; onScanFound?: () => void; onUpdated: (r: RecordItem) => void }) {
@@ -398,7 +411,11 @@ function RecordSection({ record, index, total, onScanFound, onUpdated }: { recor
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const paths = scanPathsOf(current)
-  const hasScans = paths.length > 0
+  // Backend has_scans/scan_count already only count files that resolve on
+  // disk; when present, trust it over the raw path list so a record whose
+  // scan file is missing shows no gallery. Absent (legacy/tools payloads),
+  // fall back to the path list and let ScanThumb handle a failed fetch.
+  const hasScans = current.has_scans != null ? Boolean(current.has_scans) : paths.length > 0
   useEffect(() => { if (onScanFound && hasScans) onScanFound() }, [onScanFound, hasScans])
   const { paragraphs, conclusion } = splitContent(current.content ?? '')
 
@@ -498,6 +515,7 @@ function RecordSection({ record, index, total, onScanFound, onUpdated }: { recor
 /** One thumbnail in the scan gallery; fetches its image lazily on visibility. */
 function ScanThumb({ recordId, index, label, onOpen }: { recordId: string; index: number; label: string; onOpen: () => void }) {
   const [url, setUrl] = useState<string | null>(null)
+  const [unavailable, setUnavailable] = useState(false)
   const [visible, setVisible] = useState(false)
   const btnRef = useRef<HTMLButtonElement>(null)
 
@@ -517,7 +535,7 @@ function ScanThumb({ recordId, index, label, onOpen }: { recordId: string; index
     let cancelled = false
     fetchScanBlobUrl(recordId, index)
       .then((u) => { if (cancelled) { URL.revokeObjectURL(u) } else { objectUrl = u; setUrl(u) } })
-      .catch(() => { /* leave placeholder; lightbox will surface the error */ })
+      .catch(() => { if (!cancelled) setUnavailable(true) })
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl) }
   }, [visible, recordId, index])
 
@@ -529,7 +547,7 @@ function ScanThumb({ recordId, index, label, onOpen }: { recordId: string; index
       onClick={onOpen}
       aria-label={label}
     >
-      {url ? <img src={url} alt="" loading="lazy" /> : <span className="records-scan-thumb-ph">🖼 {index + 1}</span>}
+      {url ? <img src={url} alt="" loading="lazy" /> : unavailable ? <span className="records-scan-thumb-ph records-scan-thumb-ph--unavailable">Scan unavailable</span> : <span className="records-scan-thumb-ph">🖼 {index + 1}</span>}
     </button>
   )
 }
@@ -549,7 +567,7 @@ function ScanLightbox({ recordId, title, total, initialIndex, onClose }: { recor
     setError(null)
     fetchScanBlobUrl(recordId, clamped)
       .then((u) => { if (cancelled) URL.revokeObjectURL(u); else { objectUrl = u; setUrl(u) } })
-      .catch((e) => { if (!cancelled) setError(e?.message ?? String(e)) })
+      .catch((e) => { if (!cancelled) setError(isScanMissingError(e) ? 'Scan image missing' : (e?.message ?? String(e))) })
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl) }
   }, [recordId, clamped])
 

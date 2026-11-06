@@ -1998,6 +1998,8 @@ button.link:hover { background: none; text-decoration: underline; }
   border-radius: var(--radius-sm);
   padding: var(--space-3);
   margin-bottom: var(--space-4);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* Per-document section */
@@ -2018,7 +2020,7 @@ button.link:hover { background: none; text-decoration: underline; }
   cursor: pointer;
 }
 .records-doc-body { font-size: 14px; line-height: 1.5; margin-top: var(--space-2); }
-.records-doc-body p { margin: 0 0 var(--space-2); }
+.records-doc-body p { margin: 0 0 var(--space-2); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .records-conclusion {
   background: var(--color-accent-soft);
@@ -2034,7 +2036,7 @@ button.link:hover { background: none; text-decoration: underline; }
   text-transform: uppercase;
   color: var(--color-faint);
 }
-.records-conclusion p { margin: 2px 0 0; }
+.records-conclusion p { margin: 2px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .records-doc-divider { height: 1px; background: var(--color-border); margin: var(--space-2) 0; }
 
@@ -2100,6 +2102,7 @@ button.link:hover { background: none; text-decoration: underline; }
   font-weight: 600;
   color: var(--color-muted);
 }
+.records-scan-thumb-ph--unavailable { color: var(--color-faint); font-size: 11px; text-align: center; padding: var(--space-2); }
 .records-lightbox-count { color: #cfd8dc; font-size: 13px; font-weight: 600; white-space: nowrap; }
 .records-lightbox-nav {
   flex: 0 0 auto;
