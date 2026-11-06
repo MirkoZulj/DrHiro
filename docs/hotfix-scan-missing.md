@@ -96,3 +96,19 @@ Most plausible, in order:
 - 45 files on disk, 19 missing files
 - All 19 missing are single-path records (10 Nov 2 -pageN PDF batch + 9 Nov 2-5 plain). All 10 multi-path records intact (35 files).
 - Pattern: missing = older ingests (Nov 2 14:16-14:30 batch + Nov 2 18:27 + Nov 5 09:54), present singles = Nov 5 19:43 / Nov 6 batches.
+
+## Restoration 2026-11-06 (images-only, owner-approved)
+- All 19 missing files recovered from owner Telegram resends (local Pi folders
+  `drhiro-{nose,eye,affidea,batch-20261106-extra}-*`), re-attached to the
+  EXISTING prod records — no records/encounters created, no DB writes.
+  Files were copied to `/opt/drhiro/data/medical_scans/scans/0bfad360-…/`
+  under the exact filenames already in `source_image_path` (45 → 64 files).
+- Pre-write backup: `/opt/drhiro/backups/drphiro-pre-scanrestore-20261106T2240Z.dump`.
+- PDF (Povijest bolesti 03.02.2026) converted with `pdftoppm` to JPG
+  (serve_scan/store_scan only accept jpg/png/webp/heic).
+- Ordering proof: DB content carries `Dok N/10` for the Affidea batch; local
+  tesseract OCR (vision was down) confirmed pages 1–7, 9 (GE MAC2000), 10
+  (6:05:22). Page 8 (UZV snimke) is by elimination/darkness only — see
+  `/home/mirko/drhiro-staged-19-manifest.txt` for the full per-record map.
+- Verified: `/health` 0.11.0; encounters nose 3/3, Affidea 10/10, Merkur 1/1,
+  eyes 1/1 each; `GET /medical/scan/<id>` 200 for all 19. No GitHub push.
