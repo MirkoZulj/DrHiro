@@ -1459,8 +1459,8 @@ def tool_dedupe_record_scans(req: DedupeRecordScansTool, user: User = Depends(_r
 
     mode='bytes' (default, legacy): sha256 of bytes, keep first per hash.
     mode='perceptual': 64-bit aHash per scan, greedy keep-first clustering
-    with Hamming distance <= hamming_threshold (default 4, range 0-16)
-    against cluster representatives. Keeps the earliest-uploaded path per
+    with Hamming distance <= hamming_threshold (default 4, range 0-16),
+    single-linkage (connected components, so stepwise recompression drift chains together). Keeps the earliest-uploaded path per
     cluster; deletes only files clustered with a kept image. Files whose
     aHash cannot be computed are NEVER deleted (kept, reported in
     ``unhashed``). Missing files are reported in ``missing``. Idempotent.
@@ -1484,12 +1484,9 @@ def tool_dedupe_record_scans(req: DedupeRecordScansTool, user: User = Depends(_r
     paths = list(rec.source_image_paths_json or ([rec.source_image_path] if rec.source_image_path else []))
     before = len(paths)
     if mode == "perceptual":
-        kept: list[str] = []
-        removed_paths: list[str] = []
         missing: list[str] = []
         unhashed: list[str] = []
-        # clusters: list of {kept, kept_hash, removed:[(path,dist)], max_dist}
-        clusters: list[dict] = []
+        items = []  # (rel, hash, abs_path) in original order
         for rel in paths:
             if not rel:
                 continue
@@ -1501,44 +1498,64 @@ def tool_dedupe_record_scans(req: DedupeRecordScansTool, user: User = Depends(_r
             if ah is None:
                 # Never delete a file we cannot hash.
                 unhashed.append(rel)
-                clusters.append({"kept": rel, "kept_hash": None, "removed": [], "max_distance": 0})
-                kept.append(rel)
+                items.append((rel, None, abs_path))
                 continue
-            matched = None
-            matched_dist = None
-            for c in clusters:
-                if c["kept_hash"] is None:
+            items.append((rel, ah, abs_path))
+        # Single-linkage clustering (union-find): two scans link if Hamming
+        # <= threshold. Chaining handles recompressed variants that drift
+        # stepwise from the original; representative-only clustering misses
+        # those. Unhashed files are always their own cluster (never deleted).
+        parent = list(range(len(items)))
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def _union(a, b):
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[rb] = ra
+        for i in range(len(items)):
+            if items[i][1] is None:
+                continue
+            for j in range(i + 1, len(items)):
+                if items[j][1] is None:
                     continue
-                d = _hamming(ah, c["kept_hash"])
-                if d <= threshold:
-                    matched = c
-                    matched_dist = d
-                    break
-            if matched is not None:
-                matched["removed"].append(rel)
-                matched["max_distance"] = max(matched["max_distance"], int(matched_dist or 0))
-                removed_paths.append(rel)
+                if _hamming(items[i][1], items[j][1]) <= threshold:
+                    _union(i, j)
+        groups: dict[int, list[int]] = {}
+        for idx in range(len(items)):
+            groups.setdefault(_find(idx), []).append(idx)
+        kept: list[str] = []
+        removed_paths: list[str] = []
+        cluster_summary = []
+        for root, members in sorted(groups.items(), key=lambda kv: min(kv[1])):
+            members_sorted = sorted(members)
+            kept_rel, kept_hash, kept_abs = items[members_sorted[0]]
+            kept.append(kept_rel)
+            removed_here = []
+            max_dist = 0
+            for m in members_sorted[1:]:
+                rel_m, hash_m, abs_m = items[m]
+                removed_here.append(rel_m)
+                removed_paths.append(rel_m)
+                if hash_m is not None and kept_hash is not None:
+                    max_dist = max(max_dist, _hamming(hash_m, kept_hash))
                 if not req.dry_run:
                     try:
-                        os.unlink(abs_path)
+                        os.unlink(abs_m)
                     except FileNotFoundError:
                         pass
-                continue
-            clusters.append({"kept": rel, "kept_hash": ah, "removed": [], "max_distance": 0})
-            kept.append(rel)
-        cluster_summary = [
-            {"kept": c["kept"], "kept_hash": (f"{c['kept_hash']:016x}" if c["kept_hash"] is not None else None), "removed": c["removed"], "max_distance": c["max_distance"]}
-            for c in clusters
-        ]
+            cluster_summary.append({"kept": kept_rel, "kept_hash": (f"{kept_hash:016x}" if kept_hash is not None else None), "removed": removed_here, "max_distance": max_dist})
         removed = len(removed_paths)
         if not req.dry_run and kept != paths:
             rec.source_image_paths_json = kept
             rec.source_image_path = kept[0] if kept else rec.source_image_path
         _tool_audit(db, user, "tools.dedupe_record_scans", "medical_record", str(rec.id),
-                    metadata={"before": before, "after": len(kept), "mode": mode, "clusters": len(clusters), "removed": removed, "missing": missing, "unhashed": unhashed, "dry_run": bool(req.dry_run)})
+                    metadata={"before": before, "after": len(kept), "mode": mode, "clusters": len(cluster_summary), "removed": removed, "missing": missing, "unhashed": unhashed, "dry_run": bool(req.dry_run), "hamming_threshold": threshold})
         db.commit()
-        return ToolResponse(ok=True, message=f"Perceptual dedupe record scans: {before} -> {len(kept)} ({len(clusters)} clusters, removed {removed}).",
-                            data={"record_id": str(rec.id), "mode": mode, "before": before, "after": len(kept), "clusters": len(clusters), "cluster_summary": cluster_summary, "removed_files": removed, "removed_paths": removed_paths, "kept_paths": kept, "missing": missing, "unhashed": unhashed, "dry_run": bool(req.dry_run), "hamming_threshold": threshold})
+        return ToolResponse(ok=True, message=f"Perceptual dedupe record scans: {before} -> {len(kept)} ({len(cluster_summary)} clusters, removed {removed}).",
+                            data={"record_id": str(rec.id), "mode": mode, "before": before, "after": len(kept), "clusters": len(cluster_summary), "cluster_summary": cluster_summary, "removed_files": removed, "removed_paths": removed_paths, "kept_paths": kept, "missing": missing, "unhashed": unhashed, "dry_run": bool(req.dry_run), "hamming_threshold": threshold})
 
     kept: list[str] = []
     seen_hashes: set[str] = set()
