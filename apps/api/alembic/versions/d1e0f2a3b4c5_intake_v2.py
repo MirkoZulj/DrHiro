@@ -1,13 +1,13 @@
 """Intake v2 (0.11.0-a, spec §2): unit_label, disable med reminders, paused->active, seed nutrients, food_micro_backfill.
 
-Revision ID: c9d0e1f2a3b4
-Revises: b8c9d0e1f2a3
+Revision ID: d1e0f2a3b4c5
+Revises: d8e9f0a1b2c3
 """
 from alembic import op
 import uuid
 
-revision = "c9d0e1f2a3b4"
-down_revision = "b8c9d0e1f2a3"
+revision = "d1e0f2a3b4c5"
+down_revision = "d8e9f0a1b2c3"
 branch_labels = None
 depends_on = None
 
