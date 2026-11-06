@@ -965,21 +965,20 @@ function CompositionModal({ sel, onClose, showToast, onEditDose }: {
   }, [onClose])
 
   async function confirmMapping(row: CompositionRow) {
-    // PATCH the item with this ingredient entry flipped to mapping=confirmed.
+    // Server-side single-row update (POST confirm-mapping): the API flips
+    // this entry's mapping in place from storage, so no client payload can
+    // drop the other rows or their amounts. (The former GET+PATCH of the
+    // whole ingredients_json list read the wrong response shape — GET /{id}
+    // wraps the item under "item" — came back empty, and wiped the list
+    // down to one amount-less row. 2026-11-06.)
     setConfirming(row.name)
     try {
-      const itemRes = await authClient.api(`/medications/${sel.itemId}`).catch(() => null)
-      const ingredients: Array<Record<string, unknown>> = Array.isArray(itemRes?.ingredients_json)
-        ? itemRes.ingredients_json.map((e: Record<string, unknown>) => ({ ...e }))
-        : []
-      const idx = ingredients.findIndex(
-        (e) => String(e.name ?? e.component ?? '') === row.name || String(e.nutrient_code ?? '') === String(row.nutrient_code ?? ''),
-      )
-      if (idx >= 0) ingredients[idx] = { ...ingredients[idx], mapping: 'confirmed' }
-      else ingredients.push({ name: row.name, nutrient_code: row.nutrient_code ?? null, mapping: 'confirmed' })
-      await authClient.api(`/medications/${sel.itemId}`, { method: 'PATCH', body: JSON.stringify({ ingredients_json: ingredients }) })
+      await authClient.api(`/medications/${sel.itemId}/confirm-mapping`, {
+        method: 'POST',
+        body: JSON.stringify({ name: row.name, nutrient_code: row.nutrient_code ?? null }),
+      })
       showToast('Mapping confirmed')
-      load()
+      await load()
     } catch (e) {
       showToast(errMsg(e))
     } finally {

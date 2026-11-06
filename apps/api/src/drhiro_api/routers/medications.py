@@ -519,6 +519,58 @@ def get_composition(item_id: str, scope: str = "unit", date_str: str | None = Qu
             "dose_amount": item.dose_amount, "dose_unit": item.dose_unit, "unit_label": getattr(item,"unit_label",None),
             "age": age, "scope": scope, "taken": taken, "rows": rows_out, "legacy_rows": legacy}
 
+class ConfirmMappingRequest(BaseModel):
+    name: str | None = None
+    nutrient_code: str | None = None
+
+@router.post("/{item_id}/confirm-mapping")
+def confirm_mapping(item_id: str, req: ConfirmMappingRequest,
+                    user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Flip one ingredient's mapping to 'confirmed' in place.
+
+    Server-side, single-row update: every other entry — and every
+    amount/unit/per field of the confirmed entry — is preserved verbatim
+    from storage. This replaces the web client's former GET+PATCH of the
+    whole ingredients_json list (2026-11-06: it read ingredients_json from
+    the top level of GET /{id}, which wraps the item under "item", so the
+    list came back empty and the PATCH wiped all but one amount-less row).
+    Never creates an entry: unknown ingredient -> 404, nothing written.
+    """
+    from drhiro_api.services.schemas_meds import LEGACY_CODE_MAP
+    item = _get_item(db, user, item_id)
+    if not req.name and not req.nutrient_code:
+        raise HTTPException(status_code=400, detail="name or nutrient_code is required")
+    entries = list(item.ingredients_json or [])
+
+    def _canon(e: dict):
+        c = e.get("nutrient_code")
+        return LEGACY_CODE_MAP.get(c, c) if isinstance(c, str) else c
+
+    want_code = LEGACY_CODE_MAP.get(req.nutrient_code, req.nutrient_code) if req.nutrient_code else None
+    idx = -1
+    for i, e in enumerate(entries):
+        if isinstance(e, dict) and req.name and str(
+            e.get("name") or e.get("component") or e.get("ingredient") or ""
+        ).casefold() == req.name.casefold():
+            idx = i
+            break
+    if idx < 0 and want_code:
+        for i, e in enumerate(entries):
+            if isinstance(e, dict) and _canon(e) == want_code:
+                idx = i
+                break
+    if idx < 0:
+        raise HTTPException(status_code=404, detail="ingredient not found for this item")
+    updated = dict(entries[idx])
+    updated["mapping"] = "confirmed"
+    entries[idx] = updated
+    item.ingredients_json = entries
+    audit(db, "user", str(user.id), user.id, "medications.confirm_mapping", "medication_item", str(item.id),
+          {"name": updated.get("name") or updated.get("component"), "nutrient_code": updated.get("nutrient_code")})
+    db.commit()
+    db.refresh(item)
+    return _item_out(item)
+
 @router.patch("/{item_id}")
 def patch_medication(item_id: str, req: MedicationPatchRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     item = _get_item(db, user, item_id)

@@ -101,6 +101,51 @@ def test_composition_period_day_and_legacy_codes(client, db, user_a):
     assert client.get(f"/api/v1/medications/{item_id}/composition?scope=day", headers=auth_headers(user_a)).status_code == 400
     assert client.get(f"/api/v1/medications/{item_id}/composition?scope=day&date=nope", headers=auth_headers(user_a)).status_code == 400
 
+def test_confirm_mapping_preserves_other_rows(client, db, user_a):
+    # Regression (2026-11-06): clicking "Confirm mapping" in the composition
+    # modal corrupted the table to a single Vitamin A row with dashes. The
+    # web client read ingredients_json from the top level of GET /{id}
+    # (which wraps the item under "item") and PATCHed a single amount-less
+    # entry over the whole list. The server-side confirm endpoint flips one
+    # row's mapping in place so no client payload can wipe the other rows.
+    item_id = _create(client, user_a, ingredients_json=[
+        {"component": "Vitamin A", "per_1_capsule_mcg": 900},
+        {"component": "Vitamin C", "per_1_capsule_mg": 90},
+        {"component": "Vitamin D", "per_1_capsule_mcg": 50},
+    ]).json()["id"]
+    r = client.post(f"/api/v1/medications/{item_id}/confirm-mapping",
+                    json={"name": "Vitamin A", "nutrient_code": "vitamin_a"},
+                    headers=auth_headers(user_a))
+    assert r.status_code == 200, r.text
+    stored = r.json()["ingredients_json"]
+    assert len(stored) == 3
+    by_name = {e["name"]: e for e in stored}
+    assert by_name["Vitamin A"]["mapping"] == "confirmed"
+    assert by_name["Vitamin A"]["amount"] == 900 and by_name["Vitamin A"]["unit"] == "mcg"
+    assert by_name["Vitamin C"]["amount"] == 90 and by_name["Vitamin C"]["unit"] == "mg"
+    assert by_name["Vitamin D"]["amount"] == 50 and by_name["Vitamin D"]["unit"] == "mcg"
+    # Composition (incl. period scope) still shows every row with amounts/refs
+    client.post("/api/v1/medications/intake", json={"entries": [{"item_id": item_id}]}, headers=auth_headers(user_a))
+    today = date.today().isoformat()
+    r = client.get(f"/api/v1/medications/{item_id}/composition?scope=period&start={today}&end={today}",
+                   headers=auth_headers(user_a))
+    assert r.status_code == 200, r.text
+    rows = {row["name"]: row for row in r.json()["rows"]}
+    assert set(rows) == {"Vitamin A", "Vitamin C", "Vitamin D"}
+    assert rows["Vitamin A"]["per_unit"] == 900 and rows["Vitamin A"]["mapping"] == "confirmed"
+    assert rows["Vitamin C"]["per_unit"] == 90 and rows["Vitamin D"]["per_unit"] == 50
+    assert rows["Vitamin A"]["pct_ref"] is not None
+
+def test_confirm_mapping_unknown_ingredient_404(client, db, user_a):
+    item_id = _create(client, user_a, ingredients_json=[
+        {"name": "Zinc", "nutrient_code": "zinc", "amount": 5, "unit": "mg"}]).json()["id"]
+    r = client.post(f"/api/v1/medications/{item_id}/confirm-mapping",
+                    json={"name": "Nope"}, headers=auth_headers(user_a))
+    assert r.status_code == 404, r.text
+    # Nothing was changed
+    stored = client.get(f"/api/v1/medications/{item_id}", headers=auth_headers(user_a)).json()["item"]["ingredients_json"]
+    assert len(stored) == 1 and stored[0]["amount"] == 5
+
 def test_patch_dose(client, db, user_a):
     item_id = _create(client, user_a).json()["id"]
     dose = client.post("/api/v1/medications/intake", json={"entries": [{"item_id": item_id}]}, headers=auth_headers(user_a)).json()["doses"][0]
