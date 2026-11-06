@@ -219,3 +219,37 @@ def serve_scan(
     if not abs_path:
         raise HTTPException(status_code=404, detail="Scan image missing")
     return FileResponse(abs_path)
+
+from pydantic import BaseModel
+
+class MedicalRecordPatch(BaseModel):
+    title: str | None = None
+    content: str | None = None
+
+class MedicalEncounterPatch(BaseModel):
+    title: str | None = None
+
+@router.patch("/medical/records/{record_id}")
+def patch_medical_record(record_id: str, req: MedicalRecordPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Edit a record's title/text (Card 8 fix: wrong auto-title e.g. 'Krvna kartica - zapis 2000').
+    Title is agent-supplied on create (no server auto-title); this lets owner correct it."""
+    try: rid = uuid_mod.UUID(record_id)
+    except ValueError: raise HTTPException(status_code=404, detail="Record not found")
+    rec = db.query(MedicalRecord).filter(MedicalRecord.id == rid, MedicalRecord.user_id == user.id).first()
+    if not rec: raise HTTPException(status_code=404, detail="Record not found")
+    if req.title is not None: rec.title = req.title.strip() or None
+    if req.content is not None:
+        if not req.content.strip(): raise HTTPException(status_code=400, detail="content must not be empty")
+        rec.content = req.content
+    db.add(rec); db.commit(); db.refresh(rec)
+    return _record_out(rec)
+
+@router.patch("/medical/encounters/{encounter_id}")
+def patch_medical_encounter(encounter_id: str, req: MedicalEncounterPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try: eid = uuid_mod.UUID(encounter_id)
+    except ValueError: raise HTTPException(status_code=404, detail="Encounter not found")
+    e = db.query(MedicalEncounter).filter(MedicalEncounter.id == eid, MedicalEncounter.user_id == user.id).first()
+    if not e: raise HTTPException(status_code=404, detail="Encounter not found")
+    if req.title is not None: e.title = req.title.strip() or None
+    db.add(e); db.commit(); db.refresh(e)
+    return _encounter_out(e)

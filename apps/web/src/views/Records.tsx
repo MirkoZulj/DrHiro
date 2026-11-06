@@ -268,6 +268,7 @@ function EncounterPopup({ encounter, onClose, onScansSeen }: { encounter: Encoun
               )}
               {(detail.records ?? []).map((rec, i) => (
                 <RecordSection key={rec.id} record={rec} index={i + 1} total={detail.records.length}
+                  onUpdated={() => { setDetail(null); authClient.api(`/medical/encounters/${encounter.id}`).then(setDetail).catch(() => {}) }}
                   onScanFound={scanPathsOf(rec).length ? onScansSeen : undefined} />
               ))}
             </>
@@ -299,8 +300,12 @@ async function fetchScanBlobUrl(recordId: string, index: number): Promise<string
   return URL.createObjectURL(blob)
 }
 
-function RecordSection({ record, index, total, onScanFound }: { record: RecordItem; index: number; total: number; onScanFound?: () => void }) {
+function RecordSection({ record, index, total, onScanFound, onUpdated }: { record: RecordItem; index: number; total: number; onScanFound?: () => void; onUpdated?: () => void }) {
   const [scanIndex, setScanIndex] = useState<number | null>(null)
+  const [editing, setEditing] = useState(false)
+  const [title, setTitle] = useState(record.title ?? '')
+  const [content, setContent] = useState(record.content ?? '')
+  const [saving, setSaving] = useState(false)
   const paths = scanPathsOf(record)
   const hasScans = paths.length > 0
   useEffect(() => { if (onScanFound && hasScans) onScanFound() }, [onScanFound, hasScans])
@@ -312,7 +317,21 @@ function RecordSection({ record, index, total, onScanFound }: { record: RecordIt
         <span className="records-doc-index">{String(index).padStart(2, '0')}</span>
         <span className="records-doc-title">{record.title}</span>
         <span className="badge records-doc-badge">{sourceLabel(record.source_type)}</span>
+        <button type="button" className="records-edit-btn" onClick={() => { setTitle(record.title ?? ''); setContent(record.content ?? ''); setEditing(!editing) }}>{editing ? 'Cancel' : 'Edit title / text'}</button>
       </div>
+      {editing && (
+        <div className="records-edit-form">
+          <label>Title<input value={title} onChange={(e) => setTitle(e.target.value)} /></label>
+          <label>Text<textarea value={content} onChange={(e) => setContent(e.target.value)} rows={6} /></label>
+          <button type="button" disabled={saving} onClick={async () => {
+            setSaving(true)
+            try {
+              await authClient.api(`/medical/records/${record.id}`, { method: 'PATCH', body: JSON.stringify({ title, content }) })
+              setEditing(false); onUpdated?.()
+            } catch (e: any) { alert(e?.message ?? String(e)) } finally { setSaving(false) }
+          }}>{saving ? 'Saving…' : 'Save'}</button>
+        </div>
+      )}
       <div className="records-doc-body">
         {paragraphs.map((p, i) => (
           <p key={i}>{p}</p>
