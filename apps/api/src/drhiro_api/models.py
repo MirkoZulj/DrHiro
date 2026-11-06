@@ -614,6 +614,8 @@ class MedicationItem(Base, TimestampMixin):
     ingredients_json: Mapped[list | None] = mapped_column(JSON)
     dose_amount: Mapped[float | None] = mapped_column()
     dose_unit: Mapped[str | None] = mapped_column(String(16))
+    # 0.11.0-a: per-unit description (capsule|tablet|softgel|ml|g|scoop|drop|sachet|other)
+    unit_label: Mapped[str | None] = mapped_column(String(24))
     # {"type":"daily","times":["08:00"]} | {"type":"weekly","days":["mon","thu"],"times":["08:00"]}
     # | {"type":"interval","every_days":3,"times":["08:00"],"anchor":"2026-11-03"} | {"type":"prn"}
     # optional: "with_food": "with|before|after|any"
@@ -810,3 +812,14 @@ class AppSetting(Base):
     telegram_allowed_user_id: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+class FoodMicroBackfill(Base, TimestampMixin):
+    __tablename__ = "food_micro_backfill"
+    __table_args__ = (UniqueConstraint("food_id", name="uq_food_micro_backfill_food"),)
+    id: Mapped[uuid.UUID] = uuid_pk()
+    food_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("foods.id", ondelete="CASCADE"), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    nutrients_found: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)

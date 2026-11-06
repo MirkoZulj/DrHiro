@@ -196,25 +196,14 @@ def test_medication_api_crud_and_tenant_isolation(client, db, user_a, user_b):
 
 
 def test_stop_disables_reminders_resume_reenables(client, db, user_a):
+    # 0.11.0-a: reminder coupling removed — create_reminder ignored, no Reminder rows.
     r = _create_via_api(client, user_a, create_reminder=True)
     item_id = r.json()["id"]
-    rid = r.json().get("reminder_ids_json") or []
-    if not rid:  # fall back to DB lookup
-        item = db.get(MedicationItem, uuid.UUID(item_id))
-        rid = list(item.reminder_ids_json or [])
-    assert len(rid) == 1  # D1: one reminder per time slot
-
-    def _enabled():
-        return db.query(Reminder).filter(Reminder.id.in_([uuid.UUID(x) for x in rid])).all()
-
-    assert all(x.enabled for x in _enabled())
-    db.expire_all()
-    client.post(f"/api/v1/medications/{item_id}/pause", json={}, headers=auth_headers(user_a))
-    db.expire_all()
-    assert all(not x.enabled for x in _enabled())
+    assert "create_reminder is ignored" in (r.json().get("warnings") or [])
+    assert db.query(Reminder).count() == 0
+    assert client.post(f"/api/v1/medications/{item_id}/pause", json={}, headers=auth_headers(user_a)).status_code == 410
     client.post(f"/api/v1/medications/{item_id}/resume", json={}, headers=auth_headers(user_a))
-    db.expire_all()
-    assert all(x.enabled for x in _enabled())
+    assert db.query(Reminder).count() == 0
 
 
 def test_duplicate_ingredients_with_synonyms(client, db, user_a):
