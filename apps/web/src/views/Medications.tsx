@@ -342,7 +342,7 @@ export default function Medications() {
                               key={c.key}
                               type="button"
                               className="meds-chip"
-                              onClick={() => setDoseSel(c.first)}
+                              onClick={() => setCompSel({ itemId: c.first.item_id, name: c.first.name, kind: c.first.kind, scope: 'day', date: key })}
                               aria-label={`${c.first.name}, ${trimNum(c.total, 1)}${c.first.unit_label ? ` ${c.first.unit_label}` : ''}${c.count > 1 ? `, logged ${c.count} times` : ''}`}
                             >
                               <span aria-hidden="true">{c.first.kind === 'medication' ? '💊' : '🌿'}</span>{' '}
@@ -445,6 +445,11 @@ export default function Medications() {
           sel={compSel}
           onClose={() => setCompSel(null)}
           showToast={showToast}
+          onEditDose={compSel.scope === 'day' && compSel.date ? () => {
+            const dose = (daysByDate.get(compSel.date ?? '') ?? []).find((d) => d.item_id === compSel.itemId)
+            if (dose) { setCompSel(null); setDoseSel(dose) }
+            else showToast('No dose logged that day to edit')
+          } : undefined}
         />
       )}
 
@@ -923,10 +928,11 @@ interface CompSelection {
   header?: string
 }
 
-function CompositionModal({ sel, onClose, showToast }: {
+function CompositionModal({ sel, onClose, showToast, onEditDose }: {
   sel: CompSelection
   onClose: () => void
   showToast: (m: string) => void
+  onEditDose?: () => void
 }) {
   const [detail, setDetail] = useState<Composition | null>(null)
   const [loading, setLoading] = useState(true)
@@ -1061,6 +1067,9 @@ function CompositionModal({ sel, onClose, showToast }: {
           <p className="muted">No composition recorded for this item.</p>
         )}
         <p className="meds-detail-note">“—” means no daily requirement is recorded for that component (e.g. glucosamine, boswellia) — not zero.</p>
+        {sel.scope === 'day' && onEditDose && (
+          <button type="button" className="secondary" onClick={onEditDose}>Edit dose</button>
+        )}
       </div>
     </div>
   )
