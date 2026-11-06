@@ -10,6 +10,7 @@ Each tool maps 1:1 to a function the drHiro skill exposes to the agent.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 import time
@@ -1420,6 +1421,68 @@ def tool_update_medical_record(req: UpdateMedicalRecordTool, user: User = Depend
     db.refresh(rec)
     return ToolResponse(ok=True, message="Medical record updated.", data={**_medical_record_out(rec), **merge_info})
 
+
+class DedupeRecordScansTool(BaseModel):
+    record_id: str
+
+
+@router.post("/dedupe_record_scans", response_model=ToolResponse)
+def tool_dedupe_record_scans(req: DedupeRecordScansTool, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
+    """Content-dedupe a medical record's bound scans (owner-scoped).
+
+    Hashes every bound scan file (sha256 of bytes), groups identical
+    content, keeps the FIRST path per hash (earliest-uploaded copy),
+    deletes duplicate files from disk, and rewrites
+    source_image_paths_json to the kept set. Idempotent: a re-run on an
+    already-deduped record removes nothing. Missing/unreadable files are
+    reported in ``missing`` and left out of the kept set only if no file
+    exists — never delete a path whose content hash is unique.
+    """
+    from drhiro_api.routers.medical import resolve_scan_file
+    rec = (
+        db.query(MedicalRecord)
+        .filter(MedicalRecord.id == _maybe_uuid(req.record_id), MedicalRecord.user_id == user.id)
+        .first()
+    )
+    if not rec:
+        raise HTTPException(status_code=404, detail="Medical record not found")
+    paths = list(rec.source_image_paths_json or ([rec.source_image_path] if rec.source_image_path else []))
+    before = len(paths)
+    kept: list[str] = []
+    seen_hashes: set[str] = set()
+    groups = 0
+    removed = 0
+    missing: list[str] = []
+    for rel in paths:
+        if not rel:
+            continue
+        abs_path = resolve_scan_file(user, rel)
+        if abs_path is None:
+            missing.append(rel)
+            continue
+        h = hashlib.sha256()
+        with open(abs_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        digest = h.hexdigest()
+        if digest in seen_hashes:
+            groups += 1
+            try:
+                os.unlink(abs_path)
+                removed += 1
+            except FileNotFoundError:
+                pass
+            continue
+        seen_hashes.add(digest)
+        kept.append(rel)
+    if kept != paths:
+        rec.source_image_paths_json = kept
+        rec.source_image_path = kept[0] if kept else rec.source_image_path
+    _tool_audit(db, user, "tools.dedupe_record_scans", "medical_record", str(rec.id),
+                metadata={"before": before, "after": len(kept), "groups": groups, "removed": removed, "missing": missing})
+    db.commit()
+    return ToolResponse(ok=True, message=f"Deduped record scans: {before} -> {len(kept)} (removed {removed}).",
+                        data={"record_id": str(rec.id), "before": before, "after": len(kept), "groups": groups, "removed_files": removed, "kept_paths": kept, "missing": missing})
 
 @router.post("/ingest_medical_batch", response_model=ToolResponse)
 async def tool_ingest_medical_batch(
