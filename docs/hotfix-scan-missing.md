@@ -90,3 +90,9 @@ Most plausible, in order:
   `Scan image missing` for a 404 instead of a generic error.
 - Text view: `white-space: pre-wrap` on record/conclusion/encounter-notes
   paragraphs so single-`\n` OCR lines render as lines (edit `<textarea>` unchanged).
+
+## Prod audit 2026-11-06 (owner question: how many lost)
+- 29 records have scans in DB (64 referenced files: 29 single-path + 35 in 10 multi-path records)
+- 45 files on disk, 19 missing files
+- All 19 missing are single-path records (10 Nov 2 -pageN PDF batch + 9 Nov 2-5 plain). All 10 multi-path records intact (35 files).
+- Pattern: missing = older ingests (Nov 2 14:16-14:30 batch + Nov 2 18:27 + Nov 5 09:54), present singles = Nov 5 19:43 / Nov 6 batches.
