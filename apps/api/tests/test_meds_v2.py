@@ -60,6 +60,47 @@ def test_composition_serving_units_halved(client, db, user_a):
     r = client.get(f"/api/v1/medications/{item_id}/composition?scope=unit", headers=auth_headers(user_a))
     assert r.json()["rows"][0]["per_unit"] == 10
 
+def test_composition_period_day_and_legacy_codes(client, db, user_a):
+    # Prod traceback regression: scope=period with start/end hit
+    # AttributeError 'NoneType' has no 'fromisoformat' (param shadowed date).
+    item_id = _create(client, user_a).json()["id"]
+    # Simulate pre-0.11 rows written directly to DB (bypass API normalisation)
+    from drhiro_api.models import MedicationItem
+    item = db.query(MedicationItem).filter_by(id=uuid.UUID(item_id)).first()
+    item.ingredients_json = [
+        {"name": "Thiamin", "nutrient_code": "vitamin_b1", "amount": 1.2, "unit": "mg", "per": "capsule"},
+        {"name": "Omega-3 EPA/DHA", "nutrient_code": "omega3_epa_dha", "amount": 300, "unit": "mg", "per": "unit"},
+        {"name": "Glucosamine", "nutrient_code": "bogus_code", "amount": 500, "unit": "mg", "per": "unit"},
+    ]
+    db.commit()
+    # Log a dose today so day/period scopes have taken rows
+    client.post("/api/v1/medications/intake", json={"entries": [{"item_id": item_id}]}, headers=auth_headers(user_a))
+    today = date.today().isoformat()
+    window = f"start={today}&end={today}"
+    r = client.get(f"/api/v1/medications/{item_id}/composition?scope=period&{window}", headers=auth_headers(user_a))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scope"] == "period" and body["taken"]["doses"] == 1
+    by_name = {row["name"]: row for row in body["rows"]}
+    # Legacy RDA codes mapped before validation
+    assert by_name["Thiamin"]["nutrient_code"] == "thiamin"
+    assert by_name["Omega-3 EPA/DHA"]["nutrient_code"] == "epa_dha"
+    # per='capsule' row degraded, not 500; amount preserved
+    assert by_name["Thiamin"]["per_unit"] == 1.2
+    # Unknown code degraded to unmapped, never 500
+    assert by_name["Glucosamine"]["nutrient_code"] is None
+    assert by_name["Glucosamine"]["mapping"] == "none"
+    assert by_name["Glucosamine"]["per_unit"] == 500
+    # Day scope (same shadowing bug, line 431)
+    r = client.get(f"/api/v1/medications/{item_id}/composition?scope=day&date={today}", headers=auth_headers(user_a))
+    assert r.status_code == 200, r.text
+    assert r.json()["taken"]["doses"] == 1
+    # Missing/bad params are 400, not 500
+    assert client.get(f"/api/v1/medications/{item_id}/composition?scope=period", headers=auth_headers(user_a)).status_code == 400
+    assert client.get(f"/api/v1/medications/{item_id}/composition?scope=period&start=nope&end={today}", headers=auth_headers(user_a)).status_code == 400
+    assert client.get(f"/api/v1/medications/{item_id}/composition?scope=day", headers=auth_headers(user_a)).status_code == 400
+    assert client.get(f"/api/v1/medications/{item_id}/composition?scope=day&date=nope", headers=auth_headers(user_a)).status_code == 400
+
 def test_patch_dose(client, db, user_a):
     item_id = _create(client, user_a).json()["id"]
     dose = client.post("/api/v1/medications/intake", json={"entries": [{"item_id": item_id}]}, headers=auth_headers(user_a)).json()["doses"][0]

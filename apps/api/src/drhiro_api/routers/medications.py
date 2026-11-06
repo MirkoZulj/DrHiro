@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
+from datetime import date as _date
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import AliasChoices, BaseModel, Field
@@ -411,30 +412,84 @@ def get_medication(item_id: str, user: User = Depends(get_current_user), db: Ses
     }
 
 
+def _composition_entries(raw):
+    """Per-entry fallback: never 500 on legacy rows.
+
+    Try normalise_ingredient (legacy RDA codes are mapped in schemas_meds);
+    on ValueError (unknown code, per='capsule', …) degrade to an unmapped
+    entry preserving name/amount/unit, per='unit'.
+    """
+    from drhiro_api.services.schemas_meds import LEGACY_CODE_MAP, _num, _unit_of, normalise_ingredient
+    out = []
+    for e in raw or []:
+        try:
+            out.append(normalise_ingredient(e).model_dump())
+            continue
+        except ValueError:
+            pass
+        # Salvage retry: legacy code / invalid per etc. cleaned, code preserved
+        if isinstance(e, dict):
+            c = dict(e)
+            if c.get("nutrient_code") in LEGACY_CODE_MAP:
+                c["nutrient_code"] = LEGACY_CODE_MAP[c["nutrient_code"]]
+            if c.get("per") not in (None, "unit", "serving"):
+                c["per"] = "unit"
+            if c.get("mapping") not in (None, "confirmed", "suggested", "none"):
+                c["mapping"] = "none"
+            if c.get("form") not in (None, "elemental", "compound"):
+                c["form"] = None
+            try:
+                out.append(normalise_ingredient(c).model_dump())
+                continue
+            except ValueError:
+                pass
+        try:
+            if isinstance(e, dict):
+                name = str(e.get("name") or e.get("component") or e.get("ingredient") or "").strip() or "Unknown"
+                amt = _num(e.get("amount"))
+                unit = e.get("unit")
+                if amt is None:
+                    for k, v in e.items():
+                        if isinstance(v, (int, float)) and not isinstance(v, bool) and _unit_of(k):
+                            amt = float(v); unit = _unit_of(k); break
+            else:
+                name, amt, unit = str(e), None, None
+            out.append({"name": name, "nutrient_code": None, "mapping": "none",
+                        "amount": amt, "unit": unit, "per": "unit",
+                        "serving_units": 1, "form": None})
+        except Exception:
+            out.append({"name": "Unknown", "nutrient_code": None, "mapping": "none",
+                        "amount": None, "unit": None, "per": "unit",
+                        "serving_units": 1, "form": None})
+    return out
+
+
 @router.get("/{item_id}/composition")
-def get_composition(item_id: str, scope: str = "unit", date: str | None = None, start: str | None = None, end: str | None = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_composition(item_id: str, scope: str = "unit", date_str: str | None = Query(default=None, alias="date"), start: str | None = None, end: str | None = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """§3.3/3.4 composition: per-unit × amount taken (day/period), with RDA ref.
     Returns both new shape (rows/taken) and legacy keys for old clients."""
     item = _get_item(db, user, item_id)
     if scope not in ("unit", "day", "period"): raise HTTPException(400, "scope must be unit|day|period")
     from drhiro_api.services.nutrition_rda import RDA_TABLE, age_from_profile, rda_for_age
-    from drhiro_api.services.schemas_meds import LEGACY_RDA_ALIASES, normalise_ingredients
+    from drhiro_api.services.schemas_meds import LEGACY_RDA_ALIASES
     from drhiro_api.services.day_boundary import nutrition_date
     from drhiro_api.services.schemas_meds import per_unit_amount
     age = age_from_profile(user)
-    entries = normalise_ingredients(item.ingredients_json or [])
+    entries = _composition_entries(item.ingredients_json or [])
     # taken totals
     taken_amt = 0.0; doses_n=0; days_taken=0
     if scope in ("day", "period"):
         q = db.query(DoseEvent).filter(DoseEvent.user_id == user.id, DoseEvent.item_id == item.id, DoseEvent.status == "taken")
-        if scope == "day" and date:
-            dd = date.fromisoformat(date)
+        if scope == "day":
+            if not date_str: raise HTTPException(400, "date is required for day scope")
+            try: dd = _date.fromisoformat(date_str)
+            except ValueError: raise HTTPException(400, "date must be ISO format YYYY-MM-DD")
             rows = [d for d in q.all() if nutrition_date(d.taken_at, user.timezone) == dd]
-        elif scope == "period" and start and end:
-            s, e = date.fromisoformat(start), date.fromisoformat(end)
-            rows = [d for d in q.all() if s <= nutrition_date(d.taken_at, user.timezone) <= e]
         else:
-            rows = q.all()
+            if not start or not end: raise HTTPException(400, "start and end are required for period scope")
+            try: s, e = _date.fromisoformat(start), _date.fromisoformat(end)
+            except ValueError: raise HTTPException(400, "start/end must be ISO format YYYY-MM-DD")
+            rows = [d for d in q.all() if s <= nutrition_date(d.taken_at, user.timezone) <= e]
         doses_n = len(rows)
         taken_amt = sum(float(d.amount if d.amount is not None else (item.dose_amount or 1.0)) for d in rows)
         days_taken = len({nutrition_date(d.taken_at, user.timezone) for d in rows})

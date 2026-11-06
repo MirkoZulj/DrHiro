@@ -18,6 +18,8 @@ NUTRIENT_CODES: tuple[str, ...] = (
 )
 # RDA keys used by legacy nutrition_rda (for composition ref fallback)
 LEGACY_RDA_ALIASES = {"thiamin":"vitamin_b1","riboflavin":"vitamin_b2","niacin":"vitamin_b3","epa_dha":"omega3_epa_dha"}
+# Reverse: pre-0.11 rows may carry the legacy RDA key as nutrient_code.
+LEGACY_CODE_MAP = {v: k for k, v in LEGACY_RDA_ALIASES.items()}
 
 class IngredientEntry(BaseModel):
     name: str = Field(min_length=1)
@@ -95,6 +97,8 @@ def normalise_ingredient(entry: dict) -> IngredientEntry:
             if isinstance(v,(int,float)) and not isinstance(v,bool) and _unit_of(k):
                 amt=float(v); unit=_unit_of(k); break
     code = entry.get("nutrient_code")
+    if code is not None:
+        code = LEGACY_CODE_MAP.get(code, code)
     if code is None and entry.get("mapping") in ("suggested",None) and "nutrient_code" not in entry:
         # Only suggest for legacy entries lacking the canonical key
         code = suggest_nutrient_code(name)
