@@ -272,4 +272,15 @@ input[type="number"] {
   --tab-inactive-text: var(--color-text-secondary);
 
   --divider: var(--color-border);
+
+  /* ---- Month-view dot palette (8 stable colours, composed from the
+     themed series/semantic tokens above so both themes stay accessible) -- */
+  --med-color-0: var(--color-accent);
+  --med-color-1: var(--color-chart-secondary);
+  --med-color-2: var(--color-chart-tertiary);
+  --med-color-3: var(--color-macro-carbs);
+  --med-color-4: var(--color-macro-sugar);
+  --med-color-5: var(--color-info);
+  --med-color-6: var(--color-success);
+  --med-color-7: var(--color-warning);
 }

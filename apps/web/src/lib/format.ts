@@ -71,6 +71,35 @@ export function fmtKcal(v: number | undefined | null): string {
   return v == null || Number.isNaN(v) ? '—' : `${Math.round(v)} kcal`
 }
 
+/** Trim trailing zeros: 10.00 -> "10", 2.40 -> "2.4", 0.50 -> "0.5". */
+export function trimNum(n: number, maxDec: number): string {
+  const fixed = n.toFixed(maxDec)
+  return fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed
+}
+
+/**
+ * Format an amount with its unit, keeping small values in a readable unit.
+ * Canonical API units are mcg/mg, but defensively: <1 mg is shown as mcg
+ * (so B12 never appears as "0.01 mg"), and <1 g as mg.
+ */
+export function fmtAmount(value: number | null | undefined, unit: string | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return '—'
+  let u = (unit || '').replace('µg', 'mcg').replace('ug', 'mcg').trim()
+  let v = value
+  if (u === 'g' && Math.abs(v) < 1) { v *= 1000; u = 'mg' }
+  if (u === 'mg' && v !== 0 && Math.abs(v) < 1) { v *= 1000; u = 'mcg' }
+  const dec = Math.abs(v) >= 100 ? 0 : Math.abs(v) >= 10 ? 1 : 2
+  const num = Math.abs(v) >= 1000
+    ? Math.round(v).toLocaleString('en-US')
+    : trimNum(v, dec)
+  return u ? `${num} ${u}` : num
+}
+
+export function fmtPct(v: number | null | undefined): string {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—'
+  return `${trimNum(v, 1)}%`
+}
+
 export function titleCase(s: string): string {
   return s
     .replace(/[_-]+/g, ' ')
