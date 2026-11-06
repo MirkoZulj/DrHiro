@@ -586,7 +586,14 @@ Flow (follow in order):
    (staged encounter_id) — or `list_medical_records` if only the record id is
    known — and confirm the record is present with your transcription and its
    scans bound. Quote the verification: encounter id, record id, photo count.
-6. **Only then confirm back** to the user with the verified ids.
+6. **DEDUPE scans after any merge/resend.** After `update_medical_record`
+   with `merge_record_ids` (or any resend), the scan count may exceed the
+   number of unique photos (merges concatenate paths, each resend uploads
+   fresh filenames for the same bytes). Call `dedupe_record_scans`
+   (record_id) whenever scan count > unique-photo count, then re-verify with
+   `get_medical_encounter`: scan count MUST equal the unique-photo count
+   before you confirm — transcription untouched.
+7. **Only then confirm back** to the user with the verified ids.
 
 Hard rules:
 - NEVER say "Done", "logged", "saved" or "stored" for a medical batch unless
