@@ -161,3 +161,124 @@ def test_medical_record_patch(client, db, user_a):
     assert r.json()["title"] == "Eye exam"
     r2 = client.patch(f"/api/v1/medical/records/{rec.id}", json={"content": "Corrected text"}, headers=auth_headers(user_a))
     assert r2.json()["content"] == "Corrected text"
+
+
+# ── Owner-requested Meds editing (2026-11-07): pct_dv, short_name, Edit ──
+
+def test_pct_dv_round_trip_create_and_composition(client, db, user_a):
+    item_id = _create(client, user_a, ingredients_json=[
+        {"name": "Magnesium", "nutrient_code": "magnesium", "amount": 200, "unit": "mg", "pct_dv": 48},
+        {"name": "Zinc", "nutrient_code": "zinc", "amount": 11, "unit": "mg"},
+    ]).json()["id"]
+    stored = client.get(f"/api/v1/medications/{item_id}", headers=auth_headers(user_a)).json()["item"]["ingredients_json"]
+    by_name = {e["name"]: e for e in stored}
+    assert by_name["Magnesium"]["pct_dv"] == 48
+    assert by_name["Zinc"]["pct_dv"] is None
+    body = client.get(f"/api/v1/medications/{item_id}/composition?scope=unit", headers=auth_headers(user_a)).json()
+    rows = {r["name"]: r for r in body["rows"]}
+    assert rows["Magnesium"]["pct_dv"] == 48
+    assert rows["Zinc"]["pct_dv"] is None
+
+def test_patch_edit_preserves_and_updates_rows(client, db, user_a):
+    item_id = _create(client, user_a, ingredients_json=[
+        {"name": "Vitamin D3", "nutrient_code": "vitamin_d", "amount": 25, "unit": "mcg", "pct_dv": 125},
+        {"name": "Vitamin K2", "nutrient_code": "vitamin_k", "amount": 90, "unit": "mcg", "pct_dv": 75},
+    ]).json()["id"]
+    # Full edit payload as sent by the Edit composition popup.
+    r = client.patch(f"/api/v1/medications/{item_id}", json={
+        "name": "Vitamin D3 + K2", "short_name": "D3K2", "brand": "Acme",
+        "dose_amount": 1, "dose_unit": "capsule", "unit_label": "capsule",
+        "ingredients_json": [
+            {"name": "Vitamin D3", "amount": 25, "unit": "mcg", "nutrient_code": "vitamin_d",
+             "per": "unit", "serving_units": 1, "form": None, "mapping": "confirmed", "pct_dv": 125},
+            {"name": "Vitamin K2", "amount": 90, "unit": "mcg", "nutrient_code": "vitamin_k",
+             "per": "unit", "serving_units": 1, "form": None, "mapping": "confirmed", "pct_dv": 75},
+            {"name": "New row", "amount": 10, "unit": "mg", "nutrient_code": None,
+             "per": "unit", "serving_units": 1, "form": None, "mapping": "none", "pct_dv": None},
+        ],
+    }, headers=auth_headers(user_a))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["name"] == "Vitamin D3 + K2" and out["short_name"] == "D3K2" and out["brand"] == "Acme"
+    assert len(out["ingredients_json"]) == 3
+    rows = {e["name"]: e for e in out["ingredients_json"]}
+    assert rows["Vitamin D3"]["amount"] == 25 and rows["Vitamin D3"]["pct_dv"] == 125
+    assert rows["Vitamin K2"]["amount"] == 90 and rows["Vitamin K2"]["pct_dv"] == 75
+    # Composition reflects the edit
+    body = client.get(f"/api/v1/medications/{item_id}/composition?scope=unit", headers=auth_headers(user_a)).json()
+    assert {row["name"] for row in body["rows"]} == {"Vitamin D3", "Vitamin K2", "New row"}
+
+def test_short_name_stored_and_returned_in_intake(client, db, user_a):
+    item_id = _create(client, user_a, short_name="Mg").json()["id"]
+    item = client.get(f"/api/v1/medications/{item_id}", headers=auth_headers(user_a)).json()["item"]
+    assert item["short_name"] == "Mg"
+    client.post("/api/v1/medications/intake", json={"entries": [{"item_id": item_id}]}, headers=auth_headers(user_a))
+    body = client.get("/api/v1/medications/intake?view=week", headers=auth_headers(user_a)).json()
+    assert body["days"][0]["doses"][0]["short_name"] == "Mg"
+    assert body["items"][0]["short_name"] == "Mg"
+    # PATCH can update and clear it; intake then falls back to the computed name
+    client.patch(f"/api/v1/medications/{item_id}", json={"short_name": "MultiV"}, headers=auth_headers(user_a))
+    item = client.get(f"/api/v1/medications/{item_id}", headers=auth_headers(user_a)).json()["item"]
+    assert item["short_name"] == "MultiV"
+    client.patch(f"/api/v1/medications/{item_id}", json={"short_name": ""}, headers=auth_headers(user_a))
+    item = client.get(f"/api/v1/medications/{item_id}", headers=auth_headers(user_a)).json()["item"]
+    assert item["short_name"] is None
+    body = client.get("/api/v1/medications/intake?view=week", headers=auth_headers(user_a)).json()
+    assert body["days"][0]["doses"][0]["short_name"] == "Vitamin D3"
+
+def test_pct_dv_negative_rejected(client, db, user_a):
+    item_id = _create(client, user_a, ingredients_json=[
+        {"name": "Zinc", "nutrient_code": "zinc", "amount": 5, "unit": "mg"}]).json()["id"]
+    r = client.patch(f"/api/v1/medications/{item_id}", json={
+        "ingredients_json": [{"name": "Zinc", "nutrient_code": "zinc", "amount": 5, "unit": "mg", "pct_dv": -10}],
+    }, headers=auth_headers(user_a))
+    assert r.status_code == 422, r.text
+
+def _web_src(relpath):
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[3]
+    return (root / relpath).read_text(encoding="utf-8")
+
+def test_confirm_mapping_ui_removed():
+    tsx = _web_src("apps/web/src/views/Medications.tsx")
+    assert "confirm-mapping" not in tsx
+    assert "Confirm mapping" not in tsx
+    assert "confirmMapping" not in tsx
+
+def test_taken_strip_removed():
+    tsx = _web_src("apps/web/src/views/Medications.tsx")
+    assert "meds-period-strip" not in tsx
+    assert "meds-period-chip" not in tsx
+    assert "Taken this {view}" not in tsx
+    assert "sortedPeriodItems" not in tsx
+
+def test_chip_layout_and_edit_popup_present():
+    tsx = _web_src("apps/web/src/views/Medications.tsx")
+    css = _web_src("apps/web/src/index.css")
+    assert "meds-chip-name" in tsx and "meds-chip-name" in css
+    assert "meds-chip-x" in tsx and "flex: none" in css
+    assert "min-width: 0" in css
+    assert "EditCompositionForm" in tsx
+    assert "Edit composition" in tsx
+    assert "% DV (label)" in tsx
+    assert "pct_dv" in tsx
+    assert "short_name" in tsx
+    assert "Add component" in tsx and "Remove" in tsx
+
+def test_migration_single_head_and_guarded():
+    import pathlib, re
+    versions = pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    revisions, downs = {}, set()
+    for f in versions.glob("*.py"):
+        t = f.read_text(encoding="utf-8")
+        rev = re.search(r"^revision = \"([^\"]+)\"", t, re.M)
+        down = re.search(r"^down_revision = \"([^\"]+)\"", t, re.M)
+        if rev:
+            revisions[rev.group(1)] = f.name
+            if down:
+                downs.add(down.group(1))
+    heads = set(revisions) - downs
+    assert heads == {"a7b8c9d0e1f2"}, heads
+    mig = (versions / "a7b8c9d0e1f2_meds_short_name.py").read_text(encoding="utf-8")
+    assert "ADD COLUMN IF NOT EXISTS short_name" in mig
+

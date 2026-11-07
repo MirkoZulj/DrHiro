@@ -616,6 +616,9 @@ class MedicationItem(Base, TimestampMixin):
     dose_unit: Mapped[str | None] = mapped_column(String(16))
     # 0.11.0-a: per-unit description (capsule|tablet|softgel|ml|g|scoop|drop|sachet|other)
     unit_label: Mapped[str | None] = mapped_column(String(24))
+    # Owner-chosen abbreviation shown on weekly chips (e.g. Mg, MultiV).
+    # NULL = fall back to the computed 12-char short_name.
+    short_name: Mapped[str | None] = mapped_column(String(32))
     # {"type":"daily","times":["08:00"]} | {"type":"weekly","days":["mon","thu"],"times":["08:00"]}
     # | {"type":"interval","every_days":3,"times":["08:00"],"anchor":"2026-11-03"} | {"type":"prn"}
     # optional: "with_food": "with|before|after|any"

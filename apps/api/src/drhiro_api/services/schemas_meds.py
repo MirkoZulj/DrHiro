@@ -30,8 +30,13 @@ class IngredientEntry(BaseModel):
     serving_units: float = 1
     form: str | None = None
     mapping: str = "confirmed"
+    # % of the label's daily value (printed on the supplement facts panel).
+    # Distinct from the computed %REF vs NASEM RDA shown in composition.
+    pct_dv: float | None = None
 
     def model_post_init(self, __context: Any) -> None:  # noqa
+        if self.pct_dv is not None and self.pct_dv < 0:
+            raise ValueError("pct_dv must be >= 0")
         if self.nutrient_code is not None and self.nutrient_code not in NUTRIENT_CODES:
             raise ValueError(f"unknown nutrient_code '{self.nutrient_code}'; choose from list_nutrient_codes")
         if self.per not in ("unit","serving"):
@@ -109,7 +114,8 @@ def normalise_ingredient(entry: dict) -> IngredientEntry:
     per = entry.get("per") or "unit"
     # legacy per_2 implies serving? keep explicit; default unit
     return IngredientEntry(name=name, nutrient_code=code, amount=amt, unit=unit, per=per,
-        serving_units=float(entry.get("serving_units") or 1), form=entry.get("form"), mapping=mapping)
+        serving_units=float(entry.get("serving_units") or 1), form=entry.get("form"), mapping=mapping,
+        pct_dv=_num(entry.get("pct_dv")))
 
 def normalise_ingredients(raw: list | None) -> list[dict]:
     if not raw: return []

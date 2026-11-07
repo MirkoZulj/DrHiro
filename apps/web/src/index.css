@@ -2262,7 +2262,10 @@ button.link:hover { background: none; text-decoration: underline; }
   font-weight: var(--weight-medium); text-align: left; cursor: pointer;
 }
 .meds-chip:hover { background: var(--color-surface-subtle); }
-.meds-chip-x { font-weight: var(--weight-bold); }
+.meds-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meds-chip-x { font-weight: var(--weight-bold); flex: none; margin-left: auto; padding-left: 6px; }
+.meds-edit-row { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-2); margin-bottom: var(--space-2); }
+.meds-edit-row-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-2); }
 .meds-empty-dot { color: var(--color-text-disabled); font-size: var(--text-lg); text-align: center; padding-top: var(--space-2); }
 @media (max-width: 639px) {
   .meds-week { grid-template-columns: 1fr; min-width: 0; }

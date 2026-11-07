@@ -26,7 +26,7 @@ from drhiro_api.services.schemas_meds import normalise_ingredients, per_unit_amo
 router = APIRouter(prefix="/medications", tags=["medications"])
 
 MED_FIELDS = (
-    "kind", "name", "brand", "form", "ingredients_json", "dose_amount", "dose_unit",
+    "kind", "name", "short_name", "brand", "form", "ingredients_json", "dose_amount", "dose_unit",
     "schedule_json", "timezone", "start_date", "end_date", "reason", "prescribed_by", "unit_label",
     "medical_record_id", "label_image_path", "stock_quantity", "notes",
 )
@@ -35,6 +35,7 @@ MED_FIELDS = (
 class MedicationCreateRequest(BaseModel):
     kind: str = "supplement"
     name: str = Field(min_length=1, max_length=255)
+    short_name: str | None = Field(default=None, max_length=32)
     brand: str | None = None
     form: str | None = None
     ingredients_json: list | None = None
@@ -57,6 +58,7 @@ class MedicationCreateRequest(BaseModel):
 class MedicationPatchRequest(BaseModel):
     kind: str | None = None
     name: str | None = None
+    short_name: str | None = Field(default=None, max_length=32)
     brand: str | None = None
     form: str | None = None
     # Alias "ingredients" accepted too: agents send label facts under
@@ -94,6 +96,7 @@ def _item_out(item: MedicationItem) -> dict:
         "id": str(item.id),
         "kind": item.kind,
         "name": item.name,
+        "short_name": getattr(item, "short_name", None),
         "brand": item.brand,
         "form": item.form,
         "ingredients_json": item.ingredients_json,
@@ -335,18 +338,19 @@ def get_intake(view: str = "week", offset: int = 0, kind: str = "all",
         if kind != "all" and item.kind != kind: continue
         amt = d.amount if d.amount is not None else (item.dose_amount or 1.0)
         days.setdefault(dd, []).append({"dose_id": str(d.id), "item_id": str(item.id),
-            "name": item.name, "short_name": short_name(item.name), "kind": item.kind,
+            "name": item.name, "short_name": getattr(item, "short_name", None) or short_name(item.name), "kind": item.kind,
             "color_idx": _color_idx(item.id), "amount": amt,
             "unit_label": getattr(item, "unit_label", None) or item.dose_unit,
             "taken_at": d.taken_at, "note": d.note})
         a = agg.setdefault(item.id, {"item_id": str(item.id), "name": item.name, "kind": item.kind,
+            "short_name": getattr(item, "short_name", None) or short_name(item.name),
             "color_idx": _color_idx(item.id), "days": set(), "total": 0.0,
             "unit_label": getattr(item, "unit_label", None) or item.dose_unit, "last": d.taken_at})
         a["days"].add(dd); a["total"] += float(amt or 0)
         if d.taken_at > a["last"]: a["last"] = d.taken_at
     return {"view": view, "start": start.isoformat(), "end": end.isoformat(), "tz": tz_name,
         "days": [{"date": d.isoformat(), "doses": days[d]} for d in sorted(days)],
-        "items": [{"item_id": v["item_id"], "name": v["name"], "kind": v["kind"], "color_idx": v["color_idx"],
+        "items": [{"item_id": v["item_id"], "name": v["name"], "short_name": v.get("short_name"), "kind": v["kind"], "color_idx": v["color_idx"],
                    "days_taken": len(v["days"]), "total_amount": round(v["total"], 3),
                    "unit_label": v["unit_label"], "last_taken_at": v["last"]} for v in sorted(agg.values(), key=lambda x: -len(x["days"]))]}
 
@@ -456,11 +460,11 @@ def _composition_entries(raw):
                 name, amt, unit = str(e), None, None
             out.append({"name": name, "nutrient_code": None, "mapping": "none",
                         "amount": amt, "unit": unit, "per": "unit",
-                        "serving_units": 1, "form": None})
+                        "serving_units": 1, "form": None, "pct_dv": None})
         except Exception:
             out.append({"name": "Unknown", "nutrient_code": None, "mapping": "none",
                         "amount": None, "unit": None, "per": "unit",
-                        "serving_units": 1, "form": None})
+                        "serving_units": 1, "form": None, "pct_dv": None})
     return out
 
 
@@ -509,6 +513,8 @@ def get_composition(item_id: str, scope: str = "unit", date_str: str | None = Qu
         row={"name": entry.get("name"), "nutrient_code": code, "mapping": entry.get("mapping"),
              "per_unit": per_u, "unit": entry.get("unit") or unit, "taken_total": taken_total,
              "avg_per_day_taken": avg, "ref": ref, "ref_kind": "RDA", "ul": None,
+             "pct_dv": entry.get("pct_dv"), "per": entry.get("per"), "serving_units": entry.get("serving_units"),
+             "form": entry.get("form"),
              "pct_ref": pct, "above_ul": False}
         rows_out.append(row)
         legacy.append({"component": entry.get("name"), "nutrient_key": legacy_key,
@@ -585,6 +591,9 @@ def patch_medication(item_id: str, req: MedicationPatchRequest, user: User = Dep
         val = getattr(req, f)
         if val is not None:
             setattr(item, f, val)
+    # short_name: empty string clears back to the computed fallback.
+    if req.short_name is not None:
+        item.short_name = req.short_name.strip() or None
     if getattr(req,"ingredients_json",None) is not None:
         try: item.ingredients_json=normalise_ingredients(req.ingredients_json)
         except Exception as e: raise HTTPException(status_code=422, detail=str(e))

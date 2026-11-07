@@ -5,15 +5,16 @@ import { fmtAmount, fmtPct, isoDate, trimNum } from '../lib/format'
 /**
  * Supplements & Meds — 0.11.0 §3 (intake v2).
  * Shows what was TAKEN, nothing else: week (default) / month grid, a
- * "Taken this period" strip, a collapsed Cabinet, a bulk Log-intake
- * modal, dose popovers and a composition modal. No regimen/adherence
- * language anywhere: no expected slots, no "not logged", no zeros.
+ * collapsed Cabinet, a bulk Log-intake modal, dose popovers and a
+ * composition modal with full Edit. No regimen/adherence language
+ * anywhere: no expected slots, no "not logged", no zeros.
  */
 
 interface MedItem {
   id: string
   kind: string
   name: string
+  short_name?: string | null
   brand?: string | null
   ingredients_json?: Array<Record<string, unknown>> | null
   dose_amount?: number | null
@@ -44,6 +45,7 @@ interface IntakeDay {
 interface IntakeItem {
   item_id: string
   name: string
+  short_name?: string | null
   kind: string
   color_idx?: number | null
   days_taken: number
@@ -72,12 +74,21 @@ interface CompositionRow {
   ref?: number | null
   ref_kind?: string | null
   ul?: number | null
+  /** % of the label's daily value (from the supplement facts panel). */
+  pct_dv?: number | null
+  per?: string | null
+  serving_units?: number | null
+  form?: string | null
   pct_ref?: number | null
   above_ul?: boolean
 }
 
 interface Composition {
-  item?: { id?: string; name?: string; kind?: string; brand?: string | null; unit_label?: string | null } | null
+  item?: {
+    id?: string; name?: string; short_name?: string | null; kind?: string; brand?: string | null;
+    dose_amount?: number | null; dose_unit?: string | null; unit_label?: string | null;
+    ingredients_json?: Array<Record<string, unknown>> | null
+  } | null
   item_id?: string
   name?: string
   kind?: string
@@ -244,13 +255,6 @@ export default function Medications() {
     return map
   }, [intake])
 
-  const sortedPeriodItems = useMemo(
-    () => [...(intake?.items ?? [])].sort((a, b) => b.days_taken - a.days_taken),
-    [intake],
-  )
-
-  const periodDays = view === 'week' ? 7 : new Date(new Date().getFullYear(), new Date().getMonth() + offset + 1, 0).getDate()
-
   async function archiveItem(item: MedItem) {
     setBusyId(item.id)
     try {
@@ -346,7 +350,7 @@ export default function Medications() {
                               aria-label={`${c.first.name}, ${trimNum(c.total, 1)}${c.first.unit_label ? ` ${c.first.unit_label}` : ''}${c.count > 1 ? `, logged ${c.count} times` : ''}`}
                             >
                               <span aria-hidden="true">{c.first.kind === 'medication' ? '💊' : '🌿'}</span>{' '}
-                              {shortName(c.first.name, c.first.short_name)}
+                              <span className="meds-chip-name">{shortName(c.first.name, c.first.short_name)}</span>
                               {(c.total !== 1 || c.count > 1) && <span className="meds-chip-x">×{trimNum(c.total, 1)}</span>}
                             </button>
                           ))
@@ -397,28 +401,6 @@ export default function Medications() {
             </section>
           )}
 
-          {intake && sortedPeriodItems.length > 0 && (
-            <section className="section meds-period-strip" aria-label="Taken this period">
-              <span className="meds-period-label">Taken this {view}:</span>{' '}
-              {sortedPeriodItems.map((it) => (
-                <button
-                  key={it.item_id}
-                  type="button"
-                  className="meds-period-chip"
-                  onClick={() =>
-                    setCompSel({
-                      itemId: it.item_id, name: it.name, kind: it.kind, scope: 'period',
-                      start: intake.start, end: intake.end,
-                      header: `Taken on ${it.days_taken} of ${periodDays} days · ${trimNum(it.total_amount, 1)}${it.unit_label ? ` ${it.unit_label}s` : ''} total`,
-                    })
-                  }
-                >
-                  {it.name} · {it.days_taken} {it.days_taken === 1 ? 'day' : 'days'} · {trimNum(it.total_amount, 1)}{it.unit_label ? ` ${it.unit_label}s` : ''}
-                </button>
-              ))}
-            </section>
-          )}
-
           <Cabinet items={items} busyId={busyId} onArchive={archiveItem} onUnarchive={unarchiveItem} onDetail={(it) => setCompSel({ itemId: it.id, name: it.name, kind: it.kind, scope: 'unit' })} onChanged={load} showToast={showToast} />
         </>
       )}
@@ -450,6 +432,7 @@ export default function Medications() {
             if (dose) { setCompSel(null); setDoseSel(dose) }
             else showToast('No dose logged that day to edit')
           } : undefined}
+          onChanged={load}
         />
       )}
 
@@ -603,6 +586,7 @@ function AddItemForm({ onDone, showToast }: { onDone: () => void; showToast: (m:
 
 function EditItemForm({ item, onClose, onDone, showToast }: { item: MedItem; onClose: () => void; onDone: () => void; showToast: (m: string) => void }) {
   const [name, setName] = useState(item.name)
+  const [shortName, setShortName] = useState(item.short_name ?? '')
   const [brand, setBrand] = useState(item.brand ?? '')
   const [unit, setUnit] = useState(item.unit_label ?? item.dose_unit ?? '')
   const [dose, setDose] = useState(String(item.dose_amount ?? 1))
@@ -615,7 +599,7 @@ function EditItemForm({ item, onClose, onDone, showToast }: { item: MedItem; onC
     try {
       await authClient.api(`/medications/${item.id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ name, brand: brand || null, unit_label: unit || null, dose_amount: Number(dose) || null }),
+        body: JSON.stringify({ name, short_name: shortName.trim() || null, brand: brand || null, unit_label: unit || null, dose_amount: Number(dose) || null }),
       })
       showToast(`Saved ${name}`)
       onDone()
@@ -632,6 +616,7 @@ function EditItemForm({ item, onClose, onDone, showToast }: { item: MedItem; onC
         <div className="modal-header"><h2>Edit item</h2><button className="modal-close" onClick={onClose} aria-label="Close">✕</button></div>
         <div className="meds-add-grid">
           <label>Name<input value={name} onChange={(e) => setName(e.target.value)} style={{ width: '100%' }} /></label>
+          <label>Abbreviation (weekly chips)<input value={shortName} onChange={(e) => setShortName(e.target.value)} placeholder="e.g. Mg, MultiV" style={{ width: '100%' }} /></label>
           <label>Brand<input value={brand} onChange={(e) => setBrand(e.target.value)} style={{ width: '100%' }} /></label>
           <label>Usual amount<input value={dose} onChange={(e) => setDose(e.target.value)} inputMode="decimal" style={{ width: '100%' }} /></label>
           <label>Unit<input value={unit} onChange={(e) => setUnit(e.target.value)} style={{ width: '100%' }} /></label>
@@ -928,16 +913,17 @@ interface CompSelection {
   header?: string
 }
 
-function CompositionModal({ sel, onClose, showToast, onEditDose }: {
+function CompositionModal({ sel, onClose, showToast, onEditDose, onChanged }: {
   sel: CompSelection
   onClose: () => void
   showToast: (m: string) => void
   onEditDose?: () => void
+  onChanged?: () => void
 }) {
   const [detail, setDetail] = useState<Composition | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [confirming, setConfirming] = useState<string | null>(null)
+  const [editing, setEditing] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -963,28 +949,6 @@ function CompositionModal({ sel, onClose, showToast, onEditDose }: {
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
   }, [onClose])
-
-  async function confirmMapping(row: CompositionRow) {
-    // Server-side single-row update (POST confirm-mapping): the API flips
-    // this entry's mapping in place from storage, so no client payload can
-    // drop the other rows or their amounts. (The former GET+PATCH of the
-    // whole ingredients_json list read the wrong response shape — GET /{id}
-    // wraps the item under "item" — came back empty, and wiped the list
-    // down to one amount-less row. 2026-11-06.)
-    setConfirming(row.name)
-    try {
-      await authClient.api(`/medications/${sel.itemId}/confirm-mapping`, {
-        method: 'POST',
-        body: JSON.stringify({ name: row.name, nutrient_code: row.nutrient_code ?? null }),
-      })
-      showToast('Mapping confirmed')
-      await load()
-    } catch (e) {
-      showToast(errMsg(e))
-    } finally {
-      setConfirming(null)
-    }
-  }
 
   const itemName = detail?.item?.name ?? detail?.name ?? sel.name
   const itemBrand = detail?.item?.brand
@@ -1022,7 +986,8 @@ function CompositionModal({ sel, onClose, showToast, onEditDose }: {
                   {sel.scope !== 'unit' && <th className="num">Taken</th>}
                   {isPeriod && <th className="num">Avg / day taken</th>}
                   <th className="num">Ref/day</th>
-                  <th className="num">% ref</th>
+                  <th className="num">% DV (label)</th>
+                  <th className="num">% REF</th>
                 </tr>
               </thead>
               <tbody>
@@ -1031,25 +996,12 @@ function CompositionModal({ sel, onClose, showToast, onEditDose }: {
                   const aboveUl = r.above_ul === true || (r.ul !== null && r.ul !== undefined && r.taken_total !== null && r.taken_total !== undefined && r.taken_total > r.ul)
                   return (
                     <tr key={idx}>
-                      <td className="meds-comp-name">
-                        {r.name}
-                        {r.mapping === 'suggested' && (
-                          <span className="meds-check-badge" title="Suggested nutrient mapping — please verify">
-                            check
-                            <button
-                              type="button" className="link meds-confirm"
-                              disabled={confirming === r.name}
-                              onClick={() => confirmMapping(r)}
-                            >
-                              {confirming === r.name ? 'Confirming…' : 'Confirm mapping'}
-                            </button>
-                          </span>
-                        )}
-                      </td>
+                      <td className="meds-comp-name">{r.name}</td>
                       <td className="num tabular">{fmtAmount(r.per_unit, r.unit)}</td>
                       {sel.scope !== 'unit' && <td className="num tabular">{fmtAmount(r.taken_total, r.unit)}</td>}
                       {isPeriod && <td className="num tabular">{fmtAmount(r.avg_per_day_taken, r.unit)}</td>}
                       <td className="num tabular">{hasRef ? fmtAmount(r.ref, r.unit) : '—'}</td>
+                      <td className="num tabular">{r.pct_dv !== null && r.pct_dv !== undefined ? `${trimNum(r.pct_dv, 1)}%` : '—'}</td>
                       <td className="num tabular">
                         {hasRef ? fmtPct(r.pct_ref) : '—'}
                         {aboveUl && r.ul !== null && r.ul !== undefined && (
@@ -1065,10 +1017,212 @@ function CompositionModal({ sel, onClose, showToast, onEditDose }: {
         ) : (
           <p className="muted">No composition recorded for this item.</p>
         )}
-        <p className="meds-detail-note">“—” means no daily requirement is recorded for that component (e.g. glucosamine, boswellia) — not zero.</p>
-        {sel.scope === 'day' && onEditDose && (
-          <button type="button" className="secondary" onClick={onEditDose}>Edit dose</button>
+        <p className="meds-detail-note">“—” means no daily requirement is recorded for that component (e.g. glucosamine, boswellia) — not zero. % DV (label) is from the supplement facts panel; % REF is computed against the NASEM reference intake.</p>
+        <div className="form-actions" style={{ marginTop: 12 }}>
+          <button type="button" className="secondary" onClick={() => setEditing(true)}>Edit composition</button>
+          {sel.scope === 'day' && onEditDose && (
+            <button type="button" className="secondary" onClick={onEditDose}>Edit dose</button>
+          )}
+        </div>
+        {editing && detail?.item && (
+          <EditCompositionForm
+            itemId={sel.itemId}
+            item={detail.item}
+            onClose={() => setEditing(false)}
+            onSaved={async () => {
+              setEditing(false)
+              await load()
+              onChanged?.()
+            }}
+            showToast={showToast}
+          />
         )}
+      </div>
+    </div>
+  )
+}
+
+/* ---- Edit composition popup -------------------------------------------------- */
+
+interface EditRow {
+  name: string
+  amount: string
+  unit: string
+  nutrient_code: string
+  per: string
+  serving_units: string
+  form: string
+  mapping: string
+  pct_dv: string
+}
+
+function toEditRow(e: Record<string, unknown>): EditRow {
+  return {
+    name: String(e.name ?? e.component ?? e.ingredient ?? ''),
+    amount: e.amount != null ? String(e.amount) : '',
+    unit: String(e.unit ?? ''),
+    nutrient_code: String(e.nutrient_code ?? ''),
+    per: String(e.per ?? 'unit'),
+    serving_units: e.serving_units != null ? String(e.serving_units) : '1',
+    form: String(e.form ?? ''),
+    mapping: String(e.mapping ?? 'none'),
+    pct_dv: e.pct_dv != null ? String(e.pct_dv) : '',
+  }
+}
+
+/**
+ * Full Edit for a medication item: item-level fields (name, short_name
+ * abbreviation, brand, dose_amount, dose_unit, unit_label) plus every
+ * ingredient row (name, amount, unit, nutrient_code, per, serving_units,
+ * form, mapping, pct_dv label %). Saves via PATCH /medications/{id}.
+ */
+function EditCompositionForm({ itemId, item, onClose, onSaved, showToast }: {
+  itemId: string
+  item: NonNullable<Composition['item']>
+  onClose: () => void
+  onSaved: () => void | Promise<void>
+  showToast: (m: string) => void
+}) {
+  const [name, setName] = useState(item.name ?? '')
+  const [shortName, setShortName] = useState(item.short_name ?? '')
+  const [brand, setBrand] = useState(item.brand ?? '')
+  const [doseAmount, setDoseAmount] = useState(item.dose_amount != null ? String(item.dose_amount) : '')
+  const [doseUnit, setDoseUnit] = useState(item.dose_unit ?? '')
+  const [unitLabel, setUnitLabel] = useState(item.unit_label ?? '')
+  const [rows, setRows] = useState<EditRow[]>(() => (item.ingredients_json ?? []).map(toEditRow))
+  const [saving, setSaving] = useState(false)
+  const [formError, setFormError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  function setRow(idx: number, f: keyof EditRow, v: string) {
+    setRows((prev) => prev.map((r, i) => (i === idx ? { ...r, [f]: v } : r)))
+  }
+
+  function numOrNull(s: string): number | null {
+    const t = s.trim()
+    if (!t) return null
+    const n = Number(t)
+    return Number.isFinite(n) ? n : null
+  }
+
+  async function save() {
+    if (!name.trim()) {
+      setFormError('Name is required.')
+      return
+    }
+    const bad = rows.findIndex((r) => !r.name.trim())
+    if (bad >= 0) {
+      setFormError(`Ingredient ${bad + 1} is missing a name — fill it or remove the row.`)
+      return
+    }
+    setSaving(true)
+    setFormError(null)
+    try {
+      await authClient.api(`/medications/${itemId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          name: name.trim(),
+          short_name: shortName.trim() || null,
+          brand: brand.trim() || null,
+          dose_amount: numOrNull(doseAmount),
+          dose_unit: doseUnit.trim() || null,
+          unit_label: unitLabel.trim() || null,
+          ingredients_json: rows.map((r) => ({
+            name: r.name.trim(),
+            amount: numOrNull(r.amount),
+            unit: r.unit.trim() || null,
+            nutrient_code: r.nutrient_code.trim() || null,
+            per: r.per === 'serving' ? 'serving' : 'unit',
+            serving_units: numOrNull(r.serving_units) ?? 1,
+            form: r.form === 'elemental' || r.form === 'compound' ? r.form : null,
+            mapping: r.mapping === 'confirmed' || r.mapping === 'suggested' ? r.mapping : 'none',
+            pct_dv: numOrNull(r.pct_dv),
+          })),
+        }),
+      })
+      showToast(`Saved ${name.trim()}`)
+      await onSaved()
+    } catch (e) {
+      setFormError(errMsg(e)) // keep the draft on screen — never silently lose edits
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const num = (label: string, v: string, onChange: (s: string) => void, ph?: string) => (
+    <label>{label}
+      <input type="number" inputMode="decimal" value={v} onChange={(e) => onChange(e.target.value)} placeholder={ph ?? ''} style={{ width: '100%' }} />
+    </label>
+  )
+  const txt = (label: string, v: string, onChange: (s: string) => void, ph?: string) => (
+    <label>{label}
+      <input value={v} onChange={(e) => onChange(e.target.value)} placeholder={ph ?? ''} style={{ width: '100%' }} />
+    </label>
+  )
+
+  return (
+    <div className="modal-overlay" onClick={onClose} style={{ zIndex: 60 }}>
+      <div className="modal-popup meds-detail" role="dialog" aria-modal="true" aria-label={`Edit ${item.name ?? 'composition'}`} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header"><h2>Edit composition</h2><button className="modal-close" onClick={onClose} aria-label="Close">✕</button></div>
+        <div className="meds-add-grid">
+          {txt('Name', name, setName)}
+          {txt('Abbreviation (weekly chips)', shortName, setShortName, 'e.g. Mg, MultiV')}
+          {txt('Brand', brand, setBrand)}
+          {num('Usual amount', doseAmount, setDoseAmount)}
+          {txt('Dose unit', doseUnit, setDoseUnit)}
+          {txt('Unit label', unitLabel, setUnitLabel)}
+        </div>
+        <h3 style={{ margin: '16px 0 8px' }}>Components</h3>
+        {rows.length === 0 && <p className="muted">No components recorded.</p>}
+        {rows.map((r, idx) => (
+          <div key={idx} className="meds-edit-row">
+            <div className="meds-edit-row-head">
+              <strong>#{idx + 1}</strong>
+              <button type="button" className="danger" onClick={() => setRows((prev) => prev.filter((_, i) => i !== idx))}>Remove</button>
+            </div>
+            <div className="meds-add-grid">
+              {txt('Name', r.name, (v) => setRow(idx, 'name', v))}
+              {num('Amount', r.amount, (v) => setRow(idx, 'amount', v))}
+              {txt('Unit', r.unit, (v) => setRow(idx, 'unit', v), 'mg, mcg…')}
+              {txt('Nutrient code', r.nutrient_code, (v) => setRow(idx, 'nutrient_code', v), 'e.g. magnesium')}
+              <label>Per
+                <select value={r.per} onChange={(e) => setRow(idx, 'per', e.target.value)} style={{ width: '100%' }}>
+                  <option value="unit">unit</option>
+                  <option value="serving">serving</option>
+                </select>
+              </label>
+              {num('Serving units', r.serving_units, (v) => setRow(idx, 'serving_units', v))}
+              <label>Form
+                <select value={r.form} onChange={(e) => setRow(idx, 'form', e.target.value)} style={{ width: '100%' }}>
+                  <option value="">—</option>
+                  <option value="elemental">elemental</option>
+                  <option value="compound">compound</option>
+                </select>
+              </label>
+              <label>Mapping
+                <select value={r.mapping} onChange={(e) => setRow(idx, 'mapping', e.target.value)} style={{ width: '100%' }}>
+                  <option value="confirmed">confirmed</option>
+                  <option value="suggested">suggested</option>
+                  <option value="none">none</option>
+                </select>
+              </label>
+              {num('% DV (label)', r.pct_dv, (v) => setRow(idx, 'pct_dv', v), 'e.g. 115')}
+            </div>
+          </div>
+        ))}
+        <button type="button" className="secondary" style={{ marginTop: 8 }} onClick={() => setRows((prev) => [...prev, { name: '', amount: '', unit: '', nutrient_code: '', per: 'unit', serving_units: '1', form: '', mapping: 'none', pct_dv: '' }])}>
+          + Add component
+        </button>
+        {formError && <div className="error" role="alert" style={{ marginTop: 8 }}>{formError}</div>}
+        <div className="form-actions" style={{ marginTop: 12 }}>
+          <button onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
+          <button className="secondary" onClick={onClose}>Cancel</button>
+        </div>
       </div>
     </div>
   )
@@ -1088,6 +1242,10 @@ function normaliseComposition(res: any): Composition {
       ref: r.ref ?? r.rda ?? null,
       ref_kind: r.ref_kind ?? null,
       ul: r.ul ?? null,
+      pct_dv: r.pct_dv ?? r.raw?.pct_dv ?? null,
+      per: r.per ?? r.raw?.per ?? null,
+      serving_units: r.serving_units ?? r.raw?.serving_units ?? null,
+      form: r.form ?? r.raw?.form ?? null,
       pct_ref: r.pct_ref ?? r.pct_per_capsule ?? null,
       above_ul: r.above_ul ?? null,
     }))
