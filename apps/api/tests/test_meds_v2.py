@@ -282,28 +282,45 @@ def test_migration_single_head_and_guarded():
     mig = (versions / "a7b8c9d0e1f2_meds_short_name.py").read_text(encoding="utf-8")
     assert "ADD COLUMN IF NOT EXISTS short_name" in mig
 
-def test_week_chip_pill_icons_and_external_count():
+def test_week_chip_kind_icons_repeated_per_amount():
     tsx = _web_src("apps/web/src/views/Medications.tsx")
     css = _web_src("apps/web/src/index.css")
-    # Pill icon (SVG, deterministic) replaces the leaf emoji in week chips.
-    assert "PillIcon" in tsx and "meds-chip-icon" in tsx and "meds-chip-icon" in css
+    # Kind-based SVG icons (no emoji, no PillIcon-only logic).
+    assert "LeafIcon" in tsx and "CapsuleIcon" in tsx
+    assert "PillIcon" not in tsx
+    assert "meds-chip-icon" in tsx and "meds-chip-icon" in css
+    assert "meds-chip-icon--leaf" in tsx and "meds-chip-icon--capsule" in tsx
     assert "meds-chip-icons" in tsx and "meds-chip-icons" in css
-    # Two icons when amount > 1, capped at two (one always + conditional second).
-    assert tsx.count("<PillIcon />") == 2
-    assert "c.total > 1 && <PillIcon />" in tsx
+    # Kind drives icon choice: medication -> capsule, otherwise leaf.
+    assert "c.first.kind === 'medication'" in tsx
+    assert "isMedication ? <CapsuleIcon" in tsx and ": <LeafIcon" in tsx
+    # Quantity is conveyed by repeating the icon: 1/2/3, capped at 3.
+    assert "Math.max(1, Math.min(3, Math.round(c.total)))" in tsx
+    assert "Array.from({ length: iconCount }" in tsx
     # Chip block itself: no leaf emoji, no pill emoji, short_name abbreviation used.
     start = tsx.index("groupDayChips(doses).map")
     chip_block = tsx[start:tsx.index("</button>", start)]
     assert "🌿" not in chip_block
     assert "💊" not in chip_block
-    assert "shortName(c.first.name, c.first.short_name)" in tsx
-    # ×n is OUTSIDE the pill: meds-chip-count is a sibling after </button>, inside meds-chip-wrap.
-    assert "meds-chip-wrap" in tsx and "meds-chip-wrap" in css
+    # No ×n text inside the pill (.meds-chip button).
+    assert "×" not in chip_block
+    assert "meds-chip-count" not in chip_block
     assert "meds-chip-x" not in tsx and "meds-chip-x" not in css
+    assert "shortName(c.first.name, c.first.short_name)" in tsx
+    # ×n only as >3 fallback, OUTSIDE the pill: sibling after </button>, in wrap.
+    assert "{c.total > 3 && <span className=\"meds-chip-count\">" in tsx
+    assert "(c.total !== 1" not in tsx and "c.count > 1) && <span className=\"meds-chip-count\"" not in tsx
     count_idx = tsx.index("meds-chip-count")
     assert tsx.index("</button>", start) < count_idx
-    assert "</span>" in tsx[count_idx:]  # count renders before wrap closes
     assert ".meds-chip-count" in css and ".meds-chip-wrap" in css
+    # Abbreviation gets full width: icons flex:none, name flex:1 min-width:0,
+    # chip/wrap width:100%, week columns equal 1fr.
+    assert ".meds-chip-icons" in css and "flex: none" in css
+    name_css = css[css.index(".meds-chip-name"):css.index(".meds-chip-name") + 300]
+    assert "flex: 1 1 auto" in name_css and "min-width: 0" in name_css
+    week_css = css[css.index(".meds-week"):css.index(".meds-week") + 300]
+    assert "repeat(7, 1fr)" in week_css
+    assert "width: 100%" in css[css.index(".meds-chip {"):css.index(".meds-chip {") + 300]
     # Chip click still opens composition.
     assert "setCompSel({ itemId: c.first.item_id" in tsx
 
