@@ -297,12 +297,19 @@ def test_week_chip_kind_icons_repeated_per_amount():
     # Kind drives glyph choice: medication -> capsule, otherwise leaf.
     assert "c.first.kind === 'medication'" in tsx
     assert "isMedication ? <CapsuleIcon" in tsx and ": <LeafIcon" in tsx
-    # Quantity: ONE cluster with N overlapping glyphs, N clamped 1..5
-    # (amount >5 also shows 5), each offset 2px so cluster is 14->22px.
+    # Quantity: N DISTINCT separated glyphs, N clamped 1..5, each >=10px
+    # with a >=2px gap — never overlapping (2 overlapping leaves look like 1).
     assert "Math.max(1, Math.min(5, Math.round(count)))" in tsx
     assert "Array.from({ length: iconCount }" in tsx
-    assert "left: `${i * 2}px`" in tsx
-    assert "14 + (iconCount - 1) * 2" in tsx
+    assert "CLUSTER_SIZES" in tsx
+    # Every allowed size/gap pair satisfies glyph >=10px, gap >=2px (N=1 gap 0).
+    for size, gap in [(14, 0), (12, 4), (11, 3), (10, 3), (10, 2)]:
+        assert size >= 10 and (gap == 0 or gap >= 2)
+        assert f"size: {size}" in tsx and f"gap: {gap}" in tsx
+    # No overlap mechanics: no absolute positioning, no per-glyph left offset.
+    assert "left: `${i * 2}px`" not in tsx
+    assert "position: absolute" not in css[css.index(".meds-chip-icon"):css.index(".meds-chip-icon") + 400]
+    assert "position: absolute" not in css[css.index(".meds-chip-leaf"):css.index(".meds-chip-leaf") + 400]
     # Chip block: single cluster component, no emoji, short_name abbreviation.
     start = tsx.index("groupDayChips(doses).map")
     chip_block = tsx[start:tsx.index("</button>", start)]
@@ -317,10 +324,10 @@ def test_week_chip_kind_icons_repeated_per_amount():
     assert "shortName(c.first.name, c.first.short_name)" in tsx
     # Abbreviation gets full width: cluster flex:none, name flex:1 min-width:0,
     # chip/wrap width:100%, week columns equal 1fr.
-    icon_css = css[css.index(".meds-chip-icon {"):css.index(".meds-chip-icon {") + 300]
-    assert "position: relative" in icon_css and "flex: none" in icon_css
-    glyph_css = css[css.index(".meds-chip-leaf"):css.index(".meds-chip-leaf") + 300]
-    assert "position: absolute" in glyph_css
+    icon_css = css[css.index(".meds-chip-icon {"):css.index(".meds-chip-icon {") + 400]
+    assert "display: inline-flex" in icon_css and "flex: none" in icon_css
+    glyph_css = css[css.index(".meds-chip-leaf"):css.index(".meds-chip-leaf") + 400]
+    assert "display: block" in glyph_css and "flex: none" in glyph_css
     name_css = css[css.index(".meds-chip-name"):css.index(".meds-chip-name") + 300]
     assert "flex: 1 1 auto" in name_css and "min-width: 0" in name_css
     week_css = css[css.index(".meds-week"):css.index(".meds-week") + 300]

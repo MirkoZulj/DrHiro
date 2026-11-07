@@ -106,20 +106,20 @@ function shortName(name: string, fallback?: string | null): string {
   return (space > 3 ? cut.slice(0, space) : cut).trim()
 }
 
-/** Single leaf glyph (14px, currentColor) — repeated INSIDE one cluster container. */
-function LeafIcon({ style }: { style?: React.CSSProperties }) {
+/** Single leaf glyph — size set by ChipClusterIcon (10-14px, currentColor). */
+function LeafIcon({ size }: { size: number }) {
   return (
-    <svg className="meds-chip-leaf" style={style} viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
+    <svg className="meds-chip-leaf" viewBox="0 0 24 24" width={size} height={size} aria-hidden="true" focusable="false">
       <path d="M20 4C10.5 4 4 10.5 4 20c9.5 0 16-6.5 16-16z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
       <path d="M4 20C8 14 12 10 20 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   )
 }
 
-/** Single capsule glyph (14px, currentColor) — repeated INSIDE one cluster container. */
-function CapsuleIcon({ style }: { style?: React.CSSProperties }) {
+/** Single capsule glyph — size set by ChipClusterIcon (10-14px, currentColor). */
+function CapsuleIcon({ size }: { size: number }) {
   return (
-    <svg className="meds-chip-capsule" style={style} viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
+    <svg className="meds-chip-capsule" viewBox="0 0 24 24" width={size} height={size} aria-hidden="true" focusable="false">
       <g transform="rotate(45 12 12)">
         <path d="M7 8h5v8H8a4 4 0 0 1-4-4 4 4 0 0 1 4-4z" fill="currentColor" />
         <rect x="4" y="8" width="16" height="8" rx="4" fill="none" stroke="currentColor" strokeWidth="1.6" />
@@ -130,20 +130,41 @@ function CapsuleIcon({ style }: { style?: React.CSSProperties }) {
 }
 
 /**
- * ONE clustered icon container per chip: N leaves (supplements) or N capsules
- * (medications) overlapping as a single glyph. N = clamp(amount, 1, 5);
- * each extra glyph is offset 2px right, so the cluster grows 14px -> 22px.
- * No separate spaced icons, no count text.
+ * ONE icon container per chip: N DISTINCT, SEPARATED leaves (supplements)
+ * or capsules (medications) in a horizontal flex row — never overlapping,
+ * so the count is instantly countable by eye even at phone size.
+ *
+ * Each glyph is >=10px with a >=2px gap (pitch = size + gap), same baseline.
+ * Glyph size tapers as N grows so the whole cluster stays <=58px and the
+ * abbreviation (Mg, MultiV, Omega3) never truncates in a 1/7 week column:
+ *   N=1: 14px/0px gap = 14px    N=2: 12px/4px = 28px
+ *   N=3: 11px/3px = 39px        N=4: 10px/3px = 49px
+ *   N=5: 10px/2px = 58px
+ * Omega3 (6 chars, ~42px) + 2 leaves (28px) + gaps/padding = ~90px < 105px
+ * desktop column; on mobile (<640px) chips are full-width rows.
  */
+const CLUSTER_SIZES: Record<number, { size: number; gap: number }> = {
+  1: { size: 14, gap: 0 },
+  2: { size: 12, gap: 4 },
+  3: { size: 11, gap: 3 },
+  4: { size: 10, gap: 3 },
+  5: { size: 10, gap: 2 },
+}
+
 function ChipClusterIcon({ count, isMedication }: { count: number; isMedication: boolean }) {
   const iconCount = Math.max(1, Math.min(5, Math.round(count)))
+  const { size, gap } = CLUSTER_SIZES[iconCount]
   const kindClass = isMedication ? 'meds-chip-icon--capsule' : 'meds-chip-icon--leaf'
   return (
-    <span className={`meds-chip-icon ${kindClass}`} style={{ width: `${14 + (iconCount - 1) * 2}px` }} aria-hidden="true">
-      {Array.from({ length: iconCount }, (_, i) => {
-        const style: React.CSSProperties = { left: `${i * 2}px` }
-        return isMedication ? <CapsuleIcon key={i} style={style} /> : <LeafIcon key={i} style={style} />
-      })}
+    <span
+      className={`meds-chip-icon ${kindClass}`}
+      data-count={iconCount}
+      style={{ gap: `${gap}px` }}
+      aria-hidden="true"
+    >
+      {Array.from({ length: iconCount }, (_, i) =>
+        isMedication ? <CapsuleIcon key={i} size={size} /> : <LeafIcon key={i} size={size} />,
+      )}
     </span>
   )
 }
