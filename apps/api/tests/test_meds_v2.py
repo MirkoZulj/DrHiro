@@ -256,7 +256,7 @@ def test_chip_layout_and_edit_popup_present():
     tsx = _web_src("apps/web/src/views/Medications.tsx")
     css = _web_src("apps/web/src/index.css")
     assert "meds-chip-name" in tsx and "meds-chip-name" in css
-    assert "meds-chip-x" in tsx and "flex: none" in css
+    assert "meds-chip-count" in tsx and "flex: none" in css
     assert "min-width: 0" in css
     assert "EditCompositionForm" in tsx
     assert "Edit composition" in tsx
@@ -281,4 +281,29 @@ def test_migration_single_head_and_guarded():
     assert heads == {"a7b8c9d0e1f2"}, heads
     mig = (versions / "a7b8c9d0e1f2_meds_short_name.py").read_text(encoding="utf-8")
     assert "ADD COLUMN IF NOT EXISTS short_name" in mig
+
+def test_week_chip_pill_icons_and_external_count():
+    tsx = _web_src("apps/web/src/views/Medications.tsx")
+    css = _web_src("apps/web/src/index.css")
+    # Pill icon (SVG, deterministic) replaces the leaf emoji in week chips.
+    assert "PillIcon" in tsx and "meds-chip-icon" in tsx and "meds-chip-icon" in css
+    assert "meds-chip-icons" in tsx and "meds-chip-icons" in css
+    # Two icons when amount > 1, capped at two (one always + conditional second).
+    assert tsx.count("<PillIcon />") == 2
+    assert "c.total > 1 && <PillIcon />" in tsx
+    # Chip block itself: no leaf emoji, no pill emoji, short_name abbreviation used.
+    start = tsx.index("groupDayChips(doses).map")
+    chip_block = tsx[start:tsx.index("</button>", start)]
+    assert "🌿" not in chip_block
+    assert "💊" not in chip_block
+    assert "shortName(c.first.name, c.first.short_name)" in tsx
+    # ×n is OUTSIDE the pill: meds-chip-count is a sibling after </button>, inside meds-chip-wrap.
+    assert "meds-chip-wrap" in tsx and "meds-chip-wrap" in css
+    assert "meds-chip-x" not in tsx and "meds-chip-x" not in css
+    count_idx = tsx.index("meds-chip-count")
+    assert tsx.index("</button>", start) < count_idx
+    assert "</span>" in tsx[count_idx:]  # count renders before wrap closes
+    assert ".meds-chip-count" in css and ".meds-chip-wrap" in css
+    # Chip click still opens composition.
+    assert "setCompSel({ itemId: c.first.item_id" in tsx
 

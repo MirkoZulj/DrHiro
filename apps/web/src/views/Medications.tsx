@@ -106,6 +106,19 @@ function shortName(name: string, fallback?: string | null): string {
   return (space > 3 ? cut.slice(0, space) : cut).trim()
 }
 
+/** Deterministic two-tone capsule icon (no emoji). 14px, currentColor. */
+function PillIcon() {
+  return (
+    <svg className="meds-chip-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
+      <g transform="rotate(45 12 12)">
+        <path d="M7 8h5v8H8a4 4 0 0 1-4-4 4 4 0 0 1 4-4z" fill="currentColor" />
+        <rect x="4" y="8" width="16" height="8" rx="4" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <path d="M12 8v8" stroke="currentColor" strokeWidth="1.6" />
+      </g>
+    </svg>
+  )
+}
+
 function hashColorIdx(itemId: string): number {
   let h = 0
   for (let i = 0; i < itemId.length; i++) h = (h * 31 + itemId.charCodeAt(i)) >>> 0
@@ -342,17 +355,21 @@ export default function Medications() {
                           <span className="meds-empty-dot" aria-label="Nothing taken">·</span>
                         ) : (
                           groupDayChips(doses).map((c) => (
-                            <button
-                              key={c.key}
-                              type="button"
-                              className="meds-chip"
-                              onClick={() => setCompSel({ itemId: c.first.item_id, name: c.first.name, kind: c.first.kind, scope: 'day', date: key })}
-                              aria-label={`${c.first.name}, ${trimNum(c.total, 1)}${c.first.unit_label ? ` ${c.first.unit_label}` : ''}${c.count > 1 ? `, logged ${c.count} times` : ''}`}
-                            >
-                              <span aria-hidden="true">{c.first.kind === 'medication' ? '💊' : '🌿'}</span>{' '}
-                              <span className="meds-chip-name">{shortName(c.first.name, c.first.short_name)}</span>
-                              {(c.total !== 1 || c.count > 1) && <span className="meds-chip-x">×{trimNum(c.total, 1)}</span>}
-                            </button>
+                            <span key={c.key} className="meds-chip-wrap">
+                              <button
+                                type="button"
+                                className="meds-chip"
+                                onClick={() => setCompSel({ itemId: c.first.item_id, name: c.first.name, kind: c.first.kind, scope: 'day', date: key })}
+                                aria-label={`${c.first.name}, ${trimNum(c.total, 1)}${c.first.unit_label ? ` ${c.first.unit_label}` : ''}${c.count > 1 ? `, logged ${c.count} times` : ''}`}
+                              >
+                                <span className="meds-chip-icons" aria-hidden="true">
+                                  <PillIcon />
+                                  {c.total > 1 && <PillIcon />}
+                                </span>
+                                <span className="meds-chip-name">{shortName(c.first.name, c.first.short_name)}</span>
+                              </button>
+                              {(c.total !== 1 || c.count > 1) && <span className="meds-chip-count">×{trimNum(c.total, 1)}</span>}
+                            </span>
                           ))
                         )}
                       </div>

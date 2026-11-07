@@ -2252,18 +2252,23 @@ button.link:hover { background: none; text-decoration: underline; }
 .meds-day--today { border-color: var(--color-accent); box-shadow: var(--shadow-sm); background: var(--color-accent-subtle); }
 .meds-day-label { font-size: var(--text-sm); font-weight: var(--weight-semibold); color: var(--color-text-secondary); margin-bottom: var(--space-2); display: flex; justify-content: space-between; align-items: center; gap: 4px; }
 .meds-today-tag { font-size: var(--text-xs); color: var(--color-accent-text); font-weight: var(--weight-bold); }
-.meds-day-chips { display: flex; flex-direction: column; gap: var(--space-1); }
+.meds-day-chips { display: flex; flex-direction: column; gap: var(--space-1); align-items: stretch; }
+/* Wrap holds the pill + the ×n badge OUTSIDE the pill background. */
+.meds-chip-wrap { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; }
 .meds-chip {
   display: inline-flex; align-items: center; gap: 4px; min-height: 32px;
-  min-width: 0; max-width: 100%; overflow-wrap: anywhere; hyphens: auto;
+  flex: 1 1 auto; min-width: 0; max-width: 100%; overflow-wrap: anywhere; hyphens: auto;
   padding: var(--space-1) var(--space-2); border-radius: var(--radius-full);
   background: var(--color-accent-subtle); color: var(--color-accent-text);
   border: 1px solid var(--color-accent-border); font-size: var(--text-sm);
   font-weight: var(--weight-medium); text-align: left; cursor: pointer;
 }
 .meds-chip:hover { background: var(--color-surface-subtle); }
-.meds-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.meds-chip-x { font-weight: var(--weight-bold); flex: none; margin-left: auto; padding-left: 6px; }
+.meds-chip-icons { display: inline-flex; align-items: center; gap: 1px; flex: none; }
+.meds-chip-icon { width: 14px; height: 14px; flex: none; }
+.meds-chip-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ×n lives outside .meds-chip (sibling in .meds-chip-wrap), never inside the pill. */
+.meds-chip-count { font-weight: var(--weight-bold); flex: none; color: var(--color-accent-text); font-size: var(--text-sm); white-space: nowrap; }
 .meds-edit-row { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-2); margin-bottom: var(--space-2); }
 .meds-edit-row-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-2); }
 .meds-empty-dot { color: var(--color-text-disabled); font-size: var(--text-lg); text-align: center; padding-top: var(--space-2); }
