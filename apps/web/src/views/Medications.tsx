@@ -106,7 +106,8 @@ function shortName(name: string, fallback?: string | null): string {
   return (space > 3 ? cut.slice(0, space) : cut).trim()
 }
 
-/** Single leaf glyph — size set by ChipClusterIcon (10-14px, currentColor). */
+/** Single leaf glyph — size set by ChipClusterIcon (fixed 12px for every N,
+ * identical path/rotation every instance; no stem, no sprout composite). */
 function LeafIcon({ size }: { size: number }) {
   return (
     <svg className="meds-chip-leaf" viewBox="0 0 24 24" width={size} height={size} aria-hidden="true" focusable="false">
@@ -116,7 +117,7 @@ function LeafIcon({ size }: { size: number }) {
   )
 }
 
-/** Single capsule glyph — size set by ChipClusterIcon (10-14px, currentColor). */
+/** Single capsule glyph — size set by ChipClusterIcon (fixed 12px for every N). */
 function CapsuleIcon({ size }: { size: number }) {
   return (
     <svg className="meds-chip-capsule" viewBox="0 0 24 24" width={size} height={size} aria-hidden="true" focusable="false">
@@ -130,25 +131,29 @@ function CapsuleIcon({ size }: { size: number }) {
 }
 
 /**
- * ONE icon container per chip: N DISTINCT, SEPARATED leaves (supplements)
- * or capsules (medications) in a horizontal flex row — never overlapping,
- * so the count is instantly countable by eye even at phone size.
+ * ONE icon container per chip: N IDENTICAL leaves (supplements) or
+ * capsules (medications) in a horizontal flex row — never overlapping,
+ * never a sprout/stem composite, never a different glyph per N.
  *
- * Each glyph is >=10px with a >=2px gap (pitch = size + gap), same baseline.
- * Glyph size tapers as N grows so the whole cluster stays <=58px and the
- * abbreviation (Mg, MultiV, Omega3) never truncates in a 1/7 week column:
- *   N=1: 14px/0px gap = 14px    N=2: 12px/4px = 28px
- *   N=3: 11px/3px = 39px        N=4: 10px/3px = 49px
- *   N=5: 10px/2px = 58px
- * Omega3 (6 chars, ~42px) + 2 leaves (28px) + gaps/padding = ~90px < 105px
- * desktop column; on mobile (<640px) chips are full-width rows.
+ * Every glyph in a cluster is the exact same component instance path:
+ * same SVG path, same size, same rotation, same baseline. N=2 renders
+ * two identical 12px leaves side-by-side with a 3px gap (cluster width
+ * 27px); the count is instantly countable by eye even at phone size,
+ * and the glyph never morphs into a "different icon" mid-list
+ * (owner 2026-11-08: 2-leaf cluster read as a sprout).
+ *
+ * One fixed glyph size for ALL N: size 12px (>=10px), gap 3px (>=2px):
+ *   N=1: 12px   N=2: 27px   N=3: 42px   N=4: 57px   N=5: 72px
+ * With the 13px chip font, Om3 (3 chars) + 2 leaves fits a 1/7 week
+ * column without ellipsis (see index.css .meds-chip-name flex:1,
+ * min-width:0; .meds-chip-icon / glyphs flex:none; chip width:100%).
  */
 const CLUSTER_SIZES: Record<number, { size: number; gap: number }> = {
-  1: { size: 14, gap: 0 },
-  2: { size: 12, gap: 4 },
-  3: { size: 11, gap: 3 },
-  4: { size: 10, gap: 3 },
-  5: { size: 10, gap: 2 },
+  1: { size: 12, gap: 3 },
+  2: { size: 12, gap: 3 },
+  3: { size: 12, gap: 3 },
+  4: { size: 12, gap: 3 },
+  5: { size: 12, gap: 3 },
 }
 
 function ChipClusterIcon({ count, isMedication }: { count: number; isMedication: boolean }) {
@@ -406,8 +411,9 @@ export default function Medications() {
                         ) : (
                           groupDayChips(doses).map((c) => {
                             // Quantity: ONE clustered icon container holding
-                            // 1-5 overlapping leaves/capsules (capped at 5).
-                            // No separate icons, no count text anywhere.
+                            // 1-5 IDENTICAL, separated leaves/capsules (capped
+                            // at 5, fixed 12px glyph). No separate icons, no
+                            // overlap, no sprout/stem composite, no count text.
                             const isMedication = c.first.kind === 'medication'
                             return (
                             <span key={c.key} className="meds-chip-wrap">

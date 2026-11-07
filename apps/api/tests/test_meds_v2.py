@@ -297,15 +297,32 @@ def test_week_chip_kind_icons_repeated_per_amount():
     # Kind drives glyph choice: medication -> capsule, otherwise leaf.
     assert "c.first.kind === 'medication'" in tsx
     assert "isMedication ? <CapsuleIcon" in tsx and ": <LeafIcon" in tsx
-    # Quantity: N DISTINCT separated glyphs, N clamped 1..5, each >=10px
-    # with a >=2px gap — never overlapping (2 overlapping leaves look like 1).
+    # Quantity: N DISTINCT separated glyphs, N clamped 1..5 — IDENTICAL
+    # glyphs: one fixed size/gap for every N (owner 2026-11-08: size-tapered
+    # 2-leaf cluster read as a different 'sprout' icon). >=10px, >=2px gap.
     assert "Math.max(1, Math.min(5, Math.round(count)))" in tsx
     assert "Array.from({ length: iconCount }" in tsx
     assert "CLUSTER_SIZES" in tsx
-    # Every allowed size/gap pair satisfies glyph >=10px, gap >=2px (N=1 gap 0).
-    for size, gap in [(14, 0), (12, 4), (11, 3), (10, 3), (10, 2)]:
-        assert size >= 10 and (gap == 0 or gap >= 2)
-        assert f"size: {size}" in tsx and f"gap: {gap}" in tsx
+    # Parse CLUSTER_SIZES: every N has the SAME size and gap (no taper, no
+    # per-N variant glyph), satisfying glyph >=10px and gap >=2px.
+    _cluster_body = tsx[tsx.index("const CLUSTER_SIZES"):tsx.index("function ChipClusterIcon")]
+    import re as _re
+    _pairs = _re.findall(r"(\d): \{ size: (\d+), gap: (\d+) \}", _cluster_body)
+    assert [n for n, _, _ in _pairs] == ["1", "2", "3", "4", "5"], _pairs
+    _sizes = {int(s) for _, s, _ in _pairs}
+    _gaps = {int(g) for _, _, g in _pairs}
+    assert _sizes == {12} and _gaps == {3}, (_sizes, _gaps)
+    assert all(s >= 10 and g >= 2 for s in _sizes for g in _gaps)
+    # Leaf identity: the one true leaf path appears exactly once in the whole
+    # file (a single LeafIcon definition, reused for every glyph) — no stem,
+    # no second leaf path, no sprout composite variant.
+    _leaf_path = "M20 4C10.5 4 4 10.5 4 20c9.5 0 16-6.5 16-16z"
+    _leaf_vein = "M4 20C8 14 12 10 20 4"
+    assert tsx.count(_leaf_path) == 1 and tsx.count(_leaf_vein) == 1
+    _leaf_fn = tsx[tsx.index("function LeafIcon"):tsx.index("function CapsuleIcon")]
+    assert _leaf_path in _leaf_fn and _leaf_vein in _leaf_fn
+    assert "rotate(" not in _leaf_fn and "transform=" not in _leaf_fn  # no per-glyph rotation
+    assert "<circle" not in _leaf_fn and "<line" not in _leaf_fn  # no stem/sprout bits
     # No overlap mechanics: no absolute positioning, no per-glyph left offset.
     assert "left: `${i * 2}px`" not in tsx
     assert "position: absolute" not in css[css.index(".meds-chip-icon"):css.index(".meds-chip-icon") + 400]
@@ -323,7 +340,8 @@ def test_week_chip_kind_icons_repeated_per_amount():
     assert "meds-chip-x" not in tsx and "meds-chip-x" not in css
     assert "shortName(c.first.name, c.first.short_name)" in tsx
     # Abbreviation gets full width: cluster flex:none, name flex:1 min-width:0,
-    # chip/wrap width:100%, week columns equal 1fr.
+    # chip/wrap width:100%, week columns equal 1fr. Chip font 13px (--text-sm)
+    # so Om3+2 leaves fits a 1/7 week column at 375px without ellipsis.
     icon_css = css[css.index(".meds-chip-icon {"):css.index(".meds-chip-icon {") + 400]
     assert "display: inline-flex" in icon_css and "flex: none" in icon_css
     glyph_css = css[css.index(".meds-chip-leaf"):css.index(".meds-chip-leaf") + 400]
@@ -333,6 +351,23 @@ def test_week_chip_kind_icons_repeated_per_amount():
     week_css = css[css.index(".meds-week"):css.index(".meds-week") + 300]
     assert "repeat(7, 1fr)" in week_css
     assert "width: 100%" in css[css.index(".meds-chip {"):css.index(".meds-chip {") + 300]
+    chip_css = css[css.index(".meds-chip {"):css.index(".meds-chip {") + 700]
+    assert "font-size: var(--text-sm)" in chip_css
+    tokens = _web_src("apps/web/src/design/tokens.css")
+    import re as _re2
+    _sm = _re2.search(r"--text-sm:\s*(\d+)px", tokens)
+    assert _sm and 12 <= int(_sm.group(1)) <= 13, _sm and _sm.group(0)
+    # 375px-viewport fit budget for the owner's four chips, using 13px text
+    # (~7.5px avg per char at 13px), cluster 2*12+3=27px, gaps+padding ~20px,
+    # and a 1/7 week column of >= (375 - page padding) / 1 row >= 48px
+    # (chips wrap to rows <640px, so each chip gets the full ~330px row;
+    # at >=780px desktop the 1/7 column is ~100px inner).
+    _cluster2 = 2 * 12 + 3
+    for _label, _n in [("MultiV", 1), ("Osteo", 1), ("Mg", 2), ("Om3", 2)]:
+        _cluster = 12 if _n == 1 else _cluster2
+        _needed = len(_label) * 7.5 + _cluster + 20
+        assert _needed < 330, (_label, _needed)  # full-row chips at 375px
+        assert _needed < 100, (_label, _needed)  # 1/7 desktop column (>=780px)
     # Chip click still opens composition.
     assert "setCompSel({ itemId: c.first.item_id" in tsx
 

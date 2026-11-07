@@ -2264,10 +2264,14 @@ button.link:hover { background: none; text-decoration: underline; }
   font-weight: var(--weight-medium); text-align: left; cursor: pointer;
 }
 .meds-chip:hover { background: var(--color-surface-subtle); }
-/* ONE icon container per chip: inline-flex row of N DISTINCT glyphs with a
-   real gap (>=2px) between each — never overlapping, so the count is
-   instantly countable. Width grows with N: 14px (N=1) up to 58px (N=5).
-   Glyphs are static (flex items, same baseline), not absolutely positioned. */
+/* ONE icon container per chip: inline-flex row of N IDENTICAL glyphs with a
+   real gap (3px) between each — never overlapping, never a sprout composite,
+   so the count is instantly countable. Every glyph is the same 12px size for
+   every N: cluster width 12px (N=1) up to 72px (N=5). Glyphs are static
+   (flex items, same baseline), not absolutely positioned. Chip text is 13px
+   (--text-sm); with name flex:1 min-width:0 + ellipsis and Om3 (3 chars) +
+   2 leaves (27px), all of MultiV/Osteo/Mg/Om3 fit a 1/7 week column at
+   375px viewport (chip width:100%, icons/glyphs flex:none) without ellipsis. */
 .meds-chip-icon { display: inline-flex; align-items: center; height: 14px; flex: none; }
 .meds-chip-leaf, .meds-chip-capsule { display: block; flex: none; }
 .meds-chip-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
