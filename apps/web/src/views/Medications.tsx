@@ -106,26 +106,45 @@ function shortName(name: string, fallback?: string | null): string {
   return (space > 3 ? cut.slice(0, space) : cut).trim()
 }
 
-/** Leaf icon for supplements (SVG, no emoji). 14px, currentColor. */
-function LeafIcon() {
+/** Single leaf glyph (14px, currentColor) — repeated INSIDE one cluster container. */
+function LeafIcon({ style }: { style?: React.CSSProperties }) {
   return (
-    <svg className="meds-chip-icon meds-chip-icon--leaf" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
+    <svg className="meds-chip-leaf" style={style} viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
       <path d="M20 4C10.5 4 4 10.5 4 20c9.5 0 16-6.5 16-16z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
       <path d="M4 20C8 14 12 10 20 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   )
 }
 
-/** Capsule icon for medications (SVG, no emoji). 14px, currentColor. */
-function CapsuleIcon() {
+/** Single capsule glyph (14px, currentColor) — repeated INSIDE one cluster container. */
+function CapsuleIcon({ style }: { style?: React.CSSProperties }) {
   return (
-    <svg className="meds-chip-icon meds-chip-icon--capsule" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
+    <svg className="meds-chip-capsule" style={style} viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
       <g transform="rotate(45 12 12)">
         <path d="M7 8h5v8H8a4 4 0 0 1-4-4 4 4 0 0 1 4-4z" fill="currentColor" />
         <rect x="4" y="8" width="16" height="8" rx="4" fill="none" stroke="currentColor" strokeWidth="1.6" />
         <path d="M12 8v8" stroke="currentColor" strokeWidth="1.6" />
       </g>
     </svg>
+  )
+}
+
+/**
+ * ONE clustered icon container per chip: N leaves (supplements) or N capsules
+ * (medications) overlapping as a single glyph. N = clamp(amount, 1, 5);
+ * each extra glyph is offset 2px right, so the cluster grows 14px -> 22px.
+ * No separate spaced icons, no count text.
+ */
+function ChipClusterIcon({ count, isMedication }: { count: number; isMedication: boolean }) {
+  const iconCount = Math.max(1, Math.min(5, Math.round(count)))
+  const kindClass = isMedication ? 'meds-chip-icon--capsule' : 'meds-chip-icon--leaf'
+  return (
+    <span className={`meds-chip-icon ${kindClass}`} style={{ width: `${14 + (iconCount - 1) * 2}px` }} aria-hidden="true">
+      {Array.from({ length: iconCount }, (_, i) => {
+        const style: React.CSSProperties = { left: `${i * 2}px` }
+        return isMedication ? <CapsuleIcon key={i} style={style} /> : <LeafIcon key={i} style={style} />
+      })}
+    </span>
   )
 }
 
@@ -365,10 +384,9 @@ export default function Medications() {
                           <span className="meds-empty-dot" aria-label="Nothing taken">·</span>
                         ) : (
                           groupDayChips(doses).map((c) => {
-                            // Quantity is shown by REPEATING the kind icon
-                            // (1 leaf/capsule = 1, 2 = 2, 3 = 3). No count text
-                            // inside the pill; count outside only as >3 fallback.
-                            const iconCount = Math.max(1, Math.min(3, Math.round(c.total)))
+                            // Quantity: ONE clustered icon container holding
+                            // 1-5 overlapping leaves/capsules (capped at 5).
+                            // No separate icons, no count text anywhere.
                             const isMedication = c.first.kind === 'medication'
                             return (
                             <span key={c.key} className="meds-chip-wrap">
@@ -378,14 +396,9 @@ export default function Medications() {
                                 onClick={() => setCompSel({ itemId: c.first.item_id, name: c.first.name, kind: c.first.kind, scope: 'day', date: key })}
                                 aria-label={`${c.first.name}, ${trimNum(c.total, 1)}${c.first.unit_label ? ` ${c.first.unit_label}` : ''}${c.count > 1 ? `, logged ${c.count} times` : ''}`}
                               >
-                                <span className="meds-chip-icons" aria-hidden="true">
-                                  {Array.from({ length: iconCount }, (_, i) => (
-                                    isMedication ? <CapsuleIcon key={i} /> : <LeafIcon key={i} />
-                                  ))}
-                                </span>
+                                <ChipClusterIcon count={c.total} isMedication={isMedication} />
                                 <span className="meds-chip-name">{shortName(c.first.name, c.first.short_name)}</span>
                               </button>
-                              {c.total > 3 && <span className="meds-chip-count">×{trimNum(c.total, 1)}</span>}
                             </span>
                             )
                           })

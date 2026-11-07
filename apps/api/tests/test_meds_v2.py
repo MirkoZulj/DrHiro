@@ -256,7 +256,7 @@ def test_chip_layout_and_edit_popup_present():
     tsx = _web_src("apps/web/src/views/Medications.tsx")
     css = _web_src("apps/web/src/index.css")
     assert "meds-chip-name" in tsx and "meds-chip-name" in css
-    assert "meds-chip-count" in tsx and "flex: none" in css
+    assert "meds-chip-icon" in tsx and "flex: none" in css
     assert "min-width: 0" in css
     assert "EditCompositionForm" in tsx
     assert "Edit composition" in tsx
@@ -285,37 +285,42 @@ def test_migration_single_head_and_guarded():
 def test_week_chip_kind_icons_repeated_per_amount():
     tsx = _web_src("apps/web/src/views/Medications.tsx")
     css = _web_src("apps/web/src/index.css")
-    # Kind-based SVG icons (no emoji, no PillIcon-only logic).
+    # Kind-based glyphs (no emoji, no PillIcon-only logic).
     assert "LeafIcon" in tsx and "CapsuleIcon" in tsx
     assert "PillIcon" not in tsx
+    assert "ChipClusterIcon" in tsx
+    # ALWAYS one icon container per chip, kind-classed.
     assert "meds-chip-icon" in tsx and "meds-chip-icon" in css
     assert "meds-chip-icon--leaf" in tsx and "meds-chip-icon--capsule" in tsx
-    assert "meds-chip-icons" in tsx and "meds-chip-icons" in css
-    # Kind drives icon choice: medication -> capsule, otherwise leaf.
+    # No separate spaced-icons wrapper.
+    assert "meds-chip-icons" not in tsx and "meds-chip-icons" not in css
+    # Kind drives glyph choice: medication -> capsule, otherwise leaf.
     assert "c.first.kind === 'medication'" in tsx
     assert "isMedication ? <CapsuleIcon" in tsx and ": <LeafIcon" in tsx
-    # Quantity is conveyed by repeating the icon: 1/2/3, capped at 3.
-    assert "Math.max(1, Math.min(3, Math.round(c.total)))" in tsx
+    # Quantity: ONE cluster with N overlapping glyphs, N clamped 1..5
+    # (amount >5 also shows 5), each offset 2px so cluster is 14->22px.
+    assert "Math.max(1, Math.min(5, Math.round(count)))" in tsx
     assert "Array.from({ length: iconCount }" in tsx
-    # Chip block itself: no leaf emoji, no pill emoji, short_name abbreviation used.
+    assert "left: `${i * 2}px`" in tsx
+    assert "14 + (iconCount - 1) * 2" in tsx
+    # Chip block: single cluster component, no emoji, short_name abbreviation.
     start = tsx.index("groupDayChips(doses).map")
     chip_block = tsx[start:tsx.index("</button>", start)]
+    assert "<ChipClusterIcon count={c.total} isMedication={isMedication} />" in chip_block
     assert "🌿" not in chip_block
     assert "💊" not in chip_block
-    # No ×n text inside the pill (.meds-chip button).
+    # No ×n text at all: not inside pill, not as >3 fallback, nowhere in chip code/CSS.
     assert "×" not in chip_block
-    assert "meds-chip-count" not in chip_block
+    assert "meds-chip-count" not in tsx and "meds-chip-count" not in css
+    assert "c.total > 3" not in tsx and "Math.min(3," not in tsx
     assert "meds-chip-x" not in tsx and "meds-chip-x" not in css
     assert "shortName(c.first.name, c.first.short_name)" in tsx
-    # ×n only as >3 fallback, OUTSIDE the pill: sibling after </button>, in wrap.
-    assert "{c.total > 3 && <span className=\"meds-chip-count\">" in tsx
-    assert "(c.total !== 1" not in tsx and "c.count > 1) && <span className=\"meds-chip-count\"" not in tsx
-    count_idx = tsx.index("meds-chip-count")
-    assert tsx.index("</button>", start) < count_idx
-    assert ".meds-chip-count" in css and ".meds-chip-wrap" in css
-    # Abbreviation gets full width: icons flex:none, name flex:1 min-width:0,
+    # Abbreviation gets full width: cluster flex:none, name flex:1 min-width:0,
     # chip/wrap width:100%, week columns equal 1fr.
-    assert ".meds-chip-icons" in css and "flex: none" in css
+    icon_css = css[css.index(".meds-chip-icon {"):css.index(".meds-chip-icon {") + 300]
+    assert "position: relative" in icon_css and "flex: none" in icon_css
+    glyph_css = css[css.index(".meds-chip-leaf"):css.index(".meds-chip-leaf") + 300]
+    assert "position: absolute" in glyph_css
     name_css = css[css.index(".meds-chip-name"):css.index(".meds-chip-name") + 300]
     assert "flex: 1 1 auto" in name_css and "min-width: 0" in name_css
     week_css = css[css.index(".meds-week"):css.index(".meds-week") + 300]
