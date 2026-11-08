@@ -282,37 +282,47 @@ def test_migration_single_head_and_guarded():
     mig = (versions / "a7b8c9d0e1f2_meds_short_name.py").read_text(encoding="utf-8")
     assert "ADD COLUMN IF NOT EXISTS short_name" in mig
 
-def test_week_chip_polished_separated_icons():
+def test_week_chip_bundled_fan_icons():
     import re as _re
     tsx = _web_src("apps/web/src/views/Medications.tsx")
     css = _web_src("apps/web/src/index.css")
-    # Owner 2026-11-08 rejected the fan as "ugly": polished separated
-    # cluster — N IDENTICAL glyphs in ONE container, no fan/shared-base.
-    assert "LeafBundleIcon" not in tsx and "CapsuleBundleIcon" not in tsx
-    assert "FAN_ANGLES" not in tsx and "FAN_BASE" not in tsx and "BUNDLE_WIDTHS" not in tsx
-    assert "function LeafIcon" in tsx and "function CapsuleIcon" in tsx
+    # Owner 2026-11-08 reference ("Wrong again. Something like this"):
+    # bundled fan — ONE svg, N filled leaves/capsules fanned from one base,
+    # alternating light/dark greens, tips distinct.
+    assert "function LeafBundleIcon" in tsx and "function CapsuleBundleIcon" in tsx
+    assert "function FanBundle" in tsx
+    assert "function LeafIcon" not in tsx and "function CapsuleIcon" not in tsx
     assert "PillIcon" not in tsx
     assert "ChipClusterIcon" in tsx
     assert "meds-chip-icon" in tsx and "meds-chip-icon" in css
     assert "meds-chip-icon--leaf" in tsx and "meds-chip-icon--capsule" in tsx
     assert "meds-chip-icons" not in tsx and "meds-chip-icons" not in css
     assert "c.first.kind === 'medication'" in tsx
-    assert "isMedication ? <CapsuleIcon" in tsx and ": <LeafIcon" in tsx
-    # Identical glyphs for every N: one LeafIcon/CapsuleIcon definition,
-    # fixed 14px size, 4px gap, rendered N times via Array.from.
-    assert tsx.count("function LeafIcon") == 1 and tsx.count("function CapsuleIcon") == 1
-    assert "const GLYPH_SIZE = 14" in tsx and "const GLYPH_GAP = 4" in tsx
-    _leaf_body = tsx[tsx.index("function LeafIcon"):tsx.index("function CapsuleIcon")]
-    _cap_body = tsx[tsx.index("function CapsuleIcon"):tsx.index("function ChipClusterIcon")]
-    assert "width={GLYPH_SIZE}" in _leaf_body and "width={GLYPH_SIZE}" in _cap_body
-    assert "rotate(${angle}" not in tsx and "FAN_" not in tsx
-    assert "Array.from({ length: iconCount }" in tsx
+    assert "isMedication ? <CapsuleBundleIcon" in tsx and ": <LeafBundleIcon" in tsx
+    # One svg per count: FAN_ANGLES gives N rays, rendered once via angles.map.
+    assert "FAN_ANGLES" in tsx and "BUNDLE_WIDTHS" in tsx
+    for _n, _angles in [(1, "[0]"), (2, "[-22, 22]"), (3, "[-34, 0, 34]"),
+                        (4, "[-42, -14, 14, 42]"), (5, "[-50, -25, 0, 25, 50]")]:
+        assert _angles in tsx, (_n, _angles)
+    assert "angles.map((angle" in tsx
+    assert "clampCount" in tsx
     assert "Math.max(1, Math.min(5, Math.round(count)))" in tsx
+    # Alternating fills (light/dark token greens), filled shapes, no fan lines.
+    assert "meds-bundle--light" in tsx and "meds-bundle--dark" in tsx
+    assert "pos % 2 === 0" in tsx
+    assert "meds-chip-bundle" in tsx and "meds-chip-bundle" in css
     assert "meds-chip-leaf-bundle" not in tsx and "meds-chip-capsule-bundle" not in tsx
-    assert "meds-chip-leaf" in tsx and "meds-chip-capsule" in tsx
-    # Cluster width budget: 14*N + 4*(N-1) = 14,32,50,68,86.
-    for _n, _w in [(1, 14), (2, 32), (3, 50), (4, 68), (5, 86)]:
-        assert _w == _n * 14 + (_n - 1) * 4
+    assert "meds-chip-leaf\"" not in tsx and "meds-chip-capsule\"" not in tsx
+    assert "fill=\"none\"" not in tsx
+    # Leaf and capsule are distinct shapes on the same fan.
+    assert "function leafPath" in tsx and "BUNDLE_LEAF_LEN" in tsx
+    assert "BUNDLE_CAPSULE_LEN" in tsx and "rx={BUNDLE_CAPSULE_HALF}" in tsx
+    # Rendered height 18px; viewBox widths grow 14->43 (rendered 9->28px).
+    assert "BUNDLE_RENDER_HEIGHT = 18" in tsx
+    _widths = [14, 31, 37, 41, 43]
+    assert _widths == sorted(_widths) and _widths[0] < _widths[-1]
+    for _w in _widths:
+        assert str(_w) in tsx
     # Chip block: single cluster component, no emoji, no xN text.
     start = tsx.index("groupDayChips(doses).map")
     chip_block = tsx[start:tsx.index("</button>", start)]
@@ -323,11 +333,16 @@ def test_week_chip_polished_separated_icons():
     assert "c.total > 3" not in tsx and "Math.min(3," not in tsx
     assert "meds-chip-x" not in tsx and "meds-chip-x" not in css
     assert "shortName(c.first.name, c.first.short_name)" in tsx
-    # CSS: icon box 14px, glyphs flex:none, name flex:1, chip polished.
+    # CSS: icon box 18px, bundle flex:none, alternating fills from tokens,
+    # name flex:1, chip polished.
     icon_css = css[css.index(".meds-chip-icon {"):css.index(".meds-chip-icon {") + 400]
-    assert "display: inline-flex" in icon_css and "flex: none" in icon_css and "height: 14px" in icon_css
-    glyph_css = css[css.index(".meds-chip-leaf, .meds-chip-capsule"):css.index(".meds-chip-leaf, .meds-chip-capsule") + 300]
-    assert "display: block" in glyph_css and "flex: none" in glyph_css
+    assert "display: inline-flex" in icon_css and "flex: none" in icon_css and "height: 18px" in icon_css
+    bundle_css = css[css.index(".meds-chip-bundle {"):css.index(".meds-chip-bundle {") + 300]
+    assert "display: block" in bundle_css and "flex: none" in bundle_css and "height: 18px" in bundle_css
+    light_css = css[css.index(".meds-bundle--light {"):css.index(".meds-bundle--light {") + 200]
+    dark_css = css[css.index(".meds-bundle--dark {"):css.index(".meds-bundle--dark {") + 200]
+    assert "fill: var(--color-success)" in light_css
+    assert "fill: var(--color-accent)" in dark_css
     name_css = css[css.index(".meds-chip-name"):css.index(".meds-chip-name") + 300]
     assert "flex: 1 1 auto" in name_css and "min-width: 0" in name_css
     week_css = css[css.index(".meds-week"):css.index(".meds-week") + 300]
@@ -340,8 +355,8 @@ def test_week_chip_polished_separated_icons():
     tokens = _web_src("apps/web/src/design/tokens.css")
     _sm = _re.search(r"--text-sm:\s*(\d+)px", tokens)
     assert _sm and 12 <= int(_sm.group(1)) <= 13, _sm and _sm.group(0)
-    # Fit budget with separated widths (N=2: 32px) at 13px text:
-    # Omega(5ch) + 32px + padding/gaps ~= 79px < 105px column.
-    for _label, _n in [("MultiV", 1), ("Osteo", 1), ("Mg", 2), ("Omega", 2)]:
-        _needed = len(_label) * 7.5 + (14 * _n + (_n - 1) * 4) + 32
+    # Fit budget at 13px text, widest bundle (N=5 rendered ~28px):
+    # Omega(5ch) + 28px + padding/gaps ~= 91px < 105px column.
+    for _label, _w in [("MultiV", 9), ("Osteo", 9), ("Mg", 20), ("Omega", 28)]:
+        _needed = len(_label) * 7.5 + _w + 26
         assert _needed < 105, (_label, _needed)

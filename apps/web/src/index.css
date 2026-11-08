@@ -2265,16 +2265,17 @@ button.link:hover { background: none; text-decoration: underline; }
   box-shadow: var(--shadow-card);
 }
 .meds-chip:hover { background: var(--color-surface-subtle); }
-/* ONE icon container per chip: inline-flex row of N IDENTICAL separated
-   14px glyphs with a 4px gap — distinct shapes, countable, never a fan,
-   never overlapping, never tapered. Cluster width 14px (N=1) to 86px
-   (N=5); glyphs share one baseline/color (currentColor from the chip).
-   Chip text is 13px (--text-sm); name flex:1 min-width:0 + ellipsis,
-   icon flex:none, chip width:100% — Omega (5ch) + 2 leaves ~= 79px,
-   MultiV/Osteo/Mg likewise fit a 1/7 week column without ellipsis.
-   Mobile (<640px): chips are full-width rows, even more room. */
-.meds-chip-icon { display: inline-flex; align-items: center; height: 14px; flex: none; }
-.meds-chip-leaf, .meds-chip-capsule { display: block; flex: none; }
+/* ONE icon container per chip: a single bundled fan <svg> (filled leaves
+   for supplements, capsules for meds) fanned from a shared base, tips
+   distinct, fills alternating light/dark token greens. Rendered height
+   18px, width grows with the fan (9px N=1 to 28px N=5); icon flex:none,
+   name flex:1 min-width:0 + ellipsis (Omega 5ch + 28px + padding/gaps
+   ~91px < 105px week column). Mobile (<640px): full-width rows. */
+.meds-chip-icon { display: inline-flex; align-items: center; height: 18px; flex: none; }
+.meds-chip-bundle { display: block; flex: none; height: 18px; }
+/* Alternating fan fills from tokens: light bright green / dark teal-green. */
+.meds-bundle--light { fill: var(--color-success); stroke: var(--color-accent-subtle); }
+.meds-bundle--dark { fill: var(--color-accent); stroke: var(--color-accent-subtle); }
 .meds-chip-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 639px) {
   .meds-chip { padding: 6px 10px; gap: 6px; }
