@@ -106,70 +106,111 @@ function shortName(name: string, fallback?: string | null): string {
   return (space > 3 ? cut.slice(0, space) : cut).trim()
 }
 
-/** Single leaf glyph — size set by ChipClusterIcon (fixed 12px for every N,
- * identical path/rotation every instance; no stem, no sprout composite). */
-function LeafIcon({ size }: { size: number }) {
+/**
+ * Bundled fan icons (owner 2026-11-08: "two one-leaf icons" was wrong —
+ * wanted ONE two-leaf icon, plus three/four/five-leaf icons).
+ *
+ * Leaf1..Leaf5 / Capsule1..Capsule5 are five DISTINCT single icons.
+ * Each chip renders exactly ONE <svg> element; inside it, N copies of
+ * the same leaf/capsule path are rotated around ONE shared base point
+ * at bottom-center (14, 21), like a fan. The N tips are the countable
+ * feature; the shared base makes it read as one icon, not N icons.
+ *
+ * Geometry (viewBox units, shared across all N so leaf scale is constant):
+ * - Leaf: length 16 (base y=21 to tip y=5), half-width 3, outline only
+ *   (stroke 1.6, fill none) to match the previous leaf style.
+ *   Path (defined once, reused per angle): M14 21 C11 17.5 11 11 14 5
+ *   C17 11 17 17.5 14 21 Z, vein M14 21 C14 17 14 11 14 6.
+ * - Capsule: 5 wide x 14 long (y=6..20), rx 2.5, outline + mid divider
+ *   at y=13, same rotation/base.
+ * - Fan angles (deg, symmetric about vertical, min separation 29deg):
+ *     1: [0]                     2: [-34, 34]
+ *     3: [-42, 0, 42]            4: [-51, -17, 17, 51]
+ *     5: [-58, -29, 0, 29, 58]
+ *   Tip separation at radius 16 for the tightest (29deg) fan is ~8 units
+ *   (~8px at 1:1 scale), so 2 vs 3 vs 5 stay distinguishable at phone size.
+ * - Per-N viewBox crop (centered on base x=14, y=4 height 18, so rendered
+ *   height is 18px for every N and leaf scale stays 1 unit = 1px):
+ *     widths: 1:14  2:20  3:24  4:26  5:28  (max 28px for Leaf5)
+ *   No xN text, no emoji, no separate <svg> per leaf.
+ */
+const FAN_ANGLES: Record<number, number[]> = {
+  1: [0],
+  2: [-34, 34],
+  3: [-42, 0, 42],
+  4: [-51, -17, 17, 51],
+  5: [-58, -29, 0, 29, 58],
+}
+const BUNDLE_WIDTHS: Record<number, number> = { 1: 14, 2: 20, 3: 24, 4: 26, 5: 28 }
+const BUNDLE_HEIGHT = 18
+const FAN_BASE = { x: 14, y: 21 }
+const LEAF_PATH = 'M14 21C11 17.5 11 11 14 5C17 11 17 17.5 14 21Z'
+const LEAF_VEIN = 'M14 21C14 17 14 11 14 6'
+const CAPSULE_DIVIDER = 'M11.5 13h5'
+
+function bundleViewBox(iconCount: number): string {
+  const w = BUNDLE_WIDTHS[iconCount]
+  return `${FAN_BASE.x - w / 2} 4 ${w} ${BUNDLE_HEIGHT}`
+}
+
+/** ONE <svg> containing N leaves fanning from the shared base (Leaf1..Leaf5). */
+function LeafBundleIcon({ count }: { count: number }) {
+  const iconCount = Math.max(1, Math.min(5, Math.round(count)))
+  const width = BUNDLE_WIDTHS[iconCount]
   return (
-    <svg className="meds-chip-leaf" viewBox="0 0 24 24" width={size} height={size} aria-hidden="true" focusable="false">
-      <path d="M20 4C10.5 4 4 10.5 4 20c9.5 0 16-6.5 16-16z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-      <path d="M4 20C8 14 12 10 20 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    <svg
+      className="meds-chip-leaf-bundle"
+      viewBox={bundleViewBox(iconCount)}
+      width={width}
+      height={BUNDLE_HEIGHT}
+      aria-hidden="true"
+      focusable="false"
+    >
+      {FAN_ANGLES[iconCount].map((angle) => (
+        <g key={angle} transform={`rotate(${angle} ${FAN_BASE.x} ${FAN_BASE.y})`}>
+          <path d={LEAF_PATH} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+          <path d={LEAF_VEIN} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </g>
+      ))}
     </svg>
   )
 }
 
-/** Single capsule glyph — size set by ChipClusterIcon (fixed 12px for every N). */
-function CapsuleIcon({ size }: { size: number }) {
+/** ONE <svg> containing N capsules fanning from the shared base (Capsule1..Capsule5). */
+function CapsuleBundleIcon({ count }: { count: number }) {
+  const iconCount = Math.max(1, Math.min(5, Math.round(count)))
+  const width = BUNDLE_WIDTHS[iconCount]
   return (
-    <svg className="meds-chip-capsule" viewBox="0 0 24 24" width={size} height={size} aria-hidden="true" focusable="false">
-      <g transform="rotate(45 12 12)">
-        <path d="M7 8h5v8H8a4 4 0 0 1-4-4 4 4 0 0 1 4-4z" fill="currentColor" />
-        <rect x="4" y="8" width="16" height="8" rx="4" fill="none" stroke="currentColor" strokeWidth="1.6" />
-        <path d="M12 8v8" stroke="currentColor" strokeWidth="1.6" />
-      </g>
+    <svg
+      className="meds-chip-capsule-bundle"
+      viewBox={bundleViewBox(iconCount)}
+      width={width}
+      height={BUNDLE_HEIGHT}
+      aria-hidden="true"
+      focusable="false"
+    >
+      {FAN_ANGLES[iconCount].map((angle) => (
+        <g key={angle} transform={`rotate(${angle} ${FAN_BASE.x} ${FAN_BASE.y})`}>
+          <rect x="11.5" y="6" width="5" height="14" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.6" />
+          <path d={CAPSULE_DIVIDER} fill="none" stroke="currentColor" strokeWidth="1.6" />
+        </g>
+      ))}
     </svg>
   )
 }
 
 /**
- * ONE icon container per chip: N IDENTICAL leaves (supplements) or
- * capsules (medications) in a horizontal flex row — never overlapping,
- * never a sprout/stem composite, never a different glyph per N.
- *
- * Every glyph in a cluster is the exact same component instance path:
- * same SVG path, same size, same rotation, same baseline. N=2 renders
- * two identical 12px leaves side-by-side with a 3px gap (cluster width
- * 27px); the count is instantly countable by eye even at phone size,
- * and the glyph never morphs into a "different icon" mid-list
- * (owner 2026-11-08: 2-leaf cluster read as a sprout).
- *
- * One fixed glyph size for ALL N: size 12px (>=10px), gap 3px (>=2px):
- *   N=1: 12px   N=2: 27px   N=3: 42px   N=4: 57px   N=5: 72px
- * With the 13px chip font, Om3 (3 chars) + 2 leaves fits a 1/7 week
- * column without ellipsis (see index.css .meds-chip-name flex:1,
- * min-width:0; .meds-chip-icon / glyphs flex:none; chip width:100%).
+ * ONE icon per chip: a single bundled fan icon (LeafN or CapsuleN).
+ * The wrapper span is only the flex item (flex:none); the bundle
+ * component returns exactly one <svg>. Name (Mg/MultiV/Om3) is
+ * flex:1 full width (see index.css .meds-chip-name).
  */
-const CLUSTER_SIZES: Record<number, { size: number; gap: number }> = {
-  1: { size: 12, gap: 3 },
-  2: { size: 12, gap: 3 },
-  3: { size: 12, gap: 3 },
-  4: { size: 12, gap: 3 },
-  5: { size: 12, gap: 3 },
-}
-
 function ChipClusterIcon({ count, isMedication }: { count: number; isMedication: boolean }) {
   const iconCount = Math.max(1, Math.min(5, Math.round(count)))
-  const { size, gap } = CLUSTER_SIZES[iconCount]
   const kindClass = isMedication ? 'meds-chip-icon--capsule' : 'meds-chip-icon--leaf'
   return (
-    <span
-      className={`meds-chip-icon ${kindClass}`}
-      data-count={iconCount}
-      style={{ gap: `${gap}px` }}
-      aria-hidden="true"
-    >
-      {Array.from({ length: iconCount }, (_, i) =>
-        isMedication ? <CapsuleIcon key={i} size={size} /> : <LeafIcon key={i} size={size} />,
-      )}
+    <span className={`meds-chip-icon ${kindClass}`} data-count={iconCount} aria-hidden="true">
+      {isMedication ? <CapsuleBundleIcon count={iconCount} /> : <LeafBundleIcon count={iconCount} />}
     </span>
   )
 }
@@ -410,10 +451,9 @@ export default function Medications() {
                           <span className="meds-empty-dot" aria-label="Nothing taken">·</span>
                         ) : (
                           groupDayChips(doses).map((c) => {
-                            // Quantity: ONE clustered icon container holding
-                            // 1-5 IDENTICAL, separated leaves/capsules (capped
-                            // at 5, fixed 12px glyph). No separate icons, no
-                            // overlap, no sprout/stem composite, no count text.
+                            // Quantity: ONE bundled fan icon (LeafN/CapsuleN,
+                            // 1-5 paths in one <svg> from a shared base).
+                            // No separate icons, no count text.
                             const isMedication = c.first.kind === 'medication'
                             return (
                             <span key={c.key} className="meds-chip-wrap">
