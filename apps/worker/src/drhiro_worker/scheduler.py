@@ -32,6 +32,7 @@ TICK_SECONDS = 30
 PERIODIC = [
     ("files_retention", "03:30", "drhiro_worker.files.expire_files"),
     ("backup_staleness", "09:00", "drhiro_worker.jobs_backup.check_backup_staleness"),
+    ("food_micros_backfill", "03:45", "drhiro_worker.jobs_food_micros.backfill_food_micros"),
 ]
 
 

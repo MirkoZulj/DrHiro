@@ -474,11 +474,12 @@ def get_composition(item_id: str, scope: str = "unit", date_str: str | None = Qu
     Returns both new shape (rows/taken) and legacy keys for old clients."""
     item = _get_item(db, user, item_id)
     if scope not in ("unit", "day", "period"): raise HTTPException(400, "scope must be unit|day|period")
-    from drhiro_api.services.nutrition_rda import RDA_TABLE, age_from_profile, rda_for_age
+    from drhiro_nutrition.dri import reference_for, age_from_dob
     from drhiro_api.services.schemas_meds import LEGACY_RDA_ALIASES
     from drhiro_api.services.day_boundary import nutrition_date
     from drhiro_api.services.schemas_meds import per_unit_amount
-    age = age_from_profile(user)
+    age = age_from_dob(getattr(user, "date_of_birth", None))
+    sex = getattr(user, "sex_for_health_calculations", None)
     entries = _composition_entries(item.ingredients_json or [])
     # taken totals
     taken_amt = 0.0; doses_n=0; days_taken=0
@@ -502,17 +503,16 @@ def get_composition(item_id: str, scope: str = "unit", date_str: str | None = Qu
         per_u = per_unit_amount(entry)
         code = entry.get("nutrient_code")
         legacy_key = LEGACY_RDA_ALIASES.get(code, code) if code else None
-        ref=None; unit=None
-        if legacy_key and legacy_key in RDA_TABLE:
-            _, ref, unit, _ = RDA_TABLE[legacy_key]
-            try: ref = rda_for_age(legacy_key, age)
-            except Exception: pass
+        ref=None; unit=None; ref_kind="RDA"
+        if code:
+            _r = reference_for(code, sex, age)
+            ref = _r["value"]; ref_kind = _r["kind"]; unit = entry.get("unit")
         taken_total = round(per_u * taken_amt, 3) if (per_u is not None and scope != "unit") else None
         avg = round(taken_total / days_taken, 3) if (taken_total is not None and days_taken) else None
         pct = round(taken_total / ref * 100, 1) if (taken_total is not None and ref) else None
         row={"name": entry.get("name"), "nutrient_code": code, "mapping": entry.get("mapping"),
              "per_unit": per_u, "unit": entry.get("unit") or unit, "taken_total": taken_total,
-             "avg_per_day_taken": avg, "ref": ref, "ref_kind": "RDA", "ul": None,
+             "avg_per_day_taken": avg, "ref": ref, "ref_kind": ref_kind, "ul": None,
              "pct_dv": entry.get("pct_dv"), "per": entry.get("per"), "serving_units": entry.get("serving_units"),
              "form": entry.get("form"),
              "pct_ref": pct, "above_ul": False}

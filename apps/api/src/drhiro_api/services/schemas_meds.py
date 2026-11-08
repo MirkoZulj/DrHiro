@@ -56,8 +56,9 @@ def _unit_of(k: str):
     return None
 
 # Legacy keyword suggester with exclusions (§4.4)
-_EXCLUSIONS = ("pantothen","stearate","omega-6","omega-9","fish oil","total omega")
+_EXCLUSIONS = ("stearate","omega-6","omega-9","fish oil","total omega")
 _KEYWORDS: list[tuple[str,str]] = [
+    ("pantothen","pantothenic"),  # before calcium: calcium pantothenate is B5, not calcium (§6)
     ("epa","epa_dha"),("dha","epa_dha"),("omega-3","epa_dha"),
     ("magnes","magnesium"),("calcium","calcium"),("zinc","zinc"),("iron","iron"),("ferrous","iron"),
     ("selenium","selenium"),("potassium","potassium"),("iodine","iodine"),("iodide","iodine"),

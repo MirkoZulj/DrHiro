@@ -379,10 +379,23 @@ def tool_list_nutrient_codes(req: ListNutrientCodesRequest = ListNutrientCodesRe
 
 @router.post("/get_my_intake", response_model=ToolResponse)
 def tool_get_my_intake(req: GetMyIntakeRequest, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):
-    """Stub until 0.11.0-d (§4.6): returns intake grid + completeness note."""
-    data = __import__("drhiro_api.routers.medications", fromlist=["get_intake"]).get_intake(view="week", offset=req.offset or 0, kind="all", user=user, db=db)
+    """§4.6 payload condensed: per nutrient total, % ref, food/supp split, completeness."""
+    from drhiro_api.routers.intake import overview as _overview, day as _day
+    from datetime import date as _d
+    if req.date:
+        body = _day(date=_date(req.date), user=user, db=db)
+    else:
+        body = _overview(view="week" if req.view == "week" else "day" if req.view == "day" else "week",
+                         offset=req.offset or 0, codes=None, source="all", anchor=None, user=user, db=db)
+    nutrients = [{"code": n["code"], "label": n["label"], "ref": n["ref"], "unit": n["unit"],
+                  "days": [{"date": d["date"], "food": d["food"], "supp": d["supp"], "total": d["total"],
+                            "pct": d["pct"], "completeness": d["completeness"], "status": d["status"],
+                            "above_ul": d["above_ul"]} for d in n["days"]]} for n in body["nutrients"]]
     _tool_audit(db, user, "tools.get_my_intake"); db.commit()
-    return ToolResponse(ok=True, data={"note": "full nutrient aggregation lands in 0.11.0-d", **data})
+    return ToolResponse(ok=True, data={"start": body["start"], "end": body["end"], "tz": body["tz"],
+        "dri_version": body["dri_version"], "reference_profile": body["reference_profile"],
+        "completeness_overall": body["completeness_overall"], "unknowns": body["unknowns"],
+        "nutrients": nutrients})
 
 @router.post("/delete_dose", response_model=ToolResponse)
 def tool_delete_dose(req: DeleteDoseRequest, user: User = Depends(_resolve_user), db: Session = Depends(get_db)):

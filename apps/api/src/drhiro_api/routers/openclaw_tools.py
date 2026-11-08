@@ -2177,6 +2177,8 @@ def _persist_food(db: Session, c: dict):
         "carbs": c.get("carbs_g_per_100g"),
         "fat": c.get("fat_g_per_100g"),
     }
+    if isinstance(c.get("micros_per_100g"), dict):
+        vals.update({k: v for k, v in c["micros_per_100g"].items() if v is not None})
     rows = {n.nutrient_code: n for n in db.query(Nutrient).filter(Nutrient.nutrient_code.in_(list(vals))).all()}
     for code, val in vals.items():
         r = rows.get(code)

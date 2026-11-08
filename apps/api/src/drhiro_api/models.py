@@ -200,6 +200,9 @@ class MealItem(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     user_corrected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 0.12.0 Part B (B2): matched canonical food for micro computation
+    micro_food_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("foods.id", ondelete="SET NULL"), nullable=True)
+    micro_match_confidence: Mapped[float | None] = mapped_column(nullable=True)
 
     meal: Mapped[Meal] = relationship(back_populates="items")
 

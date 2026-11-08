@@ -48,6 +48,20 @@ class USDACatalog:
             amount = n.get("amount") or n.get("value")
             if nid and amount is not None:
                 nutrients[nid] = amount
+        micros = {}
+        try:
+            from drhiro_nutrition.micros import NUTRIENT_CATALOGUE, SUM_IDS, convert_value
+            for c in NUTRIENT_CATALOGUE:
+                if c.code in SUM_IDS:
+                    if any(nutrients.get(i) is not None for i in c.fdc_ids):
+                        micros[c.code] = convert_value(sum(nutrients.get(i, 0) or 0 for i in c.fdc_ids), c.fdc_unit, c.code)
+                else:
+                    for fid in c.fdc_ids:
+                        if nutrients.get(fid) is not None:
+                            micros[c.code] = convert_value(nutrients[fid], c.fdc_unit, c.code)
+                            break
+        except Exception:
+            micros = {}
         return FoodItem(
             external_id=str(food.get("fdcId") or ""),
             source=self.source,
@@ -61,6 +75,7 @@ class USDACatalog:
             sodium_mg_per_100g=nutrients.get(NUTRIENT_IDS["sodium"]),
             data_type=food.get("dataType"),
             brand_owner=food.get("brandOwner"),
+            micros_per_100g=micros,
         )
 
     def search(self, query: str, limit: int = 10) -> list[FoodItem]:

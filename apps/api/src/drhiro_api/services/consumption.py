@@ -588,6 +588,21 @@ def _usda_search(query: str, limit: int = 3) -> list[dict]:
                 "source": "usda",
                 "confidence": 0.85,
             }
+            try:
+                from drhiro_nutrition.micros import NUTRIENT_CATALOGUE, SUM_IDS, convert_value
+                _micros = {}
+                for _c in NUTRIENT_CATALOGUE:
+                    if _c.code in SUM_IDS:
+                        if any(nuts.get(i) is not None for i in _c.fdc_ids):
+                            _micros[_c.code] = convert_value(sum(nuts.get(i, 0) or 0 for i in _c.fdc_ids), _c.fdc_unit, _c.code)
+                    else:
+                        for _fid in _c.fdc_ids:
+                            if nuts.get(_fid) is not None:
+                                _micros[_c.code] = convert_value(nuts[_fid], _c.fdc_unit, _c.code)
+                                break
+                cand["micros_per_100g"] = _micros
+            except Exception:
+                pass
             check = validate_candidate_energy(cand)
             if check.corrected:
                 log.warning(

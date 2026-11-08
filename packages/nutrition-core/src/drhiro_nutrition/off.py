@@ -27,6 +27,16 @@ class OpenFoodFactsCatalog:
             return None
         nutriments = product.get("nutriments") or {}
         g_per100 = lambda key: _num(nutriments.get(f"{key}_100g") or nutriments.get(key))
+        micros = {}
+        try:
+            from drhiro_nutrition.micros import NUTRIENT_CATALOGUE, convert_value
+            for c in NUTRIENT_CATALOGUE:
+                if c.off_key:
+                    v = nutriments.get(f"{c.off_key}_100g", nutriments.get(c.off_key))
+                    if v is not None:
+                        micros[c.code] = convert_value(float(v), "g", c.code)
+        except Exception:
+            micros = {}
         return FoodItem(
             external_id=str(product.get("id") or product.get("code") or ""),
             source=self.source,
@@ -41,6 +51,7 @@ class OpenFoodFactsCatalog:
             sodium_mg_per_100g=g_per100("sodium"),
             serving_grams=_num(nutriments.get("serving_quantity")),
             serving_unit=nutriments.get("serving_quantity_unit"),
+            micros_per_100g=micros,
         )
 
     def by_barcode(self, barcode: str) -> FoodItem | None:

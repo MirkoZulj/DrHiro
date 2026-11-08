@@ -6,7 +6,8 @@ from tests.conftest import auth_headers
 from drhiro_api.services.schemas_meds import normalise_ingredient, suggest_nutrient_code
 
 def test_legacy_normaliser_exclusions():
-    assert suggest_nutrient_code("calcium pantothenate") is None
+    # §6: calcium pantothenate -> pantothenic (suggested), not calcium, not None.
+    assert suggest_nutrient_code("calcium pantothenate") == "pantothenic"
     assert suggest_nutrient_code("magnesium stearate") is None
     assert suggest_nutrient_code("omega-6") is None
 
@@ -282,7 +283,7 @@ def test_migration_single_head_and_guarded():
             if down:
                 downs.add(down.group(1))
     heads = set(revisions) - downs
-    assert heads == {"a7b8c9d0e1f2"}, heads
+    assert heads == {"e2f3a4b5c6d7"}, heads  # 0.12.0 Part B head (was a7b8c9d0e1f2)
     mig = (versions / "a7b8c9d0e1f2_meds_short_name.py").read_text(encoding="utf-8")
     assert "ADD COLUMN IF NOT EXISTS short_name" in mig
 
