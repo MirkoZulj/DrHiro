@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { authClient } from '../lib/auth'
 import Sparkline from '../components/Sparkline'
-import NutritionCoverage from './NutritionCoverage'
+import IntakeAnalysis from './IntakeAnalysis'
 
 interface Finding {
   id: string
@@ -60,7 +60,10 @@ const PROVIDERS = ['gp', 'cardiology', 'endocrinology', 'gastroenterology', 'nep
 
 /** Wave 3 (spec §3.11): Analyse · Doctor visit · History · Data & backup. */
 export default function Analytics() {
-  const [tab, setTab] = useState<Tab>('analyse')
+  const [tab, setTab] = useState<Tab>(() => {
+    const t = new URLSearchParams(window.location.search).get('tab')
+    return t === 'intake' || t === 'visit' || t === 'history' || t === 'data' ? t : 'analyse'
+  })
 
   return (
     <div>
@@ -75,7 +78,7 @@ export default function Analytics() {
       {tab === 'analyse' && <AnalyseTab />}
       {tab === 'visit' && <VisitTab />}
       {tab === 'history' && <HistoryTab />}
-      {tab === 'intake' && <NutritionCoverage />}
+      {tab === 'intake' && <IntakeAnalysis />}
       {tab === 'data' && <DataTab />}
     </div>
   )

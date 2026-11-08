@@ -78,8 +78,9 @@ def age_from_dob(dob, today: date | None = None) -> int | None:
     return max(0, ref.year - born.year - ((ref.month, ref.day) < (born.month, born.day)))
 
 def reference_for(code, sex: str | None, age: int | None) -> dict:
-    assumed = sex not in ("male", "female") or age is None
-    sex_used = {"male": "m", "female": "f"}.get(sex, "m")
+    s = (sex or "").strip().lower()
+    sex_used = {"male": "m", "m": "m", "female": "f", "f": "f"}.get(s, "m")
+    assumed = s not in ("male", "m", "female", "f") or age is None
     band = age_band(age)
     table = DRI.get(code, {})
     value = table.get((sex_used, band), table.get(sex_used))
