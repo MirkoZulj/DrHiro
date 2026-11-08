@@ -282,53 +282,38 @@ def test_migration_single_head_and_guarded():
     mig = (versions / "a7b8c9d0e1f2_meds_short_name.py").read_text(encoding="utf-8")
     assert "ADD COLUMN IF NOT EXISTS short_name" in mig
 
-def test_week_chip_bundled_fan_icons():
+def test_week_chip_polished_separated_icons():
     import re as _re
     tsx = _web_src("apps/web/src/views/Medications.tsx")
     css = _web_src("apps/web/src/index.css")
-    # Bundled kind icons: LeafN / CapsuleN as ONE <svg> per chip (no emoji,
-    # no PillIcon-only logic, no old separate-glyph components).
-    assert "LeafBundleIcon" in tsx and "CapsuleBundleIcon" in tsx
-    assert "function LeafIcon" not in tsx and "function CapsuleIcon" not in tsx
+    # Owner 2026-11-08 rejected the fan as "ugly": polished separated
+    # cluster — N IDENTICAL glyphs in ONE container, no fan/shared-base.
+    assert "LeafBundleIcon" not in tsx and "CapsuleBundleIcon" not in tsx
+    assert "FAN_ANGLES" not in tsx and "FAN_BASE" not in tsx and "BUNDLE_WIDTHS" not in tsx
+    assert "function LeafIcon" in tsx and "function CapsuleIcon" in tsx
     assert "PillIcon" not in tsx
     assert "ChipClusterIcon" in tsx
     assert "meds-chip-icon" in tsx and "meds-chip-icon" in css
     assert "meds-chip-icon--leaf" in tsx and "meds-chip-icon--capsule" in tsx
     assert "meds-chip-icons" not in tsx and "meds-chip-icons" not in css
     assert "c.first.kind === 'medication'" in tsx
-    assert "isMedication ? <CapsuleBundleIcon" in tsx and ": <LeafBundleIcon" in tsx
-    # ONE svg per chip: each bundle component has exactly one <svg> and
-    # renders N <g> fan groups inside it (not N separate svgs).
-    _leaf_body = tsx[tsx.index("function LeafBundleIcon"):tsx.index("function CapsuleBundleIcon")]
-    _cap_body = tsx[tsx.index("function CapsuleBundleIcon"):tsx.index("function ChipClusterIcon")]
-    assert _leaf_body.count("<svg\n") == 1 and _cap_body.count("<svg\n") == 1
-    assert "FAN_ANGLES[iconCount].map" in _leaf_body and "FAN_ANGLES[iconCount].map" in _cap_body
-    assert "Array.from({ length: iconCount }" not in tsx  # no separate glyph per leaf
-    assert "CLUSTER_SIZES" not in tsx
-    # Shared base + fan angles: all N paths rotate around the SAME base
-    # point (14, 21); angles cover 1..5 with min separation >= 29deg.
-    assert "FAN_BASE" in tsx and "x: 14, y: 21" in tsx
-    assert "rotate(${angle} ${FAN_BASE.x} ${FAN_BASE.y})" in _leaf_body
-    assert "rotate(${angle} ${FAN_BASE.x} ${FAN_BASE.y})" in _cap_body
-    _fan_body = tsx[tsx.index("const FAN_ANGLES"):tsx.index("const BUNDLE_WIDTHS")]
-    _fan = {int(n): [int(a) for a in _re.findall(r"-?\d+", body)] for n, body in _re.findall(r"(\d): \[([^\]]+)\]", _fan_body)}
-    assert _fan == {1: [0], 2: [-34, 34], 3: [-42, 0, 42], 4: [-51, -17, 17, 51], 5: [-58, -29, 0, 29, 58]}, _fan
-    for _angles in _fan.values():
-        _seps = [_angles[i + 1] - _angles[i] for i in range(len(_angles) - 1)]
-        assert not _seps or min(_seps) >= 29, _angles  # countable tips, no full overlap
-    # Widths grow slightly with N, max 28px, height fixed 18px.
-    _w_body = tsx[tsx.index("const BUNDLE_WIDTHS"):tsx.index("const BUNDLE_HEIGHT")]
-    _widths = {int(n): int(w) for n, w in _re.findall(r"(\d): (\d+)", _w_body)}
-    assert _widths == {1: 14, 2: 20, 3: 24, 4: 26, 5: 28}, _widths
-    assert "const BUNDLE_HEIGHT = 18" in tsx
+    assert "isMedication ? <CapsuleIcon" in tsx and ": <LeafIcon" in tsx
+    # Identical glyphs for every N: one LeafIcon/CapsuleIcon definition,
+    # fixed 14px size, 4px gap, rendered N times via Array.from.
+    assert tsx.count("function LeafIcon") == 1 and tsx.count("function CapsuleIcon") == 1
+    assert "const GLYPH_SIZE = 14" in tsx and "const GLYPH_GAP = 4" in tsx
+    _leaf_body = tsx[tsx.index("function LeafIcon"):tsx.index("function CapsuleIcon")]
+    _cap_body = tsx[tsx.index("function CapsuleIcon"):tsx.index("function ChipClusterIcon")]
+    assert "width={GLYPH_SIZE}" in _leaf_body and "width={GLYPH_SIZE}" in _cap_body
+    assert "rotate(${angle}" not in tsx and "FAN_" not in tsx
+    assert "Array.from({ length: iconCount }" in tsx
     assert "Math.max(1, Math.min(5, Math.round(count)))" in tsx
-    # Leaf identity: leaf + vein paths defined exactly once, reused per angle.
-    assert tsx.count("'M14 21C11 17.5 11 11 14 5C17 11 17 17.5 14 21Z'") == 1
-    assert tsx.count("'M14 21C14 17 14 11 14 6'") == 1
-    assert "d={LEAF_PATH}" in _leaf_body and "d={LEAF_VEIN}" in _leaf_body
-    assert "meds-chip-leaf-bundle" in tsx and "meds-chip-capsule-bundle" in tsx
-    # Chip block: single cluster component -> single bundle svg, no emoji,
-    # no xN text anywhere in chip code/CSS.
+    assert "meds-chip-leaf-bundle" not in tsx and "meds-chip-capsule-bundle" not in tsx
+    assert "meds-chip-leaf" in tsx and "meds-chip-capsule" in tsx
+    # Cluster width budget: 14*N + 4*(N-1) = 14,32,50,68,86.
+    for _n, _w in [(1, 14), (2, 32), (3, 50), (4, 68), (5, 86)]:
+        assert _w == _n * 14 + (_n - 1) * 4
+    # Chip block: single cluster component, no emoji, no xN text.
     start = tsx.index("groupDayChips(doses).map")
     chip_block = tsx[start:tsx.index("</button>", start)]
     assert "<ChipClusterIcon count={c.total} isMedication={isMedication} />" in chip_block
@@ -338,22 +323,25 @@ def test_week_chip_bundled_fan_icons():
     assert "c.total > 3" not in tsx and "Math.min(3," not in tsx
     assert "meds-chip-x" not in tsx and "meds-chip-x" not in css
     assert "shortName(c.first.name, c.first.short_name)" in tsx
-    # CSS: one icon box, height 18px, bundle svgs flex:none, name flex:1.
+    # CSS: icon box 14px, glyphs flex:none, name flex:1, chip polished.
     icon_css = css[css.index(".meds-chip-icon {"):css.index(".meds-chip-icon {") + 400]
-    assert "display: inline-flex" in icon_css and "flex: none" in icon_css and "height: 18px" in icon_css
-    glyph_css = css[css.index(".meds-chip-leaf-bundle"):css.index(".meds-chip-leaf-bundle") + 300]
+    assert "display: inline-flex" in icon_css and "flex: none" in icon_css and "height: 14px" in icon_css
+    glyph_css = css[css.index(".meds-chip-leaf, .meds-chip-capsule"):css.index(".meds-chip-leaf, .meds-chip-capsule") + 300]
     assert "display: block" in glyph_css and "flex: none" in glyph_css
     name_css = css[css.index(".meds-chip-name"):css.index(".meds-chip-name") + 300]
     assert "flex: 1 1 auto" in name_css and "min-width: 0" in name_css
     week_css = css[css.index(".meds-week"):css.index(".meds-week") + 300]
     assert "repeat(7, 1fr)" in week_css
     assert "width: 100%" in css[css.index(".meds-chip {"):css.index(".meds-chip {") + 300]
-    chip_css = css[css.index(".meds-chip {"):css.index(".meds-chip {") + 700]
+    chip_css = css[css.index(".meds-chip {"):css.index(".meds-chip {") + 800]
     assert "font-size: var(--text-sm)" in chip_css
+    assert "padding: 6px 10px" in chip_css and "box-shadow:" in chip_css
+    assert "min-height: 32px" in chip_css and "border-radius: var(--radius-full)" in chip_css
     tokens = _web_src("apps/web/src/design/tokens.css")
     _sm = _re.search(r"--text-sm:\s*(\d+)px", tokens)
     assert _sm and 12 <= int(_sm.group(1)) <= 13, _sm and _sm.group(0)
-    # Fit budget with bundle widths (N=1: 14px, N=2: 20px) at 13px text.
-    for _label, _n in [("MultiV", 1), ("Osteo", 1), ("Mg", 2), ("Om3", 2)]:
-        _needed = len(_label) * 7.5 + _widths[_n] + 20
-        assert _needed < 330, (_label, _needed)
+    # Fit budget with separated widths (N=2: 32px) at 13px text:
+    # Omega(5ch) + 32px + padding/gaps ~= 79px < 105px column.
+    for _label, _n in [("MultiV", 1), ("Osteo", 1), ("Mg", 2), ("Omega", 2)]:
+        _needed = len(_label) * 7.5 + (14 * _n + (_n - 1) * 4) + 32
+        assert _needed < 105, (_label, _needed)

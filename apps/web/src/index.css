@@ -2256,25 +2256,28 @@ button.link:hover { background: none; text-decoration: underline; }
 /* Wrap holds the pill (one clustered icon + abbreviation). */
 .meds-chip-wrap { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; width: 100%; }
 .meds-chip {
-  display: inline-flex; align-items: center; gap: 4px; min-height: 32px; width: 100%;
+  display: inline-flex; align-items: center; gap: 6px; min-height: 32px; width: 100%;
   flex: 1 1 auto; min-width: 0; max-width: 100%; overflow-wrap: anywhere; hyphens: auto;
-  padding: 4px 8px; border-radius: var(--radius-full);
+  padding: 6px 10px; border-radius: var(--radius-full);
   background: var(--color-accent-subtle); color: var(--color-accent-text);
   border: 1px solid var(--color-accent-border); font-size: var(--text-sm);
   font-weight: var(--weight-medium); text-align: left; cursor: pointer;
+  box-shadow: var(--shadow-card);
 }
 .meds-chip:hover { background: var(--color-surface-subtle); }
-/* ONE bundled icon per chip: a single fan <svg> (LeafN/CapsuleN) — N
-   leaf/capsule paths radiating from one shared base inside ONE svg,
-   not N separate icons. Rendered height 18px for every N; width grows
-   with N: 14px (N=1), 20, 24, 26, 28px (N=5 max). Chip text is 13px
-   (--text-sm); name flex:1 min-width:0 + ellipsis, icon flex:none,
-   chip width:100% — MultiV/Osteo/Mg/Om3 fit a 1/7 week column. */
-.meds-chip-icon { display: inline-flex; align-items: center; height: 18px; flex: none; }
-.meds-chip-leaf-bundle, .meds-chip-capsule-bundle { display: block; flex: none; height: 18px; }
+/* ONE icon container per chip: inline-flex row of N IDENTICAL separated
+   14px glyphs with a 4px gap — distinct shapes, countable, never a fan,
+   never overlapping, never tapered. Cluster width 14px (N=1) to 86px
+   (N=5); glyphs share one baseline/color (currentColor from the chip).
+   Chip text is 13px (--text-sm); name flex:1 min-width:0 + ellipsis,
+   icon flex:none, chip width:100% — Omega (5ch) + 2 leaves ~= 79px,
+   MultiV/Osteo/Mg likewise fit a 1/7 week column without ellipsis.
+   Mobile (<640px): chips are full-width rows, even more room. */
+.meds-chip-icon { display: inline-flex; align-items: center; height: 14px; flex: none; }
+.meds-chip-leaf, .meds-chip-capsule { display: block; flex: none; }
 .meds-chip-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 639px) {
-  .meds-chip { padding: 4px 6px; gap: 3px; }
+  .meds-chip { padding: 6px 10px; gap: 6px; }
 }
 .meds-edit-row { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-2); margin-bottom: var(--space-2); }
 .meds-edit-row-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-2); }
