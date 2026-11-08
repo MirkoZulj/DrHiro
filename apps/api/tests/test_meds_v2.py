@@ -73,10 +73,14 @@ def test_composition_period_day_and_legacy_codes(client, db, user_a):
         {"name": "Glucosamine", "nutrient_code": "bogus_code", "amount": 500, "unit": "mg", "per": "unit"},
     ]
     db.commit()
-    # Log a dose today so day/period scopes have taken rows
-    client.post("/api/v1/medications/intake", json={"entries": [{"item_id": item_id}]}, headers=auth_headers(user_a))
-    today = date.today().isoformat()
-    window = f"start={today}&end={today}"
+    # Log a dose at a fixed taken_at so day/period scopes are
+    # deterministic (no dependence on server tz / time of day).
+    r = client.post("/api/v1/medications/intake", json={
+        "taken_at": "2026-11-04T08:00:00+00:00",
+        "entries": [{"item_id": item_id}]}, headers=auth_headers(user_a))
+    assert r.status_code == 200, r.text
+    day = "2026-11-04"
+    window = f"start={day}&end={day}"
     r = client.get(f"/api/v1/medications/{item_id}/composition?scope=period&{window}", headers=auth_headers(user_a))
     assert r.status_code == 200, r.text
     body = r.json()
@@ -92,12 +96,12 @@ def test_composition_period_day_and_legacy_codes(client, db, user_a):
     assert by_name["Glucosamine"]["mapping"] == "none"
     assert by_name["Glucosamine"]["per_unit"] == 500
     # Day scope (same shadowing bug, line 431)
-    r = client.get(f"/api/v1/medications/{item_id}/composition?scope=day&date={today}", headers=auth_headers(user_a))
+    r = client.get(f"/api/v1/medications/{item_id}/composition?scope=day&date={day}", headers=auth_headers(user_a))
     assert r.status_code == 200, r.text
     assert r.json()["taken"]["doses"] == 1
     # Missing/bad params are 400, not 500
     assert client.get(f"/api/v1/medications/{item_id}/composition?scope=period", headers=auth_headers(user_a)).status_code == 400
-    assert client.get(f"/api/v1/medications/{item_id}/composition?scope=period&start=nope&end={today}", headers=auth_headers(user_a)).status_code == 400
+    assert client.get(f"/api/v1/medications/{item_id}/composition?scope=period&start=nope&end={day}", headers=auth_headers(user_a)).status_code == 400
     assert client.get(f"/api/v1/medications/{item_id}/composition?scope=day", headers=auth_headers(user_a)).status_code == 400
     assert client.get(f"/api/v1/medications/{item_id}/composition?scope=day&date=nope", headers=auth_headers(user_a)).status_code == 400
 
