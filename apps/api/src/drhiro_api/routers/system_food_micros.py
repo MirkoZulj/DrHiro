@@ -30,16 +30,22 @@ def status(user: User = Depends(get_current_user), db: Session = Depends(get_db)
     from datetime import datetime, timedelta, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(days=90)
     meals = db.query(Meal).filter(Meal.status == "confirmed", Meal.eaten_at >= cutoff).all()
+    from drhiro_api.services.intake import item_micros, _resolve_food, _load_food_rows
+    _items = [it for m in meals for it in m.items]
+    _food_ids = set()
+    for it in _items:
+        f, _ov = _resolve_food(db, it)
+        if f is not None:
+            _food_ids.add(f.id)
+    _rows = _load_food_rows(db, _food_ids)
     kt = known = 0.0
-    for m in meals:
-        for it in m.items:
-            n = it.nutrients_json or {}
-            kcal = float(n["kcal"]) if isinstance(n, dict) and isinstance(n.get("kcal"), (int, float)) else 0.0
-            kt += kcal
-            from drhiro_api.services.intake import item_micros
-            micros, _ = item_micros(db, it)
-            if micros:
-                known += kcal
+    for it in _items:
+        n = it.nutrients_json or {}
+        kcal = float(n["kcal"]) if isinstance(n, dict) and isinstance(n.get("kcal"), (int, float)) else 0.0
+        kt += kcal
+        micros, _ = item_micros(db, it, _rows)
+        if micros:
+            known += kcal
     s["kcal_with_micros_pct_90d"] = round(known / kt * 100, 1) if kt else None
     return s
 

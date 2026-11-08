@@ -36,10 +36,14 @@ def _fdc_fetch(fdc_ids, fetcher=None, sleep=time.sleep):
         return fetcher(ids)
     import httpx
     key = os.environ.get("USDA_API_KEY", "")
-    all_ids = sorted({i for c in NUTRIENT_CATALOGUE for i in c.fdc_ids})
+    # NOTE (prod 2026-11-08): FDC POST /v1/foods rejects >25 nutrient ids
+    # (400 "nutrients size exceeded upper limit of 25") and a `nutrients` filter
+    # in the body returns empty foodNutrients. Fetch full records instead
+    # (only fdcIds in the body); the caller picks catalogue ids out of the
+    # response by nutrient id.
     for attempt in (1, 2):
         r = httpx.post("https://api.nal.usda.gov/fdc/v1/foods",
-                       params={"api_key": key} if key else {}, json={"fdcIds": ids, "nutrients": all_ids}, timeout=30)
+                       params={"api_key": key} if key else {}, json={"fdcIds": ids}, timeout=30)
         if r.status_code == 429 and attempt == 1:
             sleep(5); continue
         r.raise_for_status()
