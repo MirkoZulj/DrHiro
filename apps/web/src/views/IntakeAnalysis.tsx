@@ -133,8 +133,7 @@ export default function IntakeAnalysis() {
           <div className="section">
             <div className="form-card" style={{ padding: 8 }}>
               <IntakeChart nutrients={filtered} days={data.days} view={view} sortByPct={sortByPct} onSelect={(date) => setDrawerDate(date)} />
-              {view === 'month' && <p className="muted" style={{ fontSize: 12, margin: '6px 4px 0' }}>Average of {data.days.length} days with data · dots = per-day values · whisker = min–max. Click a bar for day detail.</p>}
-              {view === 'week' && <p className="muted" style={{ fontSize: 12, margin: '6px 4px 0' }}>Each nutrient: Mon–Sun bars (food 55% opacity, supplements solid). Hatched = incomplete food data (&lt;80%). Orange outline = above UL. Grey tick = no data. Click a bar for day detail.</p>}
+              <p className="muted" style={{ fontSize: 12, margin: '6px 4px 0' }}>Click a bar for day detail.</p>
             </div>
           </div>
 

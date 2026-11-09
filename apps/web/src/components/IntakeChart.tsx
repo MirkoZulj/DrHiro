@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { fmtAmount, fmtPct } from '../lib/format'
+import { AXIS_OFFSETS, bottomLabelPx, legendItemsFor, truncateLabel, type LegendSwatch as LegendSwatchKind } from './IntakeLegend'
 
 /** Intake chart per 0.11.0 spec §4.7 — inline SVG, no new deps. */
 export type IntakeView = 'week' | 'month'
@@ -51,7 +52,7 @@ const BORDER = 'var(--color-border, #e2e7ea)'
 const H = 300 // plot height px
 const AXIS_W = 46
 const TOP = 18
-const BOTTOM_LABEL = 44
+const BASELINE = TOP + H
 
 function p95(vals: number[]): number {
   if (!vals.length) return 150
@@ -81,6 +82,52 @@ interface Props {
   view: IntakeView
   sortByPct: boolean
   onSelect?: (date: string, code: string) => void
+}
+
+function LegendSwatch({ kind }: { kind: LegendSwatchKind }) {
+  const box: React.CSSProperties = { flex: '0 0 auto', display: 'inline-block' }
+  switch (kind) {
+    case 'supp':
+      return <span style={{ ...box, width: 14, height: 12, borderRadius: 3, background: ACCENT }} />
+    case 'food':
+      return <span style={{ ...box, width: 14, height: 12, borderRadius: 3, background: ACCENT, opacity: 0.55 }} />
+    case 'hatch':
+      return <span style={{ ...box, width: 14, height: 12, borderRadius: 3, background: ACCENT, opacity: 0.55, backgroundImage: 'repeating-linear-gradient(45deg, rgba(255,255,255,.95) 0 2px, rgba(255,255,255,0) 2px 6px)' }} />
+    case 'ref':
+      return <span style={{ ...box, width: 16, height: 0, borderTop: `3px solid ${MUTED}` }} />
+    case 'ul':
+      return <span style={{ ...box, width: 16, height: 0, borderTop: `2px dashed ${WARN}` }} />
+    case 'above-ul':
+      return <span style={{ ...box, width: 14, height: 12, borderRadius: 3, background: ACCENT, opacity: 0.55, border: `2px solid ${WARN}` }} />
+    case 'no-data':
+      return <span style={{ ...box, width: 0, height: 12, borderLeft: `3px solid var(--color-faint, #9aa8b0)` }} />
+    case 'dot':
+      return <span style={{ ...box, width: 9, height: 9, borderRadius: '50%', background: ACCENT, opacity: 0.75, border: '1px solid #fff' }} />
+    case 'whisker':
+      return (
+        <span style={{ ...box, position: 'relative', width: 12, height: 14 }}>
+          <span style={{ position: 'absolute', left: 5, top: 0, bottom: 0, width: 0, borderLeft: `1.5px solid ${MUTED}` }} />
+          <span style={{ position: 'absolute', left: 0, right: 0, top: 0, height: 0, borderTop: `1.5px solid ${MUTED}` }} />
+          <span style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 0, borderTop: `1.5px solid ${MUTED}` }} />
+        </span>
+      )
+  }
+}
+
+function ChartLegend({ view }: { view: IntakeView }) {
+  const items = legendItemsFor(view)
+  return (
+    <div className="intake-legend" data-testid="intake-legend" role="list" aria-label="Chart legend"
+      style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', alignItems: 'center', padding: '8px 10px', marginBottom: 10, border: '1px solid var(--color-border, #e2e7ea)', borderRadius: 8, background: 'var(--color-surface, #fff)' }}>
+      {items.map((i) => (
+        <span key={i.key} role="listitem" data-legend-item={i.key}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, lineHeight: 1.3 }}>
+          <LegendSwatch kind={i.swatch} />
+          <span>{i.label}</span>
+        </span>
+      ))}
+    </div>
+  )
 }
 
 export default function IntakeChart({ nutrients, days, view, sortByPct, onSelect }: Props) {
@@ -122,7 +169,8 @@ export default function IntakeChart({ nutrients, days, view, sortByPct, onSelect
     return { n, x }
   })
   const totalW = Math.max(cursor, 320)
-  const totalH = TOP + H + BOTTOM_LABEL
+  const totalH = BASELINE + bottomLabelPx(view)
+  const ax = AXIS_OFFSETS[view]
 
   // gridlines: 25,50,75,100,150,200,...
   const grids: number[] = [25, 50, 75, 100]
@@ -164,7 +212,9 @@ export default function IntakeChart({ nutrients, days, view, sortByPct, onSelect
   )
 
   return (
-    <div style={{ display: 'flex', alignItems: 'flex-start' }} onMouseLeave={() => setTip(null)}>
+    <div onMouseLeave={() => setTip(null)}>
+      <ChartLegend view={view} />
+    <div style={{ display: 'flex', alignItems: 'flex-start' }}>
       {axis}
       <div style={{ overflowX: 'auto', maxWidth: '100%' }}>
         <div style={{ position: 'relative', width: totalW }}>
@@ -297,13 +347,23 @@ export default function IntakeChart({ nutrients, days, view, sortByPct, onSelect
               )
             })}
 
-            {/* nutrient labels */}
-            {layout.map(({ n, x }) => (
-              <text key={n.code} x={x + clusterW / 2} y={TOP + H + 12} textAnchor="middle" fontSize={9} fill={MUTED}
-                transform={weekMode ? undefined : `rotate(-45 ${x + clusterW / 2} ${TOP + H + 12})`}>
-                {n.label}
-              </text>
-            ))}
+            {/* nutrient labels — below the baseline: chart area ends at
+                BASELINE; week labels are horizontal at BASELINE+14, month
+                labels are end-anchored at BASELINE+12 and rotated -45 so
+                the whole label sits below the baseline (never penetrates). */}
+            {layout.map(({ n, x }) => {
+              const cx = x + clusterW / 2
+              return weekMode ? (
+                <text key={n.code} x={cx} y={BASELINE + AXIS_OFFSETS.week.nutrient} textAnchor="middle" fontSize={9} fill={MUTED}>
+                  {truncateLabel(n.label, 12)}
+                </text>
+              ) : (
+                <text key={n.code} x={cx + 5} y={BASELINE + AXIS_OFFSETS.month.nutrientAnchor} textAnchor="end" fontSize={9} fill={MUTED}
+                  transform={`rotate(-45 ${cx + 5} ${BASELINE + AXIS_OFFSETS.month.nutrientAnchor})`}>
+                  {truncateLabel(n.label)}
+                </text>
+              )
+            })}
             {/* group captions */}
             {GROUP_ORDER.map((g) => {
               const inGroup = layout.filter((l) => l.n.group === g)
@@ -312,13 +372,13 @@ export default function IntakeChart({ nutrients, days, view, sortByPct, onSelect
               const x1 = inGroup[inGroup.length - 1].x + clusterW
               return (
                 <g key={g}>
-                  <line x1={x0} x2={x1} y1={TOP + H + 30} y2={TOP + H + 30} stroke={BORDER} />
-                  <text x={(x0 + x1) / 2} y={TOP + H + 42} textAnchor="middle" fontSize={10} fontWeight={600} fill={MUTED}>{GROUP_LABELS[g]}</text>
+                  <line x1={x0} x2={x1} y1={BASELINE + ax.groupLine} y2={BASELINE + ax.groupLine} stroke={BORDER} />
+                  <text x={(x0 + x1) / 2} y={BASELINE + ax.groupText} textAnchor="middle" fontSize={10} fontWeight={600} fill={MUTED}>{GROUP_LABELS[g]}</text>
                 </g>
               )
             })}
             {weekMode && (
-              <text x={4} y={TOP + H + 30} fontSize={9} fill={MUTED}>M T W T F S S</text>
+              <text x={4} y={BASELINE + AXIS_OFFSETS.week.weekday} fontSize={9} fill={MUTED}>M T W T F S S</text>
             )}
           </svg>
 
@@ -334,6 +394,7 @@ export default function IntakeChart({ nutrients, days, view, sortByPct, onSelect
           )}
         </div>
       </div>
+    </div>
     </div>
   )
 }

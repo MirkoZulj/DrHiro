@@ -2370,3 +2370,9 @@ button.link:hover { background: none; text-decoration: underline; }
 }
 .records-edit-actions { display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; margin-top: var(--space-3); }
 .records-edit-error { flex-basis: 100%; }
+
+/* Intake chart legend: wraps so it stays visible at 375px */
+.intake-legend { font-size: 13px; }
+@media (max-width: 480px) {
+  .intake-legend { font-size: 12px; gap: 4px 10px !important; padding: 6px 8px !important; }
+}
