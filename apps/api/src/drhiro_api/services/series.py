@@ -7,9 +7,14 @@ imports, no HTTP shapes.
 
 Semantics preserved (zero behaviour change):
 
-- Device MEASUREMENTS belong to the LOCAL CALENDAR day of their own timestamp.
-- SLEEP is keyed to the WAKE-UP day (``day_boundary.wake_date``, Xiaomi/Mi
-  Fitness convention) and deduplicated with the overlap-aware ``_dedup_sleep``.
+- Device MEASUREMENTS belong to the LOCAL CALENDAR day of their own timestamp,
+  in the timezone the DEVICE stamped them with (``metadata_json.source_timezone``,
+  falling back to the profile timezone). STEPS use the interval MIDPOINT day,
+  so a daily total anchored at device midnight attributes to its own day even
+  when the profile timezone differs from the device's.
+- SLEEP is keyed to the WAKE-UP day (``day_boundary.wake_date`` / ``sleep_day``,
+  Xiaomi/Mi Fitness convention, in the device timezone) and deduplicated with
+  the overlap-aware ``_dedup_sleep``.
 - STEPS are deduplicated with ``_dedup_steps`` (Health Connect 30-minute
   aggregate buckets are authoritative; detail records only gap-fill).
 - WATER/liquids, meals and nutrition totals belong to the NUTRITION day
@@ -33,8 +38,11 @@ from drhiro_api.models import Activity, Meal, Measurement, User
 from drhiro_api.services.day_boundary import (
     day_start_hour,
     local_calendar_date,
+    measurement_day,
     nutrition_date,
     resolve_tz,
+    sleep_day,
+    source_tz_of,
     wake_date,
 )
 from drhiro_schema.metrics import MetricType
@@ -370,30 +378,47 @@ _ALCOHOL_LEGACY_KEYS = {
 def _measurement_series(db, user, tz, key, days, start, end) -> list[DayValue]:
     mt = _MEASUREMENT_KEYS[key]
     start_dt, end_dt = _local_window(tz, start, end)
+    # Widen the SQL window by 2 days each side: a row stamped in a DIFFERENT
+    # timezone than the profile's can belong to an in-range day while its
+    # start_at falls outside the profile-tz window (e.g. a Zagreb-midnight
+    # daily total starts 17:00 the previous Chicago day). Bucketing below is
+    # exact, so the widened fetch is safe.
     q = (db.query(Measurement)
          .filter(Measurement.user_id == user.id,
                  Measurement.metric_type == mt,
-                 Measurement.start_at >= start_dt, Measurement.start_at < end_dt))
+                 Measurement.start_at >= start_dt - timedelta(days=2),
+                 Measurement.start_at < end_dt + timedelta(days=2)))
     q = _guard_soft_deleted(q, db)
     rows = q.order_by(Measurement.start_at.asc()).all()
 
     # Bucket raw records per day, exactly as the handlers do.
     by_day: dict[date, list] = {}
     vals_by_day: dict[date, list[float]] = {}
+    wanted = set(days)
     for m in rows:
+        md = getattr(m, "metadata_json", None)
         if mt == MetricType.SLEEP:
-            wd = wake_date(m.start_at, (m.value_json or {}).get("duration_min"),
-                           getattr(m, "end_at", None), tz)
-            if wd is None:
+            row = {"start_at": m.start_at, "end_at": getattr(m, "end_at", None),
+                   "value_json": m.value_json or {}, "metadata_json": md}
+            day = sleep_day(row, tz)
+            if day is None or day not in wanted:
                 continue
-            day = wd
+        elif key == "steps":
+            row = {"start_at": m.start_at, "end_at": getattr(m, "end_at", None),
+                   "value_json": m.value_json or {}, "metadata_json": md}
+            day = measurement_day(row, tz)
+            if day is None or day not in wanted:
+                continue
         else:
-            day = local_calendar_date(m.start_at, tz)
+            day = local_calendar_date(m.start_at, source_tz_of(md, tz))
+            if day not in wanted:
+                continue
         rec = {
             "start_at": m.start_at,
             "end_at": getattr(m, "end_at", None) or m.start_at,
             "value_json": m.value_json or {},
             "source_provider": getattr(m, "source_provider", None),
+            "metadata_json": md,
         }
         by_day.setdefault(day, []).append(rec)
         vj = m.value_json or {}

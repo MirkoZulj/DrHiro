@@ -33,9 +33,12 @@ from drhiro_api.services.day_boundary import (
     local_calendar_day_start,
     local_date_window,
     local_now,
+    measurement_day,
     nutrition_date,
     nutrition_day_start,
     resolve_tz,
+    sleep_day,
+    source_tz_of,
     utc_offset_str,
     wake_date,
 )
@@ -77,6 +80,7 @@ def _measurements_since(db: Session, user_id: uuid.UUID, days: int) -> list[dict
             "value_json": m.value_json,
             "source_provider": m.source_provider,
             "recording_method": m.recording_method,
+            "metadata_json": getattr(m, "metadata_json", None),
         }
         for m in rows
     ]
@@ -132,10 +136,20 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
     cal_start = local_calendar_day_start(user)    # calendar day: measurements
     measurements = _measurements_since(db, user.id, 30)
 
-    steps_today = _dedup_steps(
-        [m for m in measurements
-         if m["metric_type"] == MetricType.STEPS and m["start_at"] >= cal_start]
-    )
+    # Steps belong to the day their INTERVAL covers, in the timezone the
+    # device stamped them with (``measurement_day``). Filtering by
+    # ``start_at >= local midnight`` in the PROFILE timezone dropped a daily
+    # total anchored at device midnight whenever the two timezones differed:
+    # a Europe/Zagreb-midnight total starts at 17:00 the previous
+    # America/Chicago day, so steps_today read 0 until 23:00 UTC. "Today" is
+    # therefore evaluated per-row, in the row's own source timezone.
+    _steps_rows = [m for m in measurements if m["metric_type"] == MetricType.STEPS]
+    steps_today = _dedup_steps([
+        m for m in _steps_rows
+        if measurement_day(m, user.timezone) is not None
+        and measurement_day(m, user.timezone)
+        == datetime.now(source_tz_of(m.get("metadata_json"), user.timezone)).date()
+    ])
     def _latest_point(metric_type, value_key=None):
         """Return the newest row for a point-in-time metric, with recency metadata."""
         for m in reversed(measurements):
@@ -291,13 +305,12 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
         # records into a total.  The old "max by duration_min" returned a
         # 12-day-old value (546 min from Aug 20) instead of last night.
         tz = resolve_tz(user.timezone)
-        # Group sleep records into nights by TIME GAP, not by calendar date of
-        # start_at. The date-keyed grouping merged two genuinely different
-        # sleeps that happen to share a start date (e.g. a 02:24 morning sleep
-        # and a 23:43 night sleep both keyed "2026-09-22") and double-counted
-        # them (450+294=744min). Records overlapping or within ~10h of each
-        # other are the same night; a larger gap starts a new one.
-        night_gap = timedelta(hours=10)
+        # Group sleep records into nights by WAKE-UP DAY (in each row's own
+        # source timezone), matching ``daily_series``. The old 10-hour time-gap
+        # grouping merged distinct nights: a midday nap 6.6h after the night
+        # and 9.1h before the NEXT night glued all three blocks together
+        # (384 + 105 + 376 = 865 min reported as "last night"). Wake-day
+        # grouping keeps each night separate and agrees with the trend chart.
         sleep_rows_sorted = sorted(
             [
                 {
@@ -305,18 +318,19 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
                     "end_at": m.get("end_at") or (m.get("start_at") or m.get("recorded_at")),
                     "value_json": m.get("value_json") or {},
                     "source_provider": m.get("source_provider"),
+                    "metadata_json": m.get("metadata_json"),
                 }
                 for m in sleep_rows
                 if (m.get("start_at") or m.get("recorded_at")) is not None
             ],
             key=lambda r: r["start_at"],
         )
-        nights: list[list[dict]] = []
+        by_wake: dict = {}
         for rec in sleep_rows_sorted:
-            if not nights or (rec["start_at"] - nights[-1][-1]["end_at"]) > night_gap:
-                nights.append([rec])
-            else:
-                nights[-1].append(rec)
+            wd = sleep_day(rec, user.timezone)
+            if wd is not None:
+                by_wake.setdefault(wd, []).append(rec)
+        nights = [by_wake[d] for d in sorted(by_wake)]
 
         latest_night = max(nights, key=lambda ns: max(n["start_at"] for n in ns))
         previous_nights = sorted(nights, key=lambda ns: max(n["start_at"] for n in ns))[:-1]
@@ -329,13 +343,16 @@ def dashboard_today(user: User = Depends(get_current_user), db: Session = Depend
             duration_min = _dedup_sleep(night_recs)
 
         if duration_min > 0:
-            anchor = night_recs[0]["start_at"]
-            local_dt = anchor.astimezone(tz)
+            # Anchor at the WAKE instant (latest end) of the night, in the
+            # rows' own source timezone — the moment the sleep finished.
+            anchor = max(n["end_at"] for n in night_recs)
+            src_tz = source_tz_of(night_recs[0].get("metadata_json"), tz)
+            local_dt = anchor.astimezone(src_tz)
             sleep_last = {
                 "duration_min": duration_min,
                 "measured_at": local_dt.isoformat(),
-                "days_old": (datetime.now(tz).date() - local_dt.date()).days,
-                "is_stale": (datetime.now(tz).date() - local_dt.date()).days > 2,
+                "days_old": (datetime.now(src_tz).date() - local_dt.date()).days,
+                "is_stale": (datetime.now(src_tz).date() - local_dt.date()).days > 2,
                 "source_provider": night_recs[0].get("source_provider"),
             }
 
@@ -750,7 +767,10 @@ def energy_balance(days: int = Query(30, ge=1, le=366),
                 count = float((m.get("value_json") or {}).get("count") or
                               (m.get("value_json") or {}).get("value") or 0)
                 steps = count * ratio
-                day = local_calendar_date(dt, tz).isoformat()
+                day = measurement_day(m, tz)
+                if day is None:
+                    continue
+                day = day.isoformat()
                 walking[day] = walking.get(day, 0.0) + steps * 0.04
 
     points = []
@@ -780,6 +800,7 @@ def daily_summary(local_date: str, user: User = Depends(get_current_user), db: S
     tz = resolve_tz(user.timezone)
     start, end = local_date_window(local_date, tz)                  # meals (eating day)
     m_start, m_end = local_calendar_date_window(local_date, tz)     # measurements (calendar day)
+    wanted_day = date_type.fromisoformat(local_date)
     measurements = (
         db.query(Measurement)
         .filter(Measurement.user_id == user.id, Measurement.start_at >= m_start, Measurement.start_at < m_end)
@@ -796,9 +817,25 @@ def daily_summary(local_date: str, user: User = Depends(get_current_user), db: S
         .all()
     )
     kcal = sum((m.totals_json or {}).get("kcal") or 0 for m in meals)
+    # Steps: separate widened fetch (a device-midnight daily total can start
+    # outside the profile-tz window yet belong to `local_date`), filtered by
+    # interval day in the row's source timezone. Kept separate so the
+    # coverage score over `measurements` keeps its original window.
+    steps_q = (db.query(Measurement)
+               .filter(Measurement.user_id == user.id,
+                       Measurement.metric_type == MetricType.STEPS,
+                       Measurement.start_at >= m_start - timedelta(days=2),
+                       Measurement.start_at < m_end + timedelta(days=2)))
+    if _ledger_soft_delete_available(db):
+        steps_q = steps_q.filter(text("measurements.deleted_at IS NULL"))
+    steps_rows = steps_q.all()
     steps = _dedup_steps(
-        [{"metric_type": m.metric_type, "start_at": m.start_at, "end_at": m.end_at, "value_json": m.value_json}
-         for m in measurements if m.metric_type == MetricType.STEPS]
+        [{"metric_type": m.metric_type, "start_at": m.start_at, "end_at": m.end_at,
+          "value_json": m.value_json, "metadata_json": getattr(m, "metadata_json", None)}
+         for m in steps_rows
+         if measurement_day({"start_at": m.start_at, "end_at": m.end_at,
+                            "metadata_json": getattr(m, "metadata_json", None)},
+                           user.timezone) == wanted_day]
     )
     return {
         "date": local_date,
@@ -841,7 +878,10 @@ def weekly_summary(week: str, user: User = Depends(get_current_user), db: Sessio
         {"metric_type": m.metric_type, "start_at": m.start_at, "end_at": m.end_at, "value_json": m.value_json}
         for m in measurements if m.metric_type == MetricType.STEPS
     ]
-    days_with_steps = len({m.start_at.date() for m in measurements if m.metric_type == MetricType.STEPS})
+    days_with_steps = len({measurement_day(
+        {"start_at": m.start_at, "end_at": m.end_at,
+         "metadata_json": getattr(m, "metadata_json", None)}, user.timezone)
+        for m in measurements if m.metric_type == MetricType.STEPS})
     return {
         "week": week,
         "days_with_steps": days_with_steps,
@@ -867,8 +907,11 @@ def steps_intraday(user: User = Depends(get_current_user), db: Session = Depends
     from collections import defaultdict
     tz = resolve_tz(user.timezone or "UTC")
     now_local = datetime.now(tz)
-    day_start = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=tz)
-    day_end = day_start + timedelta(days=1)
+    # Fetch a widened window and filter by interval day in each row's source
+    # timezone (a daily total stamped at device midnight starts before the
+    # profile-tz midnight yet belongs to today).
+    day_start = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=tz) - timedelta(days=2)
+    day_end = day_start + timedelta(days=5)
     rows = (db.query(Measurement)
             .filter(Measurement.user_id == user.id,
                     Measurement.metric_type == MetricType.STEPS,
@@ -882,10 +925,15 @@ def steps_intraday(user: User = Depends(get_current_user), db: Session = Depends
     rows = rows.all()
     hourly: dict[int, float] = defaultdict(float)
     for m in rows:
+        row_tz = source_tz_of(getattr(m, "metadata_json", None), tz)
+        if measurement_day({"start_at": m.start_at, "end_at": m.end_at,
+                            "metadata_json": getattr(m, "metadata_json", None)},
+                           user.timezone) != datetime.now(row_tz).date():
+            continue
         v = (m.value_json or {}).get("count")
         if v is None:
             continue
-        local = m.start_at.astimezone(tz)
+        local = m.start_at.astimezone(row_tz)
         hourly[local.hour] += float(v)
     points = [{"hour": h, "value": round(hourly[h], 0)} for h in sorted(hourly)]
     return {"date": now_local.date().isoformat(), "total": round(sum(hourly.values()), 0), "points": points}
@@ -1256,6 +1304,13 @@ def trends_bucketed(
     _win_start, _win_end = (
         (start_dt, end_dt) if mt == MetricType.WATER else (cal_start_dt, cal_end_dt)
     )
+    # Widened by 2 days for device metrics so a row stamped in another
+    # timezone but belonging to an in-window day is not cut off by the
+    # profile-tz window; bucketing below is exact (interval/wake day in the
+    # row's source timezone).
+    if mt != MetricType.WATER:
+        _win_start = _win_start - timedelta(days=2)
+        _win_end = _win_end + timedelta(days=2)
     rows = (db.query(Measurement)
             .filter(Measurement.user_id == user.id,
                     Measurement.metric_type == mt,
@@ -1274,20 +1329,26 @@ def trends_bucketed(
     bucket_records: list[list[dict]] = [[] for _ in range(n)]
     bucket_vals: list[list[float]] = [[] for _ in range(n)]
     for m in rows:
+        md = getattr(m, "metadata_json", None)
         if mt == MetricType.SLEEP:
-            wd = wake_date(m.start_at, (m.value_json or {}).get("duration_min"),
-                           getattr(m, "end_at", None), tz)
+            wd = sleep_day({"start_at": m.start_at, "end_at": getattr(m, "end_at", None),
+                            "value_json": m.value_json or {}, "metadata_json": md}, tz)
             idx = None if wd is None else bucket_of_cal(wd)[0]
+        elif mt == MetricType.STEPS:
+            sd = measurement_day({"start_at": m.start_at, "end_at": getattr(m, "end_at", None),
+                                  "metadata_json": md}, tz)
+            idx = None if sd is None else bucket_of_cal(sd)[0]
         elif mt == MetricType.WATER:
             idx, _ = bucket_of(m.start_at.astimezone(tz))
         else:
-            idx, _ = bucket_of_cal(m.start_at.astimezone(tz))
+            idx, _ = bucket_of_cal(m.start_at.astimezone(source_tz_of(md, tz)))
         if idx is None:
             continue
         bucket_records[idx].append({
             "start_at": m.start_at,
             "end_at": getattr(m, "end_at", None) or m.start_at,
             "value_json": m.value_json or {},
+            "metadata_json": md,
         })
         vj = m.value_json or {}
         v = vj.get("value")

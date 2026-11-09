@@ -242,3 +242,94 @@ def wake_date(start_at: datetime, duration_min, end_at: datetime | None, tz) -> 
     else:
         wake = start_at
     return wake.astimezone(resolve_tz(tz)).date()
+
+
+# --------------------------------------------------------------------------- #
+# Device-measurement day attribution — the DEVICE's own timezone + interval
+# --------------------------------------------------------------------------- #
+# A wearable stamps its daily totals in the timezone the DEVICE was in
+# (``metadata_json.source_timezone``, sent by the Health Connect bridge), which
+# need not equal the profile timezone (travel, a stale profile setting, ...).
+# Bucketing such a row by the PROFILE timezone shifts a whole day: a
+# Europe/Zagreb-midnight daily steps total starts at 17:00 the previous
+# America/Chicago day, so "today" read 0 until 23:00 UTC and every trend point
+# landed one day early. Sleep had the mirror bug: a 06:00 Zagreb wake-up is
+# still the previous evening in Chicago, so wake_date keyed the night to the
+# bedtime day.
+#
+# Rule: a device MEASUREMENT belongs to the local calendar day, in the
+# timezone the DEVICE stamped it with, of the day its INTERVAL covers:
+#   * steps / interval metrics -> the interval MIDPOINT (a 24h daily total
+#     anchored at device midnight attributes to its own day in any profile
+#     timezone; short buckets are unaffected, midpoint ~= start);
+#   * sleep -> the WAKE-UP day (``wake_date`` above), in the device timezone.
+# Rows without a source timezone fall back to the profile timezone, which is
+# the historical behaviour.
+
+
+def source_tz_of(metadata_json, fallback_tz):
+    """The tzinfo a measurement row was stamped in.
+
+    Reads ``metadata_json["source_timezone"]`` (written by the ingest router
+    from the bridge's ``source_timezone`` field); falls back to ``fallback_tz``
+    (usually the profile timezone) when absent/unparsable.
+    """
+    raw = None
+    if isinstance(metadata_json, dict):
+        raw = metadata_json.get("source_timezone")
+    if raw:
+        try:
+            return resolve_tz(raw)
+        except Exception:
+            pass
+    return resolve_tz(fallback_tz)
+
+
+def interval_midpoint(start_at: datetime, end_at: datetime | None) -> datetime:
+    """Midpoint instant of a measurement interval (zero-duration -> start)."""
+    if start_at is None:
+        return None
+    if start_at.tzinfo is None:
+        start_at = start_at.replace(tzinfo=timezone.utc)
+    end = end_at or start_at
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if end <= start_at:
+        return start_at
+    return start_at + (end - start_at) / 2
+
+
+def interval_day(start_at: datetime, end_at: datetime | None, tz) -> date | None:
+    """Local calendar day, in ``tz``, of a measurement interval's midpoint."""
+    mid = interval_midpoint(start_at, end_at)
+    if mid is None:
+        return None
+    return mid.astimezone(resolve_tz(tz)).date()
+
+
+def measurement_day(row: dict, fallback_tz) -> date | None:
+    """The day a steps/interval measurement belongs to.
+
+    ``row`` carries ``start_at`` / ``end_at`` / ``metadata_json`` (the shape
+    ``_measurements_since`` and ``daily_series`` build). Day = interval
+    midpoint in the row's own source timezone.
+    """
+    start = row.get("start_at") or row.get("recorded_at")
+    if start is None:
+        return None
+    tz = source_tz_of(row.get("metadata_json"), fallback_tz)
+    return interval_day(start, row.get("end_at"), tz)
+
+
+def sleep_day(row: dict, fallback_tz) -> date | None:
+    """The wake-up day a sleep measurement belongs to, in its source timezone."""
+    start = row.get("start_at") or row.get("recorded_at")
+    if start is None:
+        return None
+    tz = source_tz_of(row.get("metadata_json"), fallback_tz)
+    return wake_date(
+        start,
+        (row.get("value_json") or {}).get("duration_min"),
+        row.get("end_at"),
+        tz,
+    )
