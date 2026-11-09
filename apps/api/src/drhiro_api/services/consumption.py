@@ -758,6 +758,12 @@ def resolve_item_nutrition(db: Session, item: ParsedItem) -> ParsedItem:
     return item
 
 
+def _attach_micro_food(db: Session, mi: MealItem) -> None:
+    """Delegate to food_micros.attach_micro_food (kept for existing call sites)."""
+    from drhiro_api.services.food_micros import attach_micro_food
+    attach_micro_food(db, mi)
+
+
 # ---------------------------------------------------------------------------
 # Unified write path
 # ---------------------------------------------------------------------------
@@ -1072,6 +1078,7 @@ def write_consumption(
         )
         db.add(mi)
         db.flush()
+        _attach_micro_food(db, mi)
 
         ci.meal_item_id = meal_item_id
         all_nutrient_dicts.append(item.nutrients_scaled)
@@ -1809,6 +1816,7 @@ def _write_new_liquid_consumption(
         )
         db.add(mi)
         db.flush()
+        _attach_micro_food(db, mi)
 
         ci.meal_item_id = mi.id
 

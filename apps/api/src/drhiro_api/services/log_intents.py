@@ -655,6 +655,8 @@ def _write_ledgers(db: Session, user, parsed: "ParsedLog", now, existing,
                           nutrients_json=nutrients, source="text", confidence=1.0)
             db.add(mi)
             db.flush()
+            from drhiro_api.services.food_micros import attach_micro_food
+            attach_micro_food(db, mi)
             result["item_ids"].append(str(mi.id))
             meal_nutrients.append(nutrients)
             it.__dict__["_meal_item_id"] = mi.id

@@ -31,10 +31,30 @@ def _item_kcal_per100(item):
             return float(n["kcal"]) * 100.0 / basis
     return None
 
-def match_item_to_food(db, display_name: str, item=None, limit: int = 200):
-    """Return (food, confidence) or (None, score)."""
+def _candidate_foods(db, display_name: str, limit: int = 1000):
+    """Full-catalogue candidates by name token (no arbitrary first-N cap).
+
+    The old matcher scanned ``Food.limit(200)`` — an arbitrary slice of a
+    ~663k-row catalogue — so most foods were never even scored. Search the
+    whole catalogue by the longest name token via the display_name index,
+    falling back to shorter tokens only if the longest finds nothing.
+    """
     from drhiro_api.models import Food
-    foods = db.query(Food).limit(limit).all()
+    from sqlalchemy import or_
+    tokens = [t for t in _norm(display_name).split() if len(t) >= 3]
+    tokens.sort(key=len, reverse=True)
+    for tok in tokens[:3]:
+        rows = (db.query(Food)
+                .filter(or_(Food.display_name.ilike(f"%{tok}%"),
+                            Food.display_name_en.ilike(f"%{tok}%")))
+                .limit(limit).all())
+        if rows:
+            return rows
+    return []
+
+def match_item_to_food(db, display_name: str, item=None, limit: int = 1000):
+    """Return (food, confidence) or (None, score)."""
+    foods = _candidate_foods(db, display_name, limit=limit)
     item_kcal = _item_kcal_per100(item) if item is not None else None
     best, best_score = None, 0.0
     for f in foods:

@@ -55,3 +55,33 @@ def test_matcher_kcal_gate(db):
     item2 = MealItem(meal_id=None, display_name="Cod liver oil", quantity=1, grams=10, nutrients_json={"kcal": 9000})
     got2, _ = match_item_to_food(db, "Cod liver oil", item=item2)
     assert got2 is None
+
+def test_matcher_searches_beyond_first_200(db):
+    _setup(db)
+    ds = db.query(DataSource).first()
+    for i in range(250):
+        db.add(Food(data_source_id=ds.id, external_id=f"filler-{i}",
+                    display_name=f"Filler food {i}"))
+    db.flush()
+    target = Food(data_source_id=ds.id, external_id="777001",
+                  display_name="Quinoa, cooked")
+    db.add(target); db.flush()
+    got, score = match_item_to_food(db, "Quinoa, cooked")
+    assert got is not None and got.id == target.id and score >= 0.85
+
+def test_log_time_attach_sets_micro_food_via_fdc(db, monkeypatch):
+    from datetime import datetime, timezone
+    from drhiro_api.services.log_intents import LogIntent, ParsedLog, _write_ledgers
+    food = _setup(db)  # seeds nutrients + a usda food + confirmed meal
+    user = db.query(User).first()
+    monkeypatch.setenv("USDA_API_KEY", "test-key")
+    def fake_resolve(db_, display_name, item=None, **k):
+        return food, 0.9, 3
+    monkeypatch.setattr("drhiro_api.services.food_micros.resolve_via_fdc_search", fake_resolve)
+    parsed = ParsedLog(intents=[LogIntent(kind="meal", display_name="Zzunknownquinoa",
+                                           grams=100)], meal_slot="lunch")
+    result = _write_ledgers(db, user, parsed, datetime.now(timezone.utc), None, "test", "order-1")
+    db.commit()
+    mi = db.query(MealItem).filter_by(display_name="Zzunknownquinoa").one()
+    assert mi.micro_food_id == food.id and mi.micro_match_confidence == 0.9
+    assert result["meal_id"] is not None

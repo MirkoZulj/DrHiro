@@ -100,10 +100,24 @@ def test_backfill_retries_on_429(db, monkeypatch):
 
 def test_backfill_food_without_source(db):
     food = _setup(db, source_key="custom", external_id="")
-    report = backfill_food_micros(db, batch=10, sleep=NOSLEEP, run_matcher_first=False)
+    report = backfill_food_micros(db, batch=10, sleep=NOSLEEP, run_matcher_first=False,
+                                  fdc_search=lambda q: [])
     assert report["no_source"] == 1, report
     row = db.query(FoodMicroBackfill).filter_by(food_id=food.id).one()
-    assert row.status == "no_source" and row.source == "none"
+    assert row.status == "no_source" and row.source == "fdc_search"
+
+def test_backfill_unknown_food_fdc_search_fallback(db):
+    # drhiro_private-style food (no usda/off identity) -> live FDC search
+    food = _setup(db, source_key="custom", external_id="")
+    fake_search = lambda q: [{"fdc_id": 168462, "description": "Spinach, raw"}]  # noqa: E731
+    fake_fdc = lambda ids: {168462: {1090: 79.0}}  # noqa: E731
+    report = backfill_food_micros(db, batch=10, fdc_fetcher=fake_fdc,
+                                  fdc_search=fake_search, sleep=NOSLEEP,
+                                  run_matcher_first=False)
+    assert report["done"] == 1 and report["no_source"] == 0, report
+    assert _rows(db, food)["magnesium"] == pytest.approx(79.0)
+    row = db.query(FoodMicroBackfill).filter_by(food_id=food.id).one()
+    assert row.status == "done" and row.source == "fdc_search"
 
 
 def test_backfill_rerun_skips_done_foods(db):

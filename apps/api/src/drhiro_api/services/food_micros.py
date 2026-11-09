@@ -54,6 +54,128 @@ def _fdc_fetch(fdc_ids, fetcher=None, sleep=time.sleep):
         return out
     return {}
 
+def _fdc_search(query, fetcher=None, sleep=time.sleep, page_size=10):
+    """Live USDA FDC name search. Returns [{fdc_id, description}]."""
+    if fetcher is not None:
+        return fetcher(query)
+    import httpx
+    key = os.environ.get("USDA_API_KEY", "")
+    try:
+        r = httpx.get("https://api.nal.usda.gov/fdc/v1/foods/search",
+                      params={"query": query, "pageSize": page_size,
+                              "dataType": ["Foundation", "SR Legacy", "Survey (FNDDS)"],
+                              **({"api_key": key} if key else {})}, timeout=30)
+        if r.status_code != 200:
+            return []
+        out = [{"fdc_id": int(f["fdcId"]), "description": f.get("description", "")}
+               for f in r.json().get("foods", []) if f.get("fdcId") and f.get("description")]
+        sleep(1)
+        return out
+    except Exception:
+        return []
+
+def _values_from_raw(raw):
+    values = {}
+    for c in NUTRIENT_CATALOGUE:
+        if c.code in SUM_IDS:
+            total_g = sum(raw.get(i, 0) or 0 for i in c.fdc_ids)
+            if any(raw.get(i) is not None for i in c.fdc_ids):
+                values[c.code] = convert_value(total_g, c.fdc_unit, c.code)
+        else:
+            for fid in c.fdc_ids:
+                if raw.get(fid) is not None:
+                    values[c.code] = convert_value(raw[fid], c.fdc_unit, c.code)
+                    break
+    return values
+
+def _best_fdc_match(display_name, item=None, fdc_search=None, fdc_fetcher=None,
+                    sleep=time.sleep, threshold=0.70):
+    """Best FDC candidate by name similarity, kcal-gated when item kcal known.
+
+    Returns (fdc_id, description, score) or None.
+    """
+    from drhiro_api.services.intake_match import similarity, _item_kcal_per100
+    cands = _fdc_search(display_name, fetcher=fdc_search, sleep=sleep)
+    scored = sorted(((similarity(display_name, c["description"]), c) for c in cands),
+                    key=lambda t: t[0], reverse=True)
+    item_kcal = _item_kcal_per100(item) if item is not None else None
+    for score, cand in scored:
+        if score < threshold:
+            continue
+        if item_kcal is not None:
+            fetched = _fdc_fetch([cand["fdc_id"]], fetcher=fdc_fetcher, sleep=sleep)
+            raw = fetched.get(cand["fdc_id"]) or {}
+            fk = raw.get(1008)  # Energy kcal
+            if fk is not None and fk > 0 and abs(item_kcal - fk) / fk > 0.25:
+                continue
+            return cand["fdc_id"], cand["description"], score
+        return cand["fdc_id"], cand["description"], score
+    return None
+
+def resolve_via_fdc_search(db, display_name, item=None, fdc_search=None,
+                           fdc_fetcher=None, sleep=time.sleep):
+    """Search FDC live, create/reuse the usda Food row, upsert its micros.
+
+    Returns (food, score, nutrients_found) or (None, score, 0).
+    Caller owns the transaction (flush only).
+    """
+    from drhiro_api.models import DataSource
+    best = _best_fdc_match(display_name, item=item, fdc_search=fdc_search,
+                           fdc_fetcher=fdc_fetcher, sleep=sleep)
+    if best is None:
+        return None, 0.0, 0
+    fdc_id, description, score = best
+    ds = db.query(DataSource).filter(DataSource.source_key == "usda").first()
+    if ds is None:
+        ds = DataSource(source_key="usda", source_label="USDA")
+        db.add(ds); db.flush()
+    food = (db.query(Food).filter(Food.data_source_id == ds.id,
+                                  Food.external_id == str(fdc_id)).first())
+    if food is None:
+        food = Food(data_source_id=ds.id, external_id=str(fdc_id),
+                    display_name=description)
+        db.add(food); db.flush()
+    fetched = _fdc_fetch([fdc_id], fetcher=fdc_fetcher, sleep=sleep)
+    raw = fetched.get(fdc_id)
+    if not raw:
+        return food, score, 0
+    found = _upsert(db, food.id, _values_from_raw(raw), _nutrient_map(db))
+    _record(db, food, "usda_search", "done", found, None)
+    return food, score, found
+
+def attach_micro_food(db, mi) -> None:
+    """Best-effort micro_food_id attach at meal-log time (never fails the log).
+
+    1. Local catalogue match over the FULL foods table (name token search).
+    2. If no local match and FDC search is enabled (USDA_API_KEY present or
+       DRHIRO_FDC_SEARCH_AT_LOG=1), search FDC live, create the usda Food
+       row + micros, and point the item at it.
+    All failures are swallowed — logging must never break on micro matching.
+    Caller owns the transaction.
+    """
+    import logging, os
+    log = logging.getLogger("drhiro.food_micros")
+    try:
+        from drhiro_api.services.intake_match import match_item_to_food
+        food, score = match_item_to_food(db, mi.display_name, item=mi)
+        if food is not None:
+            mi.micro_food_id = food.id
+            mi.micro_match_confidence = round(score, 4)
+            return
+    except Exception:
+        log.exception("micro local match failed for %s", mi.display_name)
+    if not (os.environ.get("USDA_API_KEY")
+            or os.environ.get("DRHIRO_FDC_SEARCH_AT_LOG") == "1"):
+        return
+    try:
+        with db.begin_nested():
+            food, score, _found = resolve_via_fdc_search(db, mi.display_name, item=mi)
+            if food is not None:
+                mi.micro_food_id = food.id
+                mi.micro_match_confidence = round(score, 4)
+    except Exception:
+        log.exception("micro FDC search failed for %s", mi.display_name)
+
 def _off_fetch(barcode, fetcher=None):
     if fetcher is not None:
         return fetcher(barcode)
@@ -65,15 +187,25 @@ def _off_fetch(barcode, fetcher=None):
     data = r.json()
     return (data.get("product") or {}) if data.get("status") else None
 
-def backfill_food_micros(db, batch: int = 200, fdc_fetcher=None, off_fetcher=None, sleep=time.sleep, run_matcher_first: bool = True) -> dict:
+def backfill_food_micros(db, batch: int = 200, fdc_fetcher=None, off_fetcher=None, sleep=time.sleep, run_matcher_first: bool = True, fdc_search=None) -> dict:
     if run_matcher_first:
         from drhiro_api.services.intake_match import run_matcher
         run_matcher(db)
     nmap = _nutrient_map(db)
-    done_ids = {b.food_id for b in db.query(FoodMicroBackfill).all()}
-    failed_old = {b.food_id for b in db.query(FoodMicroBackfill).filter(FoodMicroBackfill.status == "failed").all()
-                  if b.attempted_at and b.attempted_at < datetime.now(timezone.utc) - timedelta(days=7)}
-    todo_ids = (done_ids - failed_old)
+    rows = {b.food_id: b for b in db.query(FoodMicroBackfill).all()}
+    cutoff7 = datetime.now(timezone.utc) - timedelta(days=7)
+
+    def _retryable(row):
+        if row is None:
+            return True
+        if row.status not in ("failed", "no_source"):
+            return False
+        # Legacy no_source rows (source="none") predate the live FDC search
+        # fallback — retry them once under the new code path.
+        if row.source == "none":
+            return True
+        return row.attempted_at is None or row.attempted_at < cutoff7
+
     # foods referenced by any confirmed meal item
     foods = {}
     for it in db.query(MealItem).join(Meal, Meal.id == MealItem.meal_id).filter(Meal.status == "confirmed").all():
@@ -84,9 +216,9 @@ def backfill_food_micros(db, batch: int = 200, fdc_fetcher=None, off_fetcher=Non
             f = db.get(Food, __import__("uuid").UUID(str(ref)))
         except Exception:
             f = None
-        if f is not None and f.id not in done_ids:
+        if f is not None and _retryable(rows.get(f.id)):
             foods[f.id] = f
-    pending = [f for f in foods.values() if f.id not in todo_ids or f.id in failed_old][:batch]
+    pending = list(foods.values())[:batch]
     report = {"attempted": 0, "done": 0, "no_source": 0, "failed": 0}
     usda_foods = [f for f in pending if (f.data_source.source_key if f.data_source else "") == "usda" and str(f.external_id).isdigit()]
     off_foods = [f for f in pending if (f.data_source.source_key if f.data_source else "") in ("off", "open_food_facts") and f.barcode]
@@ -105,17 +237,7 @@ def backfill_food_micros(db, batch: int = 200, fdc_fetcher=None, off_fetcher=Non
             raw = fetched.get(int(f.external_id))
             if not raw:
                 _record(db, f, "usda", "failed", 0, "no FDC response"); report["failed"] += 1; continue
-            values = {}
-            for c in NUTRIENT_CATALOGUE:
-                if c.code in SUM_IDS:
-                    total_g = sum(raw.get(i, 0) or 0 for i in c.fdc_ids)
-                    if any(raw.get(i) is not None for i in c.fdc_ids):
-                        values[c.code] = convert_value(total_g, c.fdc_unit, c.code)
-                else:
-                    for fid in c.fdc_ids:
-                        if raw.get(fid) is not None:
-                            values[c.code] = convert_value(raw[fid], c.fdc_unit, c.code)
-                            break
+            values = _values_from_raw(raw)
             found = _upsert(db, f.id, values, nmap)
             _record(db, f, "usda", "done", found, None); report["done"] += 1
     for f in off_foods:
@@ -136,8 +258,25 @@ def backfill_food_micros(db, batch: int = 200, fdc_fetcher=None, off_fetcher=Non
         found = _upsert(db, f.id, values, nmap)
         _record(db, f, "off", "done", found, None); report["done"] += 1
     for f in others:
+        # No usda/off identity: search FDC live by name and upsert the
+        # matched food's micros onto this row (identity unchanged).
         report["attempted"] += 1
-        _record(db, f, "none", "no_source", 0, None); report["no_source"] += 1
+        try:
+            best = _best_fdc_match(f.display_name, fdc_search=fdc_search,
+                                   fdc_fetcher=fdc_fetcher, sleep=sleep)
+            if best is None:
+                _record(db, f, "fdc_search", "no_source", 0, "FDC search no match")
+                report["no_source"] += 1; continue
+            fdc_id, _desc, _score = best
+            fetched = _fdc_fetch([fdc_id], fetcher=fdc_fetcher, sleep=sleep)
+            raw = fetched.get(fdc_id)
+            if not raw:
+                _record(db, f, "fdc_search", "failed", 0, "no FDC response")
+                report["failed"] += 1; continue
+            found = _upsert(db, f.id, _values_from_raw(raw), nmap)
+            _record(db, f, "fdc_search", "done", found, None); report["done"] += 1
+        except Exception as e:
+            _record(db, f, "fdc_search", "failed", 0, str(e)); report["failed"] += 1
     db.commit()
     return report
 
