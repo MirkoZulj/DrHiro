@@ -92,15 +92,46 @@ def _best_fdc_match(display_name, item=None, fdc_search=None, fdc_fetcher=None,
                     sleep=time.sleep, threshold=0.70):
     """Best FDC candidate by name similarity, kcal-gated when item kcal known.
 
+    Search tiers: full name, English parenthetical (non-English items), then
+    individual long tokens (AI-estimated compound names like 'homemade pizza').
+    Acceptance: similarity >= threshold, else token-containment (short names).
     Returns (fdc_id, description, score) or None.
     """
-    from drhiro_api.services.intake_match import similarity, _item_kcal_per100
-    cands = _fdc_search(display_name, fetcher=fdc_search, sleep=sleep)
-    scored = sorted(((similarity(display_name, c["description"]), c) for c in cands),
-                    key=lambda t: t[0], reverse=True)
+    from drhiro_api.services.intake_match import (similarity, _item_kcal_per100,
+                                                  base_name, parenthetical,
+                                                  _tokens, _norm, containment_tier)
+    mname = base_name(display_name)
+    # search queries: full name, English parenthetical if distinct, long tokens
+    queries = [display_name]
+    p = parenthetical(display_name)
+    if p and _norm(p) != "ai estimated" and p.lower() != display_name.lower():
+        queries.append(p)
+    for t in sorted(_tokens(mname), key=len, reverse=True)[:2]:
+        if len(t) >= 5:
+            queries.append(t)
+            if t.endswith("s") and not t.endswith("ss"):
+                queries.append(t[:-1])  # plural -> stem ('cashews' -> 'cashew')
+    # (query, cand) pairs — token-tier acceptance needs the source query
+    pairs, seen = [], set()
+    for q in queries[:4]:
+        for c in _fdc_search(q, fetcher=fdc_search, sleep=sleep):
+            if c["fdc_id"] not in seen:
+                seen.add(c["fdc_id"])
+                pairs.append((q, c))
+    if not pairs:
+        return None
+    scored = sorted(((max(similarity(display_name, c["description"]),
+                          similarity(mname, c["description"])), q, c)
+                     for q, c in pairs), key=lambda t: t[0], reverse=True)
     item_kcal = _item_kcal_per100(item) if item is not None else None
-    for score, cand in scored:
-        if score < threshold:
+    name_tokens = _tokens(mname)
+    for score, q, cand in scored:
+        ctok = _tokens(cand["description"])
+        token_ok = q in name_tokens and q in ctok  # single-token tier query
+        ok = (score >= threshold
+              or containment_tier(name_tokens, ctok)
+              or token_ok)
+        if not ok:
             continue
         if item_kcal is not None:
             fetched = _fdc_fetch([cand["fdc_id"]], fetcher=fdc_fetcher, sleep=sleep)
@@ -108,7 +139,6 @@ def _best_fdc_match(display_name, item=None, fdc_search=None, fdc_fetcher=None,
             fk = raw.get(1008)  # Energy kcal
             if fk is not None and fk > 0 and abs(item_kcal - fk) / fk > 0.25:
                 continue
-            return cand["fdc_id"], cand["description"], score
         return cand["fdc_id"], cand["description"], score
     return None
 
