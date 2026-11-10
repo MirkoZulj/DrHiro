@@ -32,6 +32,11 @@ def base_name(display_name: str) -> str:
     """
     n = re.sub(r"\s*\([^()]*ai[-\s]estimated[^()]*\)\s*$", "",
                (display_name or "").strip(), flags=re.I)
+    # Strip a trailing portion/quantity ('Kefir, 150 G', 'Water, Plain, 0 G')
+    # — it is not part of the food identity and poisons token matching.
+    n = re.sub(r"[\s,]*\b\d+(?:\.\d+)?\s*(?:g|ml|oz|l|kg|lb|pcs|piece|pieces|"
+               r"cup|cups|tbsp|tsp|serving|servings|pack)\b\.?\s*$",
+               "", n, flags=re.I).strip().rstrip(",").strip()
     p = parenthetical(n)
     return p if p else n
 
@@ -51,6 +56,34 @@ _GENERIC = {
     "extra", "aged", "young", "mixed", "whole", "regular", "strong",
     "roasted", "baked", "cooked", "freshly", "local",
 }
+
+# Preparation/cut/style words: a candidate may carry these and still be the
+# same food ('Beer, regular', 'Beef, ground, raw').
+_MODIFIERS = {
+    "raw", "dried", "cured", "sliced", "ground", "chopped", "canned",
+    "frozen", "smoked", "boiled", "fried", "grilled", "steamed", "pickled",
+    "peeled", "seeded", "skinless", "boneless", "lean", "prepared", "ready",
+    "processed", "salted", "unsalted", "sweetened", "unsweetened", "lowfat",
+    "nonfat", "skim", "filtered", "pasteurized", "diet", "sugarfree",
+    "halves", "pieces", "chunks", "crushed", "minced", "diced", "powdered",
+    "concentrated", "evaporated", "condensed", "drinking", "table",
+}
+
+# Food-class words: descriptive of the kind, not a different food
+# ('Pizza, cheese' is still pizza).
+_CATEGORY = {
+    "nut", "nuts", "fruit", "fruits", "vegetable", "vegetables", "beverage",
+    "beverages", "drink", "juice", "water", "milk", "cheese", "yogurt",
+    "yoghurt", "bread", "pasta", "rice", "cereal", "cereals", "snack",
+    "snacks", "sauce", "soup", "oil", "butter", "meat", "pork", "beef",
+    "chicken", "poultry", "fish", "seafood", "egg", "eggs", "bean", "beans",
+    "lentil", "lentils", "seed", "seeds", "grain", "grains", "flour",
+    "sugar", "honey", "candy", "sweets", "dessert", "pudding", "cream",
+    "syrup", "bran", "shell", "cake", "pastry",
+}
+
+# Filler + modifiers + category: tokens that do not change which food it is.
+_NONIDENTIFYING = _GENERIC | _MODIFIERS | _CATEGORY
 
 
 def _fold_all(*token_sets):
@@ -86,6 +119,14 @@ def containment_tier(name_tokens, cand_tokens) -> bool:
     nt = nt_raw - _GENERIC
     ct = ct_raw - _GENERIC
     if 1 <= len(nt) <= 2 and nt <= ct:
+        # Single-content-token names ('beer') must not latch onto a candidate
+        # that adds a *different* food word ('beer mustard'). Short candidates
+        # (<=3 tokens) may only add non-identifying words; longer descriptions
+        # ('Nuts, cashew nuts, raw') are trusted as-is.
+        if len(nt) == 1 and len(ct_raw) <= 3:
+            extra = ct_raw - nt_raw
+            if not extra <= _NONIDENTIFYING:
+                return False
         return True
     if (len(nt_raw) <= 3 and len(ct_raw) <= 3
             and (nt_raw <= ct_raw or ct_raw <= nt_raw)):
@@ -102,7 +143,9 @@ def _item_kcal_per100(item):
     n = item.nutrients_json or {}
     if isinstance(n, dict) and isinstance(n.get("kcal"), (int, float)):
         basis = item.grams or item.volume_ml
-        if basis:
+        # Below ~10 g/ml the per-100 g estimate is noise ('Kefir, 150 G'
+        # logged as grams=1.5 reads as 139 kcal/100 g) — no gate.
+        if basis and basis >= 10:
             return float(n["kcal"]) * 100.0 / basis
     return None
 

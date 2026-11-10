@@ -46,7 +46,7 @@ def _food(db, name, kcal=None):
     return f
 
 
-def _item(db, name, kcal=None, grams=100):
+def _item(db, name, kcal=None, grams: float = 100):
     u = User(display_name="U", timezone="Europe/Zagreb")
     db.add(u); db.flush()
     m = Meal(user_id=u.id, eaten_at=datetime(2026, 11, 4, 12, tzinfo=TZ).astimezone(timezone.utc),
@@ -61,6 +61,13 @@ def _item(db, name, kcal=None, grams=100):
 def test_base_name_strips_ai_marker():
     assert base_name("homemade pizza (AI-estimated)") == "homemade pizza"
     assert base_name("roasted corn snack, chili (AI-estimated)") == "roasted corn snack, chili"
+
+
+def test_base_name_strips_quantity_suffix():
+    assert base_name("Kefir, 150 G") == "Kefir"
+    assert base_name("Water, Plain, 0 G") == "Water, Plain"
+    assert base_name("Beer, regular, 330 ml") == "Beer, regular"
+    assert base_name("Beef, 80% lean, raw") == "Beef, 80% lean, raw"
 
 
 def test_base_name_prefers_english_parenthetical():
@@ -99,7 +106,23 @@ def test_local_match_plural_fold(db):
     assert food is not None and food.display_name == "Nuts, cashew nuts, raw"
 
 
-def test_local_match_beeF_kcal_gated(db):
+def test_beer_does_not_match_beer_mustard(db):
+    """'beer' must not latch onto a candidate that adds a different food."""
+    _food(db, "beer mustard")
+    _food(db, "Beer, regular")
+    food, _ = match_item_to_food(db, "beer")
+    assert food is not None and food.display_name == "Beer, regular"
+
+
+def test_kefir_matches_despite_tiny_basis(db):
+    """grams=1.5 makes kcal/100g noise; the gate must not block the match."""
+    _food(db, "Kefir, lowfat, plain, LIFEWAY", kcal=60)
+    it = _item(db, "Kefir, 150 G", kcal=2.08, grams=1.5)
+    food, _ = match_item_to_food(db, it.display_name, item=it)
+    assert food is not None and food.display_name == "Kefir, lowfat, plain, LIFEWAY"
+
+
+def test_beeF_kcal_gated(db):
     _food(db, "Beef, ground, raw", kcal=155)
     # item claims 23 kcal/100g (like spinach) -> beef must be gated out
     it = _item(db, "BEEF", kcal=23)
