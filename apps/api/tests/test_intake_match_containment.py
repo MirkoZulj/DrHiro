@@ -106,6 +106,21 @@ def test_local_match_plural_fold(db):
     assert food is not None and food.display_name == "Nuts, cashew nuts, raw"
 
 
+def test_prefers_micro_rich_candidate(db):
+    """Among tier-passing candidates, the one carrying micros wins."""
+    _food(db, "Cashews, raw")
+    generic = _food(db, "Nuts, cashew nuts, raw")
+    for code, amt in (("iron", 6.6), ("zinc", 5.6), ("magnesium", 292.0)):
+        nn = db.query(Nutrient).filter_by(nutrient_code=code).first()
+        if nn is None:
+            nn = Nutrient(nutrient_code=code, nutrient_label=code, unit="mg", category="micro")
+            db.add(nn); db.flush()
+        db.add(FoodNutrient(food_id=generic.id, nutrient_id=nn.id, amount_per_100g=amt))
+    db.commit()
+    food, _ = match_item_to_food(db, "cashews")
+    assert food is not None and food.display_name == "Nuts, cashew nuts, raw"
+
+
 def test_beer_does_not_match_beer_mustard(db):
     """'beer' must not latch onto a candidate that adds a different food."""
     _food(db, "beer mustard")

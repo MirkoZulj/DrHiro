@@ -168,26 +168,50 @@ def _candidate_foods(db, display_name: str, limit: int = 1000):
         queries.append(t)
         if len(t) > 4 and t.endswith("s") and not t.endswith("ss"):
             queries.append(t[:-1])
+    seen: set = set()
+    rows: list = []
     for tok in queries:
-        rows = (db.query(Food)
-                .filter(or_(Food.display_name.ilike(f"%{tok}%"),
-                            Food.display_name_en.ilike(f"%{tok}%")))
-                .limit(limit).all())
-        if rows:
-            return rows
-    return []
+        for r in (db.query(Food)
+                  .filter(or_(Food.display_name.ilike(f"%{tok}%"),
+                              Food.display_name_en.ilike(f"%{tok}%")))
+                  .limit(limit).all()):
+            if r.id not in seen:
+                seen.add(r.id)
+                rows.append(r)
+        if len(rows) >= limit:
+            break
+    return rows
+
+def _micro_counts(db, food_ids) -> dict:
+    """Non-energy micronutrient row counts per food id (one bulk query)."""
+    from drhiro_api.models import FoodNutrient, Nutrient
+    from sqlalchemy import func
+    ids = list(food_ids)
+    if not ids:
+        return {}
+    rows = (db.query(FoodNutrient.food_id, func.count(FoodNutrient.id))
+            .join(Nutrient, Nutrient.id == FoodNutrient.nutrient_id)
+            .filter(FoodNutrient.food_id.in_(ids),
+                    Nutrient.nutrient_code != "energy")
+            .group_by(FoodNutrient.food_id).all())
+    return {fid: c for fid, c in rows}
 
 def match_item_to_food(db, display_name: str, item=None, limit: int = 1000):
     """Return (food, confidence) or (None, score).
 
     Two tiers: (1) name similarity >= 0.85; (2) token-containment for short
     generic names ('beer' in 'Beer, regular'). Both kcal-gated ±25%.
+
+    Among the candidates that pass, prefer the one that actually carries
+    micronutrient data — a brand food with 3 micros loses to the generic
+    'Nuts, cashew nuts, raw' with a full profile. Ties fall back to name
+    similarity.
     """
     foods = _candidate_foods(db, display_name, limit=limit)
     item_kcal = _item_kcal_per100(item) if item is not None else None
     mname = base_name(display_name)
     name_tokens = _tokens(mname)
-    best, best_score = None, 0.0
+    passing = []
     for f in foods:
         score = max(similarity(display_name, f.display_name),
                     similarity(mname, f.display_name))
@@ -198,8 +222,12 @@ def match_item_to_food(db, display_name: str, item=None, limit: int = 1000):
             if fk is not None and fk > 0:
                 if abs(item_kcal - fk) / fk > 0.25:
                     continue
-        if score > best_score:
-            best, best_score = f, score
+        passing.append((f, score))
+    if not passing:
+        return None, 0.0
+    counts = _micro_counts(db, [f.id for f, _ in passing])
+    passing.sort(key=lambda t: (counts.get(t[0].id, 0), t[1]), reverse=True)
+    best, best_score = passing[0]
     return best, best_score
 
 def run_matcher(db, days: int = 365, limit: int = 500) -> dict:
