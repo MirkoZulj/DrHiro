@@ -128,8 +128,7 @@ def containment_tier(name_tokens, cand_tokens) -> bool:
             if not extra <= _NONIDENTIFYING:
                 return False
         return True
-    if (len(nt_raw) <= 3 and len(ct_raw) <= 3
-            and (nt_raw <= ct_raw or ct_raw <= nt_raw)):
+    if len(nt_raw) <= 3 and nt_raw == ct_raw:
         return True
     return False
 
@@ -226,8 +225,14 @@ def match_item_to_food(db, display_name: str, item=None, limit: int = 1000):
     if not passing:
         return None, 0.0
     counts = _micro_counts(db, [f.id for f, _ in passing])
-    passing.sort(key=lambda t: (counts.get(t[0].id, 0), t[1]), reverse=True)
-    best, best_score = passing[0]
+    # Prefer the closest NAME among candidates that actually carry a usable
+    # micro profile (>=3 nutrients). Max-micro-count alone would promote a
+    # generic 'CHEESE' over the correct 'Cheese, Emmental'. Fall back to all
+    # passing candidates when none reaches the threshold.
+    rich = [(f, s) for f, s in passing if counts.get(f.id, 0) >= 3]
+    pool = rich or passing
+    pool.sort(key=lambda t: t[1], reverse=True)
+    best, best_score = pool[0]
     return best, best_score
 
 def run_matcher(db, days: int = 365, limit: int = 500) -> dict:

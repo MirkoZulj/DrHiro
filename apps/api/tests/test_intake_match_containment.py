@@ -121,6 +121,31 @@ def test_prefers_micro_rich_candidate(db):
     assert food is not None and food.display_name == "Nuts, cashew nuts, raw"
 
 
+def test_subset_candidate_rejected(db):
+    """A candidate that DROPS a distinctive name token must not match:
+    'gummy bears' is candy, not the meat entry 'Bear'."""
+    _food(db, "Bear")
+    food, _ = match_item_to_food(db, "gummy bears")
+    assert food is None
+
+
+def test_prefers_closest_name_among_micro_rich(db):
+    """Among micro-rich candidates the closest name wins, not the largest
+    micro count ('Emmental cheese' -> Emmental, not generic CHEESE)."""
+    _food(db, "CHEESE")
+    emmental = _food(db, "Cheese, Emmental")
+    for code, amt in (("iron", 0.2), ("zinc", 3.9), ("calcium", 1041.0),
+                      ("phosphorus", 600.0), ("magnesium", 30.0)):
+        nn = db.query(Nutrient).filter_by(nutrient_code=code).first()
+        if nn is None:
+            nn = Nutrient(nutrient_code=code, nutrient_label=code, unit="mg", category="micro")
+            db.add(nn); db.flush()
+        db.add(FoodNutrient(food_id=emmental.id, nutrient_id=nn.id, amount_per_100g=amt))
+    db.commit()
+    food, _ = match_item_to_food(db, "Emmental cheese")
+    assert food is not None and food.display_name == "Cheese, Emmental"
+
+
 def test_beer_does_not_match_beer_mustard(db):
     """'beer' must not latch onto a candidate that adds a different food."""
     _food(db, "beer mustard")
