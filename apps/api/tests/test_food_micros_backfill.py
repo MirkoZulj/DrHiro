@@ -120,6 +120,30 @@ def test_backfill_unknown_food_fdc_search_fallback(db):
     assert row.status == "done" and row.source == "fdc_search"
 
 
+def test_backfill_attaches_fdc_food_to_unmatched_item(db, monkeypatch):
+    """A confirmed item with no local match gets the live-FDC fallback
+    inside backfill (same path as meal-log time)."""
+    _nuts(db)
+    u = User(display_name="U", timezone="Europe/Zagreb")
+    db.add(u); db.flush()
+    m = Meal(user_id=u.id, eaten_at=datetime(2026, 11, 8, 12, tzinfo=TZ).astimezone(timezone.utc),
+             meal_type="dinner", status="confirmed")
+    db.add(m); db.flush()
+    db.add(MealItem(meal_id=m.id, display_name="homemade pizza (AI-estimated)",
+                    quantity=1, grams=250, nutrients_json={"kcal": 600}))
+    db.commit()
+    monkeypatch.setenv("USDA_API_KEY", "test")
+    fake_search = lambda q: [{"fdc_id": 123456, "description": "Pizza, cheese"}]  # noqa: E731
+    fake_fdc = lambda ids: {123456: {1090: 10.0}}  # noqa: E731
+    report = backfill_food_micros(db, batch=10, fdc_fetcher=fake_fdc,
+                                  fdc_search=fake_search, sleep=NOSLEEP,
+                                  run_matcher_first=False)
+    assert report["items_attached"] == 1, report
+    item = db.query(MealItem).filter_by(display_name="homemade pizza (AI-estimated)").one()
+    food = db.get(Food, item.micro_food_id)
+    assert food is not None and food.display_name == "Pizza, cheese"
+
+
 def test_backfill_rerun_skips_done_foods(db):
     food = _setup(db)
     fake = lambda ids: {168462: {1090: 79.0}}  # noqa: E731

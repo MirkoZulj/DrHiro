@@ -173,13 +173,13 @@ def resolve_via_fdc_search(db, display_name, item=None, fdc_search=None,
     _record(db, food, "usda_search", "done", found, None)
     return food, score, found
 
-def attach_micro_food(db, mi) -> None:
+def attach_micro_food(db, mi, fdc_search=None, fdc_fetcher=None, sleep=time.sleep) -> None:
     """Best-effort micro_food_id attach at meal-log time (never fails the log).
 
     1. Local catalogue match over the FULL foods table (name token search).
     2. If no local match and FDC search is enabled (USDA_API_KEY present or
-       DRHIRO_FDC_SEARCH_AT_LOG=1), search FDC live, create the usda Food
-       row + micros, and point the item at it.
+    DRHIRO_FDC_SEARCH_AT_LOG=1), search FDC live, create the usda Food
+    row + micros, and point the item at it.
     All failures are swallowed — logging must never break on micro matching.
     Caller owns the transaction.
     """
@@ -199,7 +199,10 @@ def attach_micro_food(db, mi) -> None:
         return
     try:
         with db.begin_nested():
-            food, score, _found = resolve_via_fdc_search(db, mi.display_name, item=mi)
+            food, score, _found = resolve_via_fdc_search(db, mi.display_name, item=mi,
+                                                         fdc_search=fdc_search,
+                                                         fdc_fetcher=fdc_fetcher,
+                                                         sleep=sleep)
             if food is not None:
                 mi.micro_food_id = food.id
                 mi.micro_match_confidence = round(score, 4)
@@ -220,7 +223,30 @@ def _off_fetch(barcode, fetcher=None):
 def backfill_food_micros(db, batch: int = 200, fdc_fetcher=None, off_fetcher=None, sleep=time.sleep, run_matcher_first: bool = True, fdc_search=None) -> dict:
     if run_matcher_first:
         from drhiro_api.services.intake_match import run_matcher
-        run_matcher(db)
+        # No 500-item cap: the nightly job must clear the whole backlog,
+        # not an arbitrary first slice of it.
+        run_matcher(db, days=365, limit=100000)
+    # Items still without a micro food: local match + live FDC fallback —
+    # the same path as meal-log time (attach_micro_food). Without this the
+    # tail of the backlog was never touched, because the food-level pass
+    # below only visits foods already referenced by some item.
+    import logging
+    log = logging.getLogger("drhiro.food_micros")
+    items_attached = 0
+    pending_items = (db.query(MealItem).join(Meal, Meal.id == MealItem.meal_id)
+                     .filter(Meal.status == "confirmed",
+                             MealItem.micro_food_id.is_(None))
+                     .limit(batch * 5).all())
+    for it in pending_items:
+        try:
+            attach_micro_food(db, it, fdc_search=fdc_search,
+                              fdc_fetcher=fdc_fetcher, sleep=sleep)
+            db.commit()
+            if it.micro_food_id is not None:
+                items_attached += 1
+        except Exception:
+            log.exception("backfill attach failed for %s", it.display_name)
+            db.rollback()
     nmap = _nutrient_map(db)
     rows = {b.food_id: b for b in db.query(FoodMicroBackfill).all()}
     cutoff7 = datetime.now(timezone.utc) - timedelta(days=7)
@@ -249,7 +275,8 @@ def backfill_food_micros(db, batch: int = 200, fdc_fetcher=None, off_fetcher=Non
         if f is not None and _retryable(rows.get(f.id)):
             foods[f.id] = f
     pending = list(foods.values())[:batch]
-    report = {"attempted": 0, "done": 0, "no_source": 0, "failed": 0}
+    report = {"attempted": 0, "done": 0, "no_source": 0, "failed": 0,
+              "items_attached": items_attached}
     usda_foods = [f for f in pending if (f.data_source.source_key if f.data_source else "") == "usda" and str(f.external_id).isdigit()]
     off_foods = [f for f in pending if (f.data_source.source_key if f.data_source else "") in ("off", "open_food_facts") and f.barcode]
     others = [f for f in pending if f not in usda_foods and f not in off_foods]
