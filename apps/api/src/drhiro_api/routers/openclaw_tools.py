@@ -38,6 +38,7 @@ from drhiro_api.services.day_boundary import (
     resolve_tz,
     utc_offset_str,
 )
+from drhiro_api.services.photo_router import classify_batch, router_enabled, router_threshold
 from drhiro_rules.calculations import weight_trend
 from drhiro_schema.metrics import MetricType
 
@@ -1628,6 +1629,13 @@ async def tool_ingest_medical_batch(
     Idempotent: callers pass ``batch_key`` (stable per batch, e.g. a hash of
     the staged media paths); a replay returns the original ids with
     deduplicated=true and stores nothing new.
+
+    Routing gate (0.12.0-i): before anything medical is written, a confident
+    FOOD/MEAL batch (vision classifier, see services/photo_router.py) is
+    diverted to a MEAL draft instead — food photos must never become medical
+    records. Medication/supplement labels and medical documents keep the
+    medical path (the label flow needs the record), as does ANY classifier
+    failure or ambiguity: the medical-path guarantee never regresses.
     """
     from drhiro_api.routers.medical import store_scan
 
@@ -1645,11 +1653,93 @@ async def tool_ingest_medical_batch(
         )
         if existing is not None:
             prior = existing.result_json or {}
+            # The routing decision (meal vs medical) lives in the stored
+            # result_json, so a replay returns the ORIGINAL decision — a meal
+            # batch is never re-routed into a medical record on retry.
             return ToolResponse(
                 ok=True,
                 message="Batch already staged — returning the original encounter/record.",
                 data={**prior, "deduplicated": True},
             )
+
+    # ── Routing gate (0.12.0-i) ────────────────────────────────────────────
+    # Before creating ANY medical encounter/record, ask the vision classifier
+    # what the batch actually is. Only a CONFIDENT food/meal batch is diverted
+    # to a meal draft; everything else (medical documents, medication labels,
+    # ambiguous, classifier failure) keeps the medical path unchanged, so the
+    # guarantee that real medical photos are always stored cannot regress.
+    # The classifier itself never raises: failure -> 'other' -> medical path.
+    image_bytes: list[bytes] = []
+    for f in files:
+        data = await f.read()
+        image_bytes.append(data)
+
+    routed_to_meal = False
+    router_verdict = None
+    if router_enabled():
+        try:
+            router_verdict = classify_batch(image_bytes, caption)
+        except Exception:
+            router_verdict = {"category": "other", "confidence": 0.0, "reason": "classification failed"}
+        # A confident FOOD/MEAL verdict routes to a meal draft. 'other'
+        # (which is also the failure sentinel) and every other category keep
+        # the medical path, so a classifier outage can never suppress the
+        # medical storage guarantee.
+        routed_to_meal = (
+            router_verdict.get("category") == "food_meal"
+            and float(router_verdict.get("confidence") or 0.0) >= router_threshold()
+        )
+
+    if routed_to_meal:
+        # Store the scans (reusing store_scan so photos are preserved on disk
+        # exactly like the medical path), then create ONE meal draft. No
+        # encounter, no medical record. The classifier sniff can mis-detect a
+        # MIME from the magic bytes, so the ORIGINAL upload content type is
+        # used for the extension (store_scan rejects unsupported types).
+        scan_paths = [store_scan(user, data, f.content_type) for f, data in zip(files, image_bytes)]
+        n = len(scan_paths)
+        meal = Meal(
+            user_id=user.id,
+            eaten_at=local_now(user.timezone).astimezone(timezone.utc),
+            meal_type=None,
+            status="needs_review",
+            input_method="photo",
+            notes=((caption or "").strip() or "Photo meal (auto-routed)"),
+            photo_asset_id=scan_paths[0],
+            confidence=0.0,
+        )
+        db.add(meal)
+        db.flush()
+        result = {
+            "routed": "meal",
+            "meal_id": str(meal.id),
+            "photo_count": n,
+            "scan_paths": scan_paths,
+            "deduplicated": False,
+            "status": "needs_review",
+        }
+        if key:
+            db.add(IngestBatch(
+                user_id=user.id,
+                installation_id="medical_batch_ingest",
+                batch_id=key,
+                result_json=result,
+            ))
+        _tool_audit(db, user, "tools.ingest_medical_batch", "meal", str(meal.id),
+                    metadata={"routed": "meal", "photo_count": n, "batch_key": key,
+                              "router_category": "food_meal"})
+        db.commit()
+        return ToolResponse(
+            ok=True,
+            message=(
+                f"Routed {n} photo(s) to a MEAL draft (meal_id={meal.id}) — this was a "
+                "food/meal photo, not a medical document, so NO medical record was created. "
+                "Identify the food items from the photos, add them to THAT draft "
+                "(update_meal_item / get_pending_meal), then verify with get_pending_meal "
+                "and confirm with confirm_meal. Never create a medical record for these photos."
+            ),
+            data=result,
+        )
 
     # Encounter date defaults to the user's LOCAL day (never the UTC clock).
     if encounter_date and encounter_date.strip():
@@ -1662,8 +1752,7 @@ async def tool_ingest_medical_batch(
 
     # Store first (all scans), then create encounter + ONE record atomically.
     scan_paths: list[str] = []
-    for f in files:
-        data = await f.read()
+    for f, data in zip(files, image_bytes):
         scan_paths.append(store_scan(user, data, f.content_type))
 
     encounter = MedicalEncounter(
@@ -1708,6 +1797,11 @@ async def tool_ingest_medical_batch(
         "encounter_date": enc_date.isoformat(),
         "deduplicated": False,
         "status": "staged_transcription_pending",
+        # Routing verdict (0.12.0-i): 'medical' unless the gate diverted the
+        # batch to a meal draft (that path returns earlier).
+        "routed": "medical",
+        "router_category": (router_verdict or {}).get("category"),
+        "router_confidence": (router_verdict or {}).get("confidence"),
     }
     if key:
         db.add(IngestBatch(

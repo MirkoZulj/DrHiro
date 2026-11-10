@@ -544,6 +544,37 @@ member's data without an active consent grant.
     response. The MCP tool injects the inbound message id automatically —
     never invent or pass a telegram_message_id.
 
+## Photo routing gate (0.12.0-i) — food becomes a meal, never a medical record
+
+Every inbound Telegram photo batch is uploaded to `ingest_medical_batch` BEFORE
+your turn by the gateway/bridge. Since 0.12.0-i the API first CLASSIFIES the
+batch with a vision model and routes it:
+
+| Classifier category | What it is | Where it lands |
+|---|---|---|
+| `food_meal` | plates of food, prepared dishes, raw ingredients, groceries, **nutrition-facts panels on food products** | **ONE MEAL draft** (`status=needs_review`, `input_method=photo`) — `routed: "meal"`, `meal_id` |
+| `medication_label` | medication / supplement / vitamin / mineral / herbal **labels** (ingredient lists, dosages) | medical encounter + ONE record (`routed: "medical"`) — the label flow needs the record so components can be transcribed and nutrient-mapped |
+| `medical_document` | lab results, scans, prescriptions, doctor's letters, reports | medical encounter + ONE record (`routed: "medical"`) |
+| `other` / classifier failure / low confidence | anything ambiguous or unreachable | medical encounter + ONE record (`routed: "medical"`) — **fail-safe**, the medical guarantee never regresses |
+
+What this means for you:
+
+1. **Read `routed` in the stage payload / turn context.** If it is `"meal"`,
+   a MEAL draft already exists — the photos were food. Identify the food items
+   from the photos, add them to THAT draft (`update_meal_item` /
+   `get_pending_meal`), then verify and confirm with `confirm_meal`. **Never
+   create a medical record or encounter for a meal-routed batch.**
+2. **Never re-create a staged entity.** Whatever `routed` says, the batch was
+   already stored before your turn: enrich/complete THAT entity, do not create
+   a second one. A medical stage → `update_medical_record`; a meal stage →
+   `update_meal_item` + `confirm_meal`.
+3. **Medication and supplement labels stay medical records on purpose.** The
+   label flow (transcribe components → nutrient-map) depends on the record, so
+   those photos must still land in Medical Records.
+4. If the classifier is disabled (`DRHIRO_PHOTO_ROUTER_ENABLED=false`) or fails,
+   every batch keeps the medical path — treat a `routed: "medical"` stage with
+   no `router_category` as "no classifier verdict".
+
 ## Medical records — batch first: stage, transcribe, enrich, verify (non-negotiable)
 
 A medical photo batch is ALWAYS stored deterministically — storage never

@@ -216,10 +216,25 @@ function stageContextText() {
   if (!lastStage) {
     try {
       const j = JSON.parse(fs.readFileSync(BATCH_FILE, "utf8"));
-      if (j && j.record_id && Date.now() - (j.at || 0) < MEDIA_TTL_MS) lastStage = j;
+      if (j && Date.now() - (j.at || 0) < MEDIA_TTL_MS) {
+        // A routed meal draft has no encounter/record; only medical stages
+        // carry those ids. Accept either shape so a meal stage is picked up.
+        if (j.record_id || j.meal_id) lastStage = j;
+      }
     } catch (_) {}
   }
   if (!lastStage) return null;
+  if (lastStage.routed === "meal") {
+    return (
+      `[DRHIRO_MEAL_DRAFT] A MEAL draft was ALREADY created deterministically before this turn: ` +
+      `meal_id=${lastStage.meal_id} photo_count=${lastStage.photo_count || "?"} ` +
+      `(status: ${lastStage.status || "needs_review"}). The photos were classified as FOOD/MEAL, ` +
+      `so NO medical record or encounter exists and you must NOT create one. Identify the food items ` +
+      `from the photos, add them to THAT draft (update_meal_item / get_pending_meal), then VERIFY with ` +
+      `get_pending_meal and CONFIRM with confirm_meal. Never create a medical record for these photos, ` +
+      `and never fabricate a "Done" without the confirm_meal payload.`
+    );
+  }
   return (
     `[DRHIRO_MEDICAL_BATCH] A medical photo batch was ALREADY staged deterministically before this turn: ` +
     `encounter_id=${lastStage.encounter_id} record_id=${lastStage.record_id} photo_count=${lastStage.photo_count || "?"} ` +
