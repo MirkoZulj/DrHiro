@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { authClient } from '../lib/auth'
 import Sparkline from '../components/Sparkline'
 import IntakeAnalysis from './IntakeAnalysis'
+import Questionnarium from './Questionnarium'
 
 interface Finding {
   id: string
@@ -44,7 +45,7 @@ interface GenFile {
   size_bytes?: number | null
 }
 
-type Tab = 'analyse' | 'visit' | 'history' | 'intake' | 'data'
+type Tab = 'questionnarium' | 'analyse' | 'visit' | 'history' | 'intake' | 'data'
 
 const PRESETS = [
   { key: '30d', label: '30d' },
@@ -62,19 +63,25 @@ const PROVIDERS = ['gp', 'cardiology', 'endocrinology', 'gastroenterology', 'nep
 export default function Analytics() {
   const [tab, setTab] = useState<Tab>(() => {
     const t = new URLSearchParams(window.location.search).get('tab')
-    return t === 'intake' || t === 'visit' || t === 'history' || t === 'data' ? t : 'analyse'
+    return t === 'questionnarium' || t === 'analyse' || t === 'visit' || t === 'history' || t === 'intake' || t === 'data' ? t : 'questionnarium'
   })
 
   return (
     <div>
       <h2 style={{ margin: '8px 0' }}>Analytics</h2>
       <div className="form-actions" style={{ marginBottom: 12 }}>
-        {(['analyse', 'visit', 'history', 'intake', 'data'] as Tab[]).map((t) => (
+        {(['questionnarium', 'analyse', 'visit', 'history', 'intake', 'data'] as Tab[]).map((t) => (
           <button key={t} className={tab === t ? '' : 'secondary'} onClick={() => setTab(t)}>
-            {t === 'analyse' ? 'Analyse' : t === 'visit' ? 'Doctor visit' : t === 'history' ? 'History' : t === 'intake' ? 'Intake analysis' : 'Data & backup'}
+            {t === 'questionnarium' ? 'Questionnarium'
+              : t === 'analyse' ? 'Analyse'
+              : t === 'visit' ? 'Doctor visit'
+              : t === 'history' ? 'History'
+              : t === 'intake' ? 'Intake analysis'
+              : 'Data & backup'}
           </button>
         ))}
       </div>
+      {tab === 'questionnarium' && <Questionnarium />}
       {tab === 'analyse' && <AnalyseTab />}
       {tab === 'visit' && <VisitTab />}
       {tab === 'history' && <HistoryTab />}

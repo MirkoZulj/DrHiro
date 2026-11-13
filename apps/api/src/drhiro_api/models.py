@@ -829,3 +829,32 @@ class FoodMicroBackfill(Base, TimestampMixin):
     nutrients_found: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     error: Mapped[str | None] = mapped_column(Text)
+
+
+# ── Questionnarium (0.12.0): patient health Q&A grounded in the record ──────
+
+
+class QuestionnariumQuestion(Base, TimestampMixin):
+    """One asked question and the answer the model gave, for the owner only.
+
+    The record context is curated per request (see
+    services/questionnarium_context.py) and is summarised in ``context_json`` —
+    the full context text is NOT stored, only which sections were included and
+    its size. The question and answer are the tenant's own data and are never
+    served across users.
+    """
+
+    __tablename__ = "questionnarium_questions"
+    __table_args__ = (Index("ix_questionnarium_user_created", "user_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str | None] = mapped_column(Text)
+    model: Mapped[str] = mapped_column(String(16), nullable=False)  # default | ling
+    profile: Mapped[str | None] = mapped_column(String(64))
+    sources_json: Mapped[list] = mapped_column(JSON, default=list)
+    context_json: Mapped[dict | None] = mapped_column(JSON)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="ok", nullable=False)  # ok | failed
+    error: Mapped[str | None] = mapped_column(Text)
