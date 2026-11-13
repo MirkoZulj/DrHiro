@@ -101,7 +101,16 @@ def _encounter_out(
     return out
 
 
-def _record_out(r: MedicalRecord) -> dict:
+def _record_out(r: MedicalRecord, user: User | None = None) -> dict:
+    paths = r.source_image_paths_json or ([r.source_image_path] if r.source_image_path else [])
+    # scan_count/has_scans count only scans that actually resolve on disk
+    # (resolve_scan_file: owner dir + isfile). A record whose scan file was
+    # deleted/lost therefore reports 0/false and the UI shows no gallery,
+    # instead of a broken thumbnail/lightbox for a 404.
+    if user is not None:
+        scan_count = sum(1 for p in paths if resolve_scan_file(user, p) is not None)
+    else:
+        scan_count = len([p for p in paths if p])
     return {
         "id": str(r.id),
         "title": r.title,
@@ -110,7 +119,9 @@ def _record_out(r: MedicalRecord) -> dict:
         "recorded_at": r.recorded_at.isoformat() if r.recorded_at else None,
         "encounter_id": str(r.encounter_id) if r.encounter_id else None,
         "source_image_path": r.source_image_path,
-        "source_image_paths": r.source_image_paths_json or ([r.source_image_path] if r.source_image_path else []),
+        "source_image_paths": paths,
+        "scan_count": scan_count,
+        "has_scans": scan_count > 0,
         "created_at": r.created_at.isoformat() if r.created_at else None,
     }
 
@@ -124,7 +135,6 @@ def list_encounters(user: User = Depends(get_current_user), db: Session = Depend
         db.query(
             MedicalEncounter,
             func.count(MedicalRecord.id),
-            func.count(MedicalRecord.source_image_path),
         )
         .outerjoin(MedicalRecord, MedicalRecord.encounter_id == MedicalEncounter.id)
         .filter(MedicalEncounter.user_id == user.id)
@@ -132,7 +142,17 @@ def list_encounters(user: User = Depends(get_current_user), db: Session = Depend
         .order_by(MedicalEncounter.encounter_date.desc(), MedicalEncounter.created_at.desc())
         .all()
     )
-    encounters = [_encounter_out(e, int(cnt or 0), int(scnt or 0)) for e, cnt, scnt in rows]
+    # scan_count counts only scans that resolve on disk (resolve_scan_file).
+    rec_rows = (
+        db.query(MedicalRecord.encounter_id, MedicalRecord.source_image_paths_json, MedicalRecord.source_image_path)
+        .filter(MedicalRecord.user_id == user.id)
+        .all()
+    )
+    resolvable: dict = {}
+    for enc_id, paths_json, single in rec_rows:
+        paths = paths_json or ([single] if single else [])
+        resolvable[enc_id] = resolvable.get(enc_id, 0) + sum(1 for p in paths if resolve_scan_file(user, p) is not None)
+    encounters = [_encounter_out(e, int(cnt or 0), int(resolvable.get(e.id, 0))) for e, cnt in rows]
     return {"encounters": encounters, "count": len(encounters)}
 
 
@@ -153,10 +173,10 @@ def get_encounter(encounter_id: str, user: User = Depends(get_current_user), db:
         .order_by(MedicalRecord.recorded_at.desc(), MedicalRecord.created_at.desc())
         .all()
     )
-    scan_count = sum(1 for r in records if r.source_image_path)
+    scan_count = sum(1 for r in records for p in (r.source_image_paths_json or ([r.source_image_path] if r.source_image_path else [])) if resolve_scan_file(user, p) is not None)
     return {
         "encounter": _encounter_out(e, len(records), scan_count),
-        "records": [_record_out(r) for r in records],
+        "records": [_record_out(r, user) for r in records],
     }
 
 
@@ -206,8 +226,10 @@ def serve_scan(
     except ValueError:
         raise HTTPException(status_code=404, detail="Record not found")
     rec = db.query(MedicalRecord).filter(MedicalRecord.id == rid, MedicalRecord.user_id == user.id).first()
-    if not rec or not rec.source_image_path:
+    if not rec:
         raise HTTPException(status_code=404, detail="Record not found")
+    if not rec.source_image_path:
+        raise HTTPException(status_code=404, detail="Scan image missing")
     paths = rec.source_image_paths_json or [rec.source_image_path]
     if index is None:
         rel_path = rec.source_image_path
@@ -219,3 +241,45 @@ def serve_scan(
     if not abs_path:
         raise HTTPException(status_code=404, detail="Scan image missing")
     return FileResponse(abs_path)
+
+from pydantic import BaseModel
+
+class MedicalRecordPatch(BaseModel):
+    title: str | None = None
+    content: str | None = None
+
+class MedicalEncounterPatch(BaseModel):
+    title: str | None = None
+
+@router.patch("/medical/records/{record_id}")
+def patch_medical_record(record_id: str, req: MedicalRecordPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Edit a record's title/text (Card 8 fix: wrong auto-title e.g. 'Krvna kartica - zapis 2000').
+    Title is agent-supplied on create (no server auto-title); this lets owner correct it."""
+    try: rid = uuid_mod.UUID(record_id)
+    except ValueError: raise HTTPException(status_code=404, detail="Record not found")
+    rec = db.query(MedicalRecord).filter(MedicalRecord.id == rid, MedicalRecord.user_id == user.id).first()
+    if not rec: raise HTTPException(status_code=404, detail="Record not found")
+    if req.title is not None: rec.title = req.title.strip() or None
+    if req.content is not None:
+        if not req.content.strip(): raise HTTPException(status_code=400, detail="content must not be empty")
+        rec.content = req.content
+    # Card 8 propagation: Records.tsx renders the ENCOUNTER title as the card
+    # headline. Keep it in sync when this record is the encounter's only record.
+    if req.title is not None and rec.encounter_id is not None:
+        enc = db.query(MedicalEncounter).filter(MedicalEncounter.id == rec.encounter_id, MedicalEncounter.user_id == user.id).first()
+        if enc is not None:
+            count = db.query(MedicalRecord).filter(MedicalRecord.encounter_id == enc.id).count()
+            if count == 1 and enc.title != rec.title:
+                enc.title = rec.title
+    db.add(rec); db.commit(); db.refresh(rec)
+    return _record_out(rec, user)
+
+@router.patch("/medical/encounters/{encounter_id}")
+def patch_medical_encounter(encounter_id: str, req: MedicalEncounterPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try: eid = uuid_mod.UUID(encounter_id)
+    except ValueError: raise HTTPException(status_code=404, detail="Encounter not found")
+    e = db.query(MedicalEncounter).filter(MedicalEncounter.id == eid, MedicalEncounter.user_id == user.id).first()
+    if not e: raise HTTPException(status_code=404, detail="Encounter not found")
+    if req.title is not None: e.title = req.title.strip() or None
+    db.add(e); db.commit(); db.refresh(e)
+    return _encounter_out(e)

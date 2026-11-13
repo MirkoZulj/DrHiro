@@ -32,6 +32,7 @@ class FoodItem:
     # is a Branded food. Used by _persist_food to set is_generic correctly.
     data_type: str | None = None
     brand_owner: str | None = None
+    micros_per_100g: dict = field(default_factory=dict)  # canonical code -> amount per 100g
 
 
 @dataclass(frozen=True)

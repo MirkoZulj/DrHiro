@@ -12,6 +12,7 @@ it. Medical thresholds are versioned, jurisdiction-aware, and reviewed.
 | bp_elevated_repeated | 1 | global | info | >=3 elevated systolic readings -> trend flag for LLM explanation |
 | weight_extreme | 1 | global | info | Weight outside plausibility band -> confirm entry |
 | missing_is_not_zero | 1 | global | info | Enforced invariant: missing wearable data is never zero |
+| nasem_dri_reference | nasem-2024.1 | global | info | Micronutrient reference values are NASEM DRI (RDA/AI) by sex x age band, curated from NIH ODS fact sheets; EPA+DHA uses EFSA AI 250 mg. Missing sex/DOB uses assumed male 31-50 and is flagged. Changing a value requires bumping DRI_VERSION in packages/nutrition-core/src/drhiro_nutrition/dri.py |
 
 The canonical list lives in code: `packages/rule-engine/src/drhiro_rules/engine.py`.
 Run `python -c "import drhiro_rules.engine as e; print(e.rule_registry_snapshot())"`.

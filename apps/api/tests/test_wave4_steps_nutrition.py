@@ -38,13 +38,12 @@ def test_dedup_steps_point_inside_bucket_still_skipped():
     assert _dedup_steps(recs) == 300
 
 
-def test_update_medication_item_keeps_arbitrary_ingredient_keys(client, db):
-    """update_medication_item must accept arbitrary keys inside
-    ingredients_json entries (label facts), not strip them."""
+def test_update_medication_item_normalises_legacy_ingredient_keys(client, db):
+    """0.11.0 spec §2.1: legacy ingredient keys (component/per_1_softgel_mg)
+    are accepted on input and normalised into canonical shape on output.
+    Unknown extra keys are dropped, not preserved verbatim."""
     user = make_user(db, "omega@test.local")
     h = auth_headers(user)
-    r = client.post("/api/v1/tools/update_medication_item", headers=h, json={})
-    # item doesn't exist yet -> create via add first
     r = client.post("/api/v1/medications", headers=h, json={
         "kind": "supplement", "name": "Omega-3",
         "ingredients_json": [{"component": "Fish oil", "per_1_softgel_mg": 1200}],
@@ -56,7 +55,14 @@ def test_update_medication_item_keeps_arbitrary_ingredient_keys(client, db):
     r = client.patch(f"/api/v1/medications/{item_id}", headers=h,
                      json={"ingredients_json": ing})
     assert r.status_code == 200, r.text
-    assert r.json()["ingredients_json"] == ing
+    out = r.json()["ingredients_json"]
+    assert len(out) == 1
+    # Canonical companion shape (§2.1): legacy keys normalised, custom key gone.
+    assert out[0] == {
+        "name": "EPA", "nutrient_code": "epa_dha", "amount": 360, "unit": "mg",
+        "per": "unit", "serving_units": 1, "form": None,
+        "mapping": "suggested", "pct_dv": None,
+    }
 
 
 def test_nutrition_coverage_endpoint(client, db):
@@ -78,6 +84,8 @@ def test_nutrition_coverage_endpoint(client, db):
 
 
 def test_composition_endpoint_per_capsule_vs_rda(client, db):
+    """Canonical composition rows keyed by 'name' with per_unit/unit/ref;
+    legacy component/per_1_softgel_mg input is accepted, canonical output."""
     user = make_user(db, "capsule@test.local")
     h = auth_headers(user)
     r = client.post("/api/v1/medications", headers=h, json={
@@ -92,15 +100,32 @@ def test_composition_endpoint_per_capsule_vs_rda(client, db):
     item_id = r.json()["id"]
     r = client.get(f"/api/v1/medications/{item_id}/composition", headers=h)
     assert r.status_code == 200, r.text
-    rows = {row["component"]: row for row in r.json()["rows"]}
+    rows_list = r.json()["rows"]
+    assert "component" not in rows_list[0]  # canonical rows keyed by 'name'
+    rows = {row["name"]: row for row in rows_list}
     epa = rows["EPA"]
-    assert epa["nutrient_key"] == "omega3_epa_dha"
-    assert epa["per_capsule"] == 360 and epa["unit"] == "mg"
-    assert epa["rda"] == 250 and epa["pct_per_capsule"] == 144.0
-    assert epa["per_dose_total"] == 720  # dose_amount 2
+    assert epa["nutrient_code"] == "epa_dha"
+    assert epa["per_unit"] == 360 and epa["unit"] == "mg"
+    assert epa["ref"] == 250
     mg = rows["Magnesium (citrate)"]
-    assert mg["nutrient_key"] == "magnesium" and mg["rda"] == 420
-    assert rows["Mystery blend"]["nutrient_key"] is None  # unmapped, not dropped
+    assert mg["nutrient_code"] == "magnesium" and mg["ref"] == 420
+    assert mg["per_unit"] == 200 and mg["unit"] == "mg"
+    assert rows["Mystery blend"]["nutrient_code"] is None  # unmapped, not dropped
+    assert rows["Mystery blend"]["mapping"] == "none"
+    assert rows["Mystery blend"]["per_unit"] == 50
+    # Taken totals vs RDA: fixed taken_at so the day bucket is deterministic
+    # (no dependence on server tz / time of day).
+    r = client.post("/api/v1/medications/intake", headers=h,
+                    json={"taken_at": "2026-11-04T08:00:00+00:00",
+                          "entries": [{"item_id": item_id}]})
+    assert r.status_code == 200, r.text
+    r = client.get(f"/api/v1/medications/{item_id}/composition"
+                   f"?scope=period&start=2026-11-04&end=2026-11-04", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["taken"]["doses"] == 1
+    rows = {row["name"]: row for row in r.json()["rows"]}
+    assert rows["EPA"]["taken_total"] == 720  # 360 per unit * dose_amount 2
+    assert rows["EPA"]["pct_ref"] == 288.0    # 720 / 250 * 100
 
 
 def _omega3_item(db, user, name, ingredients, dose_amount=2):

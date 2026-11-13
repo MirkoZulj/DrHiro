@@ -10,7 +10,8 @@ from drhiro_api.config import get_settings
 from drhiro_api.routers import auth, auth_web, dashboard, datapoints, import_csv, ingest, me, meals, medical, openclaw_tools, privacy, reminders
 from drhiro_api.routers import analytics, medications, tools_analytics, tools_meds
 from drhiro_api.routers import files, health_card
-from drhiro_api.routers import backups, exports_v2, nutrition_coverage
+from drhiro_api.routers import backups, exports_v2, nutrition_coverage, intake, system_food_micros
+from drhiro_api.routers.questionnarium import router as questionnarium_router
 from drhiro_api.routers.xiaomi_csv import router as xiaomi_csv_router
 
 settings = get_settings()
@@ -62,5 +63,8 @@ app.include_router(health_card.router, prefix="/api/v1")
 app.include_router(files.router, prefix="/api/v1")
 app.include_router(exports_v2.router, prefix="/api/v1")
 app.include_router(nutrition_coverage.router, prefix="/api/v1")
+app.include_router(intake.router, prefix="/api/v1")
+app.include_router(system_food_micros.router, prefix="/api/v1")
 app.include_router(backups.router, prefix="/api/v1")
+app.include_router(questionnarium_router, prefix="/api/v1")
 app.include_router(me.router, prefix="/api/v1")

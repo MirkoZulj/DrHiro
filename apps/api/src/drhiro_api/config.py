@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DRHIRO_", env_file=".env", extra="ignore")
 
     app_name: str = "drHiro Core API"
-    version: str = "0.10.3"
+    version: str = "0.12.0-i"
     debug: bool = False
 
     database_url: str = "postgresql+psycopg://drhiro:drhiro@localhost:5432/drhiro"
@@ -42,6 +42,21 @@ class Settings(BaseSettings):
     llm_api_url: str = "http://100.119.202.68:8000/v1"
     llm_api_key: str = ""
     llm_model: str = "E:\Models\Qwen3.8-27B-UD-Q4_K_M.gguf"
+
+    # Questionnarium — patient health Q&A grounded in the record. The gateway
+    # is OpenAI-compatible chat; the lab switches the underlying model profile
+    # (default Qwen <-> Ling healthcare) and is a single shared slot, so a
+    # switch is global and can take minutes on a cold load.
+    questionnarium_gateway_url: str = "http://100.75.78.18:8500"
+    questionnarium_lab_url: str = "http://100.75.78.18:18001"
+    # DRHIRO_LAB_TOKEN wins over this; the lab's token file is the last resort.
+    questionnarium_lab_token: str = ""
+    questionnarium_lab_token_file: str = "/home/mirko/src/strata/lab/token"
+    questionnarium_default_model: str = "default"
+    questionnarium_request_timeout_s: float = 240.0
+    questionnarium_switch_timeout_s: float = 900.0
+    questionnarium_max_question_chars: int = 2000
+    questionnarium_max_history_turns: int = 10
 
     # Jev (TypeSafe System One) food-match verification.
     # Calibrated on this workload: correct matches score 0.88-0.99, wrong

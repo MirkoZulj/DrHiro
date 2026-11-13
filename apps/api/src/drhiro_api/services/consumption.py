@@ -588,6 +588,21 @@ def _usda_search(query: str, limit: int = 3) -> list[dict]:
                 "source": "usda",
                 "confidence": 0.85,
             }
+            try:
+                from drhiro_nutrition.micros import NUTRIENT_CATALOGUE, SUM_IDS, convert_value
+                _micros = {}
+                for _c in NUTRIENT_CATALOGUE:
+                    if _c.code in SUM_IDS:
+                        if any(nuts.get(i) is not None for i in _c.fdc_ids):
+                            _micros[_c.code] = convert_value(sum(nuts.get(i, 0) or 0 for i in _c.fdc_ids), _c.fdc_unit, _c.code)
+                    else:
+                        for _fid in _c.fdc_ids:
+                            if nuts.get(_fid) is not None:
+                                _micros[_c.code] = convert_value(nuts[_fid], _c.fdc_unit, _c.code)
+                                break
+                cand["micros_per_100g"] = _micros
+            except Exception:
+                pass
             check = validate_candidate_energy(cand)
             if check.corrected:
                 log.warning(
@@ -741,6 +756,12 @@ def resolve_item_nutrition(db: Session, item: ParsedItem) -> ParsedItem:
         factor,
     )
     return item
+
+
+def _attach_micro_food(db: Session, mi: MealItem) -> None:
+    """Delegate to food_micros.attach_micro_food (kept for existing call sites)."""
+    from drhiro_api.services.food_micros import attach_micro_food
+    attach_micro_food(db, mi)
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +1078,7 @@ def write_consumption(
         )
         db.add(mi)
         db.flush()
+        _attach_micro_food(db, mi)
 
         ci.meal_item_id = meal_item_id
         all_nutrient_dicts.append(item.nutrients_scaled)
@@ -1794,6 +1816,7 @@ def _write_new_liquid_consumption(
         )
         db.add(mi)
         db.flush()
+        _attach_micro_food(db, mi)
 
         ci.meal_item_id = mi.id
 

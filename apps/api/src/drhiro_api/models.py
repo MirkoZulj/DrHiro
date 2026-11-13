@@ -200,6 +200,9 @@ class MealItem(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     user_corrected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 0.12.0 Part B (B2): matched canonical food for micro computation
+    micro_food_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("foods.id", ondelete="SET NULL"), nullable=True)
+    micro_match_confidence: Mapped[float | None] = mapped_column(nullable=True)
 
     meal: Mapped[Meal] = relationship(back_populates="items")
 
@@ -614,6 +617,11 @@ class MedicationItem(Base, TimestampMixin):
     ingredients_json: Mapped[list | None] = mapped_column(JSON)
     dose_amount: Mapped[float | None] = mapped_column()
     dose_unit: Mapped[str | None] = mapped_column(String(16))
+    # 0.11.0-a: per-unit description (capsule|tablet|softgel|ml|g|scoop|drop|sachet|other)
+    unit_label: Mapped[str | None] = mapped_column(String(24))
+    # Owner-chosen abbreviation shown on weekly chips (e.g. Mg, MultiV).
+    # NULL = fall back to the computed 12-char short_name.
+    short_name: Mapped[str | None] = mapped_column(String(32))
     # {"type":"daily","times":["08:00"]} | {"type":"weekly","days":["mon","thu"],"times":["08:00"]}
     # | {"type":"interval","every_days":3,"times":["08:00"],"anchor":"2026-11-03"} | {"type":"prn"}
     # optional: "with_food": "with|before|after|any"
@@ -810,3 +818,43 @@ class AppSetting(Base):
     telegram_allowed_user_id: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+class FoodMicroBackfill(Base, TimestampMixin):
+    __tablename__ = "food_micro_backfill"
+    __table_args__ = (UniqueConstraint("food_id", name="uq_food_micro_backfill_food"),)
+    id: Mapped[uuid.UUID] = uuid_pk()
+    food_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("foods.id", ondelete="CASCADE"), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    nutrients_found: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+# ── Questionnarium (0.12.0): patient health Q&A grounded in the record ──────
+
+
+class QuestionnariumQuestion(Base, TimestampMixin):
+    """One asked question and the answer the model gave, for the owner only.
+
+    The record context is curated per request (see
+    services/questionnarium_context.py) and is summarised in ``context_json`` —
+    the full context text is NOT stored, only which sections were included and
+    its size. The question and answer are the tenant's own data and are never
+    served across users.
+    """
+
+    __tablename__ = "questionnarium_questions"
+    __table_args__ = (Index("ix_questionnarium_user_created", "user_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str | None] = mapped_column(Text)
+    model: Mapped[str] = mapped_column(String(16), nullable=False)  # default | ling
+    profile: Mapped[str | None] = mapped_column(String(64))
+    sources_json: Mapped[list] = mapped_column(JSON, default=list)
+    context_json: Mapped[dict | None] = mapped_column(JSON)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="ok", nullable=False)  # ok | failed
+    error: Mapped[str | None] = mapped_column(Text)

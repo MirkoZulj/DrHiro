@@ -170,3 +170,131 @@ def test_delete_bad_id(client, service_headers):
 def test_requires_service_auth(client):
     r = client.post("/api/v1/tools/list_medical_records", json={})
     assert r.status_code == 401
+
+
+# ----------------------------------------------------------------
+# Card 8 regression (Kim qa-title-bug.md): stale encounter title
+# must not shadow the corrected record title in the single-record case.
+# SYNTHETIC content only.
+# ----------------------------------------------------------------
+
+def test_update_single_record_propagates_title_to_encounter(client, service_headers):
+    """Stage with stale title A, enrich to B -> encounter headline == B."""
+    # stage encounter with stale title
+    r = client.post(
+        "/api/v1/tools/add_medical_encounter",
+        json={"title": "Krvna kartica - zapis 2000", "encounter_date": "2026-05-11"},
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    eid = r.json()["data"]["id"]
+    # stage single record under it with same stale title (ingest_batch pattern)
+    r = client.post(
+        "/api/v1/tools/add_medical_record",
+        json={"title": "Krvna kartica - zapis 2000", "content": "SYNTHETIC PLACEHOLDER", "encounter_id": eid},
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    rid = r.json()["data"]["id"]
+    # enrich record to real title (tool path)
+    r = client.post(
+        "/api/v1/tools/update_medical_record",
+        json={"record_id": rid, "title": "Eye exam", "content": "SYNTHETIC EYE EXAM\nVisual acuity: 1.0"},
+        headers=service_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["title"] == "Eye exam"
+    # encounter headline (what Records.tsx renders) must follow
+    r = client.post("/api/v1/tools/get_medical_encounter", json={"encounter_id": eid}, headers=service_headers)
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["encounter"]["title"] == "Eye exam", data["encounter"]
+    assert data["records"][0]["title"] == "Eye exam"
+
+
+# ----------------------------------------------------------------
+# Missing-scan graceful fallback (hotfix 2026-11-06): a record whose
+# scan file is gone from disk must report scan_count=0/has_scans=False
+# (no gallery), and serve_scan must distinguish 'Scan image missing'
+# from 'Record not found'. SYNTHETIC content only.
+# ----------------------------------------------------------------
+
+import os as _os
+
+from drhiro_api.models import MedicalEncounter
+from tests.conftest import auth_headers
+
+
+@pytest.fixture()
+def scans_dir(tmp_path, monkeypatch):
+    from drhiro_api import config
+    d = tmp_path / "medical_scans"
+    monkeypatch.setattr(config.get_settings(), "medical_scans_dir", str(d))
+    yield d
+
+
+@pytest.fixture()
+def jwt_client_user(client, db):
+    user = make_user(db, "Missing Scan Tester", None)
+    return user, auth_headers(user)
+
+
+def _encounter_with_record(db, user, rel_path, create_file, scans_dir):
+    enc = MedicalEncounter(user_id=user.id, encounter_date="2026-05-11", title="Eye exam")
+    db.add(enc)
+    db.flush()
+    rec = MedicalRecord(
+        user_id=user.id, encounter_id=enc.id, title="Eye exam",
+        content="SYNTHETIC EYE EXAM\nLine one\nLine two",
+        source_image_path=rel_path,
+        source_image_paths_json=[rel_path] if rel_path else None,
+    )
+    db.add(rec)
+    db.commit()
+    if create_file and rel_path:
+        abs_path = _os.path.join(str(scans_dir), rel_path)
+        _os.makedirs(_os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "wb") as fh:
+            fh.write(b"\xff\xd8\xff\xe0synthetic-scan-bytes")
+    return enc, rec
+
+
+def test_missing_scan_counts_zero_and_serves_friendly_404(client, db, jwt_client_user, scans_dir):
+    user, h = jwt_client_user
+    rel = f"scans/{user.id}/fb3cba1b-synthetic-missing.jpg"
+    enc, rec = _encounter_with_record(db, user, rel, create_file=False, scans_dir=scans_dir)
+
+    r = client.get("/api/v1/medical/encounters", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["encounters"][0]["scan_count"] == 0
+
+    r = client.get(f"/api/v1/medical/encounters/{enc.id}", headers=h)
+    body = r.json()
+    assert body["encounter"]["scan_count"] == 0
+    assert body["records"][0]["scan_count"] == 0
+    assert body["records"][0]["has_scans"] is False
+    assert body["records"][0]["source_image_path"] == rel  # path preserved, not fabricated
+
+    r = client.get(f"/api/v1/medical/scan/{rec.id}?index=0", headers=h)
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "Scan image missing"
+
+    r = client.get(f"/api/v1/medical/scan/{uuid.uuid4()}?index=0", headers=h)
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Record not found"
+
+
+def test_existing_scan_counts_and_serves(client, db, jwt_client_user, scans_dir):
+    user, h = jwt_client_user
+    rel = f"scans/{user.id}/synthetic-existing.jpg"
+    enc, rec = _encounter_with_record(db, user, rel, create_file=True, scans_dir=scans_dir)
+
+    r = client.get(f"/api/v1/medical/encounters/{enc.id}", headers=h)
+    body = r.json()
+    assert body["encounter"]["scan_count"] == 1
+    assert body["records"][0]["scan_count"] == 1
+    assert body["records"][0]["has_scans"] is True
+
+    r = client.get(f"/api/v1/medical/scan/{rec.id}?index=0", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.content.startswith(b"\xff\xd8\xff\xe0")
