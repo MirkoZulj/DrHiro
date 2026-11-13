@@ -55,6 +55,7 @@ export default function App() {
           <Route path="/" element={user ? <Home /> : <Navigate to="/login" />} />
           <Route path="/activities" element={user ? <Activities /> : <Navigate to="/login" />} />
           <Route path="/records" element={user ? <Records /> : <Navigate to="/login" />} />
+          <Route path="/records/:encounterId" element={user ? <Records /> : <Navigate to="/login" />} />
           <Route path="/medications" element={user ? <Medications /> : <Navigate to="/login" />} />
           <Route path="/questionnarium" element={user ? <Questionnarium /> : <Navigate to="/login" />} />
           <Route path="/nutrition-coverage" element={<Navigate to="/analytics?tab=intake" replace />} />
