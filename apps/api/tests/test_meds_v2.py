@@ -283,7 +283,7 @@ def test_migration_single_head_and_guarded():
             if down:
                 downs.add(down.group(1))
     heads = set(revisions) - downs
-    assert heads == {"e2f3a4b5c6d7"}, heads  # 0.12.0 Part B head (was a7b8c9d0e1f2)
+    assert heads == {"f3a4b5c6d7e8"}, heads  # 0.12.0 Questionnarium head (was e2f3a4b5c6d7)
     mig = (versions / "a7b8c9d0e1f2_meds_short_name.py").read_text(encoding="utf-8")
     assert "ADD COLUMN IF NOT EXISTS short_name" in mig
 
