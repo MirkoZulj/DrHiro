@@ -12,6 +12,7 @@ import ImportMifitness from './views/ImportMifitness'
 import Activities from './views/Activities'
 import Records from './views/Records'
 import Medications from './views/Medications'
+import Questionnarium from './views/Questionnarium'
 import Analytics from './views/Analytics'
 import HealthCard from './views/HealthCard'
 import TelegramLinkCallback from './views/TelegramLinkCallback'
@@ -22,6 +23,7 @@ const NAV = [
   { to: '/activities', label: 'Activities', icon: '🏃' },
   { to: '/records', label: 'Records', icon: '🩺' },
   { to: '/medications', label: 'Meds & Supplements', icon: '💊' },
+  { to: '/questionnarium', label: 'Ask', icon: '💬' },
   { to: '/analytics', label: 'Analytics', icon: '📈' },
   { to: '/meals', label: 'Meals', icon: '🍽️' },
   { to: '/reminders', label: 'Reminders', icon: '⏰' },
@@ -54,6 +56,7 @@ export default function App() {
           <Route path="/activities" element={user ? <Activities /> : <Navigate to="/login" />} />
           <Route path="/records" element={user ? <Records /> : <Navigate to="/login" />} />
           <Route path="/medications" element={user ? <Medications /> : <Navigate to="/login" />} />
+          <Route path="/questionnarium" element={user ? <Questionnarium /> : <Navigate to="/login" />} />
           <Route path="/nutrition-coverage" element={<Navigate to="/analytics?tab=intake" replace />} />
           <Route path="/analytics" element={user ? <Analytics /> : <Navigate to="/login" />} />
           <Route path="/health-card" element={user ? <HealthCard /> : <Navigate to="/login" />} />
