@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import os
 import uuid as uuid_mod
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -32,6 +32,7 @@ from drhiro_api.config import get_settings
 from drhiro_api.db import get_db
 from drhiro_api.deps import get_current_user
 from drhiro_api.models import MedicalEncounter, MedicalRecord, User
+from drhiro_api.services.day_boundary import local_calendar_date, resolve_tz
 
 router = APIRouter(tags=["medical"])
 
@@ -156,6 +157,141 @@ def list_encounters(user: User = Depends(get_current_user), db: Session = Depend
     return {"encounters": encounters, "count": len(encounters)}
 
 
+@router.get("/medical/timeline")
+def get_timeline(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    from_: str | None = Query(default=None, alias="from"),
+    to: str | None = Query(default=None),
+):
+    """Horizontal timeline derivation (Part A, 0.12.0-b).
+
+    One event per distinct date per encounter. Dates come from
+    ``encounter_date`` plus the local calendar date of each record's
+    ``recorded_at`` — EXCEPT records whose ``recorded_at`` is just the upload
+    timestamp (``recorded_at == created_at`` within 60s, i.e. no transcription
+    dating was ever applied), which are ignored so upload day doesn't leak in
+    as a phantom series point. Sort ascending by date; ``?from=&to=`` filter
+    inclusive on the event date.
+    """
+    tz = resolve_tz(user.timezone)
+    today = datetime.now(tz).date()
+
+    from_d = _parse_iso_date(from_) if from_ else None
+    to_d = _parse_iso_date(to) if to else None
+
+    encounters = (
+        db.query(MedicalEncounter)
+        .filter(MedicalEncounter.user_id == user.id)
+        .order_by(MedicalEncounter.encounter_date.asc())
+        .all()
+    )
+    records = (
+        db.query(MedicalRecord)
+        .filter(MedicalRecord.user_id == user.id)
+        .order_by(MedicalRecord.recorded_at.asc())
+        .all()
+    )
+    recs_by_enc: dict = {}
+    for r in records:
+        recs_by_enc.setdefault(r.encounter_id, []).append(r)
+
+    events: list[dict] = []
+    for enc in encounters:
+        recs = recs_by_enc.get(enc.id, [])
+        # distinct dates -> record ids (surgery-day dating already landed in
+        # recorded_at via 514008f-era tooling; upload-timestamp rows excluded).
+        by_date: dict = {}
+        # encounter_date is always a candidate.
+        by_date.setdefault(enc.encounter_date, [])
+        for r in recs:
+            if _is_upload_timestamp_only(r):
+                continue
+            d = local_calendar_date(r.recorded_at, tz)
+            by_date.setdefault(d, [])
+            by_date[d].append(str(r.id))
+        dates = sorted(by_date)
+        series_id = (
+            str(enc.id) if len(dates) > 1 else None
+        )
+        kind = _timeline_kind(enc, recs)
+        for d in dates:
+            if from_d and d < from_d:
+                continue
+            if to_d and d > to_d:
+                continue
+            events.append(
+                {
+                    "id": f"enc:{enc.id}:{d.isoformat()}",
+                    "encounter_id": str(enc.id),
+                    "date": d.isoformat(),
+                    "kind": kind,
+                    "title": enc.title or (recs[0].title if recs else None) or "Medical record",
+                    "facility": enc.facility,
+                    "record_ids": by_date[d],
+                    "series_id": series_id,
+                    "series_size": len(dates),
+                }
+            )
+    events.sort(key=lambda e: e["date"])
+    birth_date = user.date_of_birth
+    # A6 handled client-side: null birth_date -> earliest event -1y.
+    return {
+        "birth_date": birth_date,
+        "today": today.isoformat(),
+        "timezone": user.timezone,
+        "events": events,
+        "count": len(events),
+    }
+
+
+def _is_upload_timestamp_only(r: MedicalRecord) -> bool:
+    """True when recorded_at carries no transcription dating info: it equals
+    created_at within 60s (a fresh upload auto-dated to now, never backdated
+    by transcription, surgery-day rule, or explicit recorded_at)."""
+    if r.recorded_at is None or r.created_at is None:
+        return False
+    a = r.recorded_at if r.recorded_at.tzinfo else r.recorded_at.replace(tzinfo=timezone.utc)
+    b = r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)
+    return abs((a - b).total_seconds()) <= 60
+
+
+def _parse_iso_date(s: str):
+    try:
+        return date.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+# Clinical-kind derivation for timeline dots. ``source_type`` values in this
+# app are transport channels (telegram_photo / manual / ... — see Records.tsx
+# SOURCE_LABELS), NOT clinical kinds, so kind is inferred from encounter
+# title/facility/notes + record titles. Unknown -> "other".
+_KIND_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("surgery", ("operac", "kirur", "surgery", "surgical", "operation", "tonsillectom", "tonsilektom", "uppp", "osas", "aneste")),
+    ("imaging", ("ct ", "mri", "mr ", "xray", "x-ray", "rentgen", "ultrazvu", "ultrasound", "pet", "mamograf", "scan", "snim")),
+    ("hospital", ("hospital", "bolnic", "clinic", "klinik", "ward", "odjel", "emergency", "hitna", "inpatient", "stay", "boravak")),
+    ("lab", ("lab", "blood", "krv", "hemoglobin", "panel", "nalaz", "biochem", "hormone", "glucose", "kolesterol", "cholesterol", "urine", "mokrac")),
+    ("rx", ("prescription", "recept", "pharmac", "lek", "lijek", "medication", "terapij", "dose", "doz")),
+    ("visit", ("visit", "exam", "pregled", "consult", "checkup", "check-up", "appointment", "doctor", "liječnik", "doktor", "ordinac")),
+)
+
+
+def _timeline_kind(enc, recs) -> str:
+    from drhiro_api.routers.openclaw_tools import _is_surgery_encounter
+
+    if _is_surgery_encounter(enc):
+        return "surgery"
+    hay = " ".join(
+        str(x or "")
+        for x in [enc.title, enc.facility, enc.notes, *(r.title for r in recs)]
+    ).lower()
+    for kind, kws in _KIND_KEYWORDS:
+        if any(k in hay for k in kws):
+            return kind
+    return "other"
+
+
 @router.get("/medical/encounters/{encounter_id}")
 def get_encounter(encounter_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """One encounter plus its records (values/findings/conclusion live inside
@@ -250,6 +386,9 @@ class MedicalRecordPatch(BaseModel):
 
 class MedicalEncounterPatch(BaseModel):
     title: str | None = None
+    # Notes/text: the Records detail page edits both title and notes (main's
+    # encounter edit UI); without this the notes draft was silently dropped.
+    notes: str | None = None
 
 @router.patch("/medical/records/{record_id}")
 def patch_medical_record(record_id: str, req: MedicalRecordPatch, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -281,5 +420,6 @@ def patch_medical_encounter(encounter_id: str, req: MedicalEncounterPatch, user:
     e = db.query(MedicalEncounter).filter(MedicalEncounter.id == eid, MedicalEncounter.user_id == user.id).first()
     if not e: raise HTTPException(status_code=404, detail="Encounter not found")
     if req.title is not None: e.title = req.title.strip() or None
+    if req.notes is not None: e.notes = req.notes.strip() or None
     db.add(e); db.commit(); db.refresh(e)
     return _encounter_out(e)

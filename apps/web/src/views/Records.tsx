@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useNavigate, useLocation, useParams, Link } from 'react-router-dom'
 import { authClient, API_BASE } from '../lib/auth'
+import RecordsTimeline, { TimelineEvent } from '../components/RecordsTimeline'
 
 /**
- * Medical Records — timeline of encounters extracted from documents sent to
- * drHiro on Telegram. Per approved design spec
- * (drhiro-records-mockup/DESIGN.md): vertical timeline with year separators,
- * encounter cards, per-document popup, full-screen scan lightbox.
- * All data comes from the stored text the bot transcribed — rendered
- * faithfully, never re-parsed or re-structured (data honesty rule).
+ * Medical Records — horizontal timeline (Part A, 0.12.0-b).
+ * /records renders RecordsTimeline; /records/:encounterId#d-YYYY-MM-DD renders
+ * the full encounter detail (all records fully expanded incl scans, grouped by
+ * local recorded_at date). The old vertical year list was REMOVED (owner).
+ * All data is the bot's faithful transcription — never re-parsed.
  */
 
 interface EncounterSummary {
@@ -64,13 +65,6 @@ function dayParts(s: string) {
   }
 }
 
-/** First sentence of the notes, for the one-line card preview. */
-function firstSentence(s: string | null): string {
-  if (!s) return ''
-  const m = s.match(/^(.+?[.!?])(\s|$)/)
-  return (m ? m[1] : s).trim()
-}
-
 /** Lines that start a conclusion-style callout. */
 const CONCLUSION_RE = /^(conclusion|impression|diagnosis|zaključak|dijagnoza)\s*[:\-—]?\s*/i
 
@@ -95,161 +89,99 @@ export function splitContent(content: string): { paragraphs: string[]; conclusio
 }
 
 export default function Records() {
-  const [encounters, setEncounters] = useState<EncounterSummary[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const { encounterId } = useParams<{ encounterId?: string }>()
+  if (encounterId) return <EncounterDetailPage encounterId={encounterId} />
+  return <TimelinePage />
+}
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const res = await authClient.api('/medical/encounters')
-      const list = Array.isArray(res) ? res : (res?.encounters ?? [])
-      setEncounters(list)
-    } catch (e: any) {
-      setError(e?.message ?? String(e))
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+function TimelinePage() {
+  const navigate = useNavigate()
 
-  useEffect(() => { load() }, [load])
-
-  if (loading) return <div className="loading">Loading medical records…</div>
-  if (error) {
-    return (
-      <div className="records-view">
-        <h2>Medical Records</h2>
-        <p className="page-sub">Encounters extracted from documents you sent to drHiro.</p>
-        <div className="error">{error}</div>
-        <div style={{ textAlign: 'center', marginTop: 12 }}>
-          <button onClick={load}>Retry</button>
-        </div>
-      </div>
-    )
-  }
+  const openEvent = useCallback(
+    (ev: TimelineEvent) => {
+      // Future dates clamp at today with a note (A6): navigate with hash, the
+      // detail page resolves the nearest date and notes it.
+      navigate(`/records/${ev.encounter_id}#d-${ev.date}`)
+    },
+    [navigate],
+  )
 
   return (
     <div className="records-view">
       <h2>Medical Records</h2>
       <p className="page-sub">Encounters extracted from documents you sent to drHiro.</p>
-      {encounters.length === 0 ? (
-        <div className="empty">No medical records yet. Send a document photo to drHiro on Telegram.</div>
-      ) : (
-        <EncounterTimeline
-          encounters={encounters}
-          onUpdate={(updated) =>
-            setEncounters((prev) => prev.map((e) => (e.id === updated.id ? { ...e, ...updated } : e)))
-          }
-        />
-      )}
+      <RecordsTimeline
+        onOpen={openEvent}
+        restoreKey="records-timeline-scroll"
+      />
     </div>
   )
 }
-
-function EncounterTimeline({ encounters, onUpdate }: { encounters: EncounterSummary[]; onUpdate: (e: EncounterSummary) => void }) {
-  // Contract returns the full list; sort newest first and group by year.
-  const sorted = [...encounters].sort((a, b) =>
-    (b.encounter_date || '').localeCompare(a.encounter_date || '')
-  )
-
-  const groups: { year: string; items: EncounterSummary[] }[] = []
-  for (const enc of sorted) {
-    const d = parseDate(enc.encounter_date)
-    const year = d ? String(d.getFullYear()) : 'Unknown'
-    const last = groups[groups.length - 1]
-    if (last && last.year === year) last.items.push(enc)
-    else groups.push({ year, items: [enc] })
+function localDateOf(rec: RecordItem, fallback: string): string {
+  // Group by LOCAL recorded_at date; fall back to encounter_date.
+  if (rec.recorded_at) {
+    const d = parseDate(rec.recorded_at)
+    if (d) return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
   }
-
-  return (
-    <div className="records-timeline">
-      {groups.map((g) => (
-        <section key={g.year} className="records-year-group">
-          <div className="records-year-label">{g.year}</div>
-          <div className="records-year-items">
-            {g.items.map((enc) => (
-              <EncounterCard key={enc.id} encounter={enc} onUpdate={onUpdate} />
-            ))}
-          </div>
-        </section>
-      ))}
-    </div>
-  )
+  const d = parseDate(fallback)
+  return d ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : fallback
 }
 
-function EncounterCard({ encounter, onUpdate }: { encounter: EncounterSummary; onUpdate: (e: EncounterSummary) => void }) {
-  const [open, setOpen] = useState(false)
-  const [current, setCurrent] = useState(encounter)
-  useEffect(() => { setCurrent(encounter) }, [encounter])
-  const d = dayParts(current.encounter_date)
-  // Scan presence: the summary contract doesn't include it, so start from an
-  // optional `scan_count` the backend may add, and mark filled once the popup
-  // reveals a record with source_image_path (persists for the session).
-  const [hasScans, setHasScans] = useState(
-    Number((encounter as any).scan_count ?? 0) > 0
-  )
-  const scanCount = Number((encounter as any).scan_count ?? 0)
-
-  const subParts = [
-    current.facility,
-    `${current.record_count} document${current.record_count === 1 ? '' : 's'}`,
-  ]
-  if (hasScans) subParts.push(`${scanCount || ''} ${scanCount === 1 ? 'scan' : 'scans'}`.trim())
-
-  return (
-    <>
-      <button type="button" className={`records-card${hasScans ? ' has-scans' : ''}`} onClick={() => setOpen(true)}>
-        <div className="records-card-date">
-          <div className="records-card-day">{d.day}</div>
-          <div className="records-card-monyr">{d.mon} {d.year}</div>
-        </div>
-        <div className="records-card-main">
-          <div className="records-card-title">{current.title}</div>
-          <div className="records-card-sub">{subParts.filter(Boolean).join(' · ')}</div>
-          <div className="records-card-notes">{firstSentence(current.notes)}</div>
-        </div>
-        <span className="records-card-chevron" aria-hidden="true">›</span>
-      </button>
-      {open && (
-        <EncounterPopup
-          encounter={current}
-          onClose={() => setOpen(false)}
-          onScansSeen={() => setHasScans(true)}
-          onUpdated={(updated) => { setCurrent(updated); onUpdate(updated) }}
-        />
-      )}
-    </>
-  )
-}
-
-function EncounterPopup({ encounter, onClose, onScansSeen, onUpdated }: { encounter: EncounterSummary; onClose: () => void; onScansSeen: () => void; onUpdated: (e: EncounterSummary) => void }) {
+function EncounterDetailPage({ encounterId }: { encounterId: string }) {
+  const navigate = useNavigate()
+  const location = useLocation()
   const [detail, setDetail] = useState<EncounterDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const scrollRef = useRef<HTMLDivElement>(null)
+  const [note, setNote] = useState<string | null>(null)
+  const [highlight, setHighlight] = useState<string | null>(null)
+  // Encounter title/notes edit (main's Records feature, kept in the full-page
+  // detail): inline form in the header, PATCH /medical/encounters/{id}.
   const [editing, setEditing] = useState(false)
-  const [draftTitle, setDraftTitle] = useState(encounter.title ?? '')
-  const [draftNotes, setDraftNotes] = useState(encounter.notes ?? '')
+  const [draftTitle, setDraftTitle] = useState('')
+  const [draftNotes, setDraftNotes] = useState('')
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
-  const [headlineTitle, setHeadlineTitle] = useState(encounter.title)
+  const fetchedRef = useRef(0)
+  const load = useCallback(() => {
+    setError(null)
+    const id = ++fetchedRef.current
+    authClient
+      .api(`/medical/encounters/${encounterId}`)
+      .then((res) => {
+        if (id !== fetchedRef.current) return
+        const enc = res?.encounter ?? res ?? {}
+        setDetail({ ...enc, records: res?.records ?? enc.records ?? [] })
+      })
+      .catch((e) => {
+        if (id !== fetchedRef.current) return
+        // 404 when deleted while open -> toast + refetch affordance.
+        const msg = e?.message ?? String(e)
+        setError(/404|not found/i.test(msg) ? 'Encounter no longer exists (deleted).' : msg)
+      })
+  }, [encounterId])
+  useEffect(() => { load() }, [load])
+
+  function startEditing() {
+    setDraftTitle(detail?.title ?? '')
+    setDraftNotes(detail?.notes ?? '')
+    setSaveError(null)
+    setEditing(true)
+  }
 
   async function saveEncounter() {
+    if (!detail) return
     setSaving(true)
     setSaveError(null)
     try {
-      const res = await authClient.api(`/medical/encounters/${encounter.id}`, {
+      const res = await authClient.api(`/medical/encounters/${encounterId}`, {
         method: 'PATCH',
-        body: JSON.stringify({ title: draftTitle.trim() || encounter.title, notes: draftNotes || null }),
+        body: JSON.stringify({ title: draftTitle.trim() || detail.title, notes: draftNotes || null }),
       })
-      const updated: EncounterSummary = {
-        ...encounter,
-        title: res?.title ?? draftTitle,
-        notes: res?.notes ?? draftNotes,
-      }
-      setHeadlineTitle(updated.title)
-      setDetail((prev) => (prev ? { ...prev, title: updated.title, notes: updated.notes } : prev))
-      onUpdated(updated)
+      setDetail((prev) =>
+        prev
+          ? { ...prev, title: res?.title ?? draftTitle, notes: res?.notes ?? draftNotes }
+          : prev,
+      )
       setEditing(false)
     } catch (e: any) {
       // Surface the failure and KEEP the draft text — never silently lose it.
@@ -259,116 +191,137 @@ function EncounterPopup({ encounter, onClose, onScansSeen, onUpdated }: { encoun
     }
   }
 
-  function startEditing() {
-    setDraftTitle(detail?.title ?? encounter.title ?? '')
-    setDraftNotes(detail?.notes ?? encounter.notes ?? '')
-    setSaveError(null)
-    setEditing(true)
-  }
-
+  // Anchor #d-YYYY-MM-DD (?date= equivalent): scroll + highlight 2s.
   useEffect(() => {
-    let cancelled = false
-    authClient
-      .api(`/medical/encounters/${encounter.id}`)
-      .then((res) => {
-        if (cancelled) return
-        // API returns { encounter, records } — normalise (old code used res
-        // directly, so encounter notes never rendered).
-        const enc = res?.encounter ?? res ?? {}
-        setDetail({ ...enc, records: res?.records ?? enc.records ?? [] })
-      })
-      .catch((e) => { if (!cancelled) setError(e?.message ?? String(e)) })
-    return () => { cancelled = true }
-  }, [encounter.id])
-
-  // Close on Esc. The lightbox handles its own Esc when open (it unmounts
-  // on close and this listener is re-added), so this only fires while the
-  // popup itself is the topmost layer.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+    if (!detail) return
+    const hash = location.hash || ''
+    const m = hash.match(/^#d-(\d{4}-\d{2}-\d{2})/)
+    const dateId = m ? m[1] : null
+    if (!dateId) return
+    const groups = groupByDate(detail)
+    let target = dateId
+    let msg: string | null = null
+    if (!groups.some((g) => g.date === dateId)) {
+      // No exact date -> nearest + note.
+      if (groups.length === 0) return
+      const t = new Date(dateId + 'T00:00:00').getTime()
+      let best = groups[0]
+      let bestDiff = Infinity
+      for (const g of groups) {
+        const diff = Math.abs(new Date(g.date + 'T00:00:00').getTime() - t)
+        if (diff < bestDiff) { bestDiff = diff; best = g }
+      }
+      target = best.date
+      msg = `No records dated ${dateId} — showing nearest ${best.date}.`
     }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
+    setNote(msg)
+    requestAnimationFrame(() => {
+      const el = document.getElementById(`d-${target}`)
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        el.setAttribute('aria-current', 'true')
+        setHighlight(target)
+        setTimeout(() => { setHighlight(null); el.removeAttribute('aria-current') }, 2000)
+      }
+    })
+  }, [detail, location.hash])
 
-  const d = dayParts(encounter.encounter_date)
+  if (error) {
+    return (
+      <div className="records-view">
+        <h2>Medical Records</h2>
+        <div className="error" role="alert">{error}</div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button type="button" onClick={load}>Retry</button>
+          <Link className="btn" to="/records">← Back to timeline</Link>
+        </div>
+      </div>
+    )
+  }
+  if (!detail) return <div className="loading">Loading encounter…</div>
+
+  const d = dayParts(detail.encounter_date)
+  const groups = groupByDate(detail)
 
   return (
-    <div className="modal-overlay records-overlay" onClick={onClose}>
-      <div
-        className="modal-popup records-popup"
-        role="dialog"
-        aria-modal="true"
-        aria-label={headlineTitle}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="records-popup-header">
-          <div className="records-popup-date">
-            <div className="records-card-day">{d.day}</div>
-            <div className="records-card-monyr">{d.mon} {d.year}</div>
-          </div>
-          <div className="records-popup-headline">
-            {editing ? (
-              <div className="records-edit-form">
-                <label>
-                  Title
-                  <input value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} aria-label="Encounter title" />
-                </label>
-                <label>
-                  Notes (text)
-                  <textarea value={draftNotes} onChange={(e) => setDraftNotes(e.target.value)} rows={3} aria-label="Encounter notes" />
-                </label>
-              </div>
-            ) : (
-              <>
-                <div className="records-card-title">{headlineTitle}</div>
-                <div className="records-card-sub">
-                  {[encounter.facility, `${encounter.record_count} document${encounter.record_count === 1 ? '' : 's'}`]
-                    .filter(Boolean)
-                    .join(' · ')}
-                </div>
-              </>
-            )}
-          </div>
-          <button type="button" className="modal-close" onClick={onClose} aria-label="Close">✕</button>
+    <div className="records-view">
+      <div className="records-detail-header">
+        <Link className="rt-back" to="/records" onClick={() => navigate(-1)}>← Timeline</Link>
+        <div className="records-popup-date">
+          <div className="records-card-day">{d.day}</div>
+          <div className="records-card-monyr">{d.mon} {d.year}</div>
         </div>
-        {editing ? (
-          <div className="records-edit-actions">
-            <button type="button" onClick={saveEncounter} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
-            <button type="button" className="secondary" onClick={() => { setEditing(false); setSaveError(null) }}>Cancel</button>
-            {saveError && <span className="error records-edit-error" role="alert">Save failed: {saveError}</span>}
-          </div>
-        ) : (
-          <div className="records-edit-actions">
-            <button type="button" className="secondary" onClick={startEditing}>Edit title / text</button>
-          </div>
-        )}
-
-        <div className="records-popup-scroll" ref={scrollRef}>
-          {error && <div className="error">{error}</div>}
-          {!detail && !error && <div className="loading">Loading encounter…</div>}
-          {detail && (
+        <div className="records-popup-headline">
+          {editing ? (
+            <div className="records-edit-form">
+              <label>
+                Title
+                <input value={draftTitle} onChange={(e) => setDraftTitle(e.target.value)} aria-label="Encounter title" />
+              </label>
+              <label>
+                Notes (text)
+                <textarea value={draftNotes} onChange={(e) => setDraftNotes(e.target.value)} rows={3} aria-label="Encounter notes" />
+              </label>
+            </div>
+          ) : (
             <>
-              {detail.notes && <div className="records-encounter-notes">{detail.notes}</div>}
-              {(detail.records ?? []).length === 0 && (
-                <div className="empty">No documents stored for this encounter.</div>
-              )}
-              {(detail.records ?? []).map((rec, i) => (
-                <RecordSection key={rec.id} record={rec} index={i + 1} total={detail.records.length}
-                  onScanFound={(rec.has_scans != null ? Boolean(rec.has_scans) : scanPathsOf(rec).length > 0) ? onScansSeen : undefined}
-                  onUpdated={(updated) =>
-                    setDetail((prev) =>
-                      prev ? { ...prev, records: prev.records.map((r) => (r.id === updated.id ? updated : r)) } : prev,
-                    )
-                  } />
-              ))}
+              <div className="records-card-title">{detail.title}</div>
+              <div className="records-card-sub">
+                {[detail.facility, `${detail.record_count} document${detail.record_count === 1 ? '' : 's'}`]
+                  .filter(Boolean)
+                  .join(' · ')}
+              </div>
             </>
           )}
         </div>
+        <div className="records-edit-actions">
+          {editing ? (
+            <>
+              <button type="button" onClick={saveEncounter} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
+              <button type="button" className="secondary" onClick={() => { setEditing(false); setSaveError(null) }}>Cancel</button>
+              {saveError && <span className="error records-edit-error" role="alert">Save failed: {saveError}</span>}
+            </>
+          ) : (
+            <button type="button" className="secondary" onClick={startEditing}>Edit title / text</button>
+          )}
+        </div>
       </div>
+      {note && <p className="note" role="note">{note}</p>}
+      {detail.notes && <div className="records-encounter-notes">{detail.notes}</div>}
+      {groups.length === 0 && (
+        <div className="empty">No documents stored for this encounter.</div>
+      )}
+      {groups.map((g) => (
+        <section
+          key={g.date}
+          id={`d-${g.date}`}
+          className={highlight === g.date ? 'records-date-group highlighted' : 'records-date-group'}
+          aria-label={`Records dated ${g.date}`}
+        >
+          <h3 className="records-date-heading">{g.date}</h3>
+          {g.records.map((rec, i) => (
+            <RecordSection key={rec.id} record={rec} index={i + 1} total={g.records.length}
+              onUpdated={(updated) =>
+                setDetail((prev) =>
+                  prev ? { ...prev, records: prev.records.map((r) => (r.id === updated.id ? updated : r)) } : prev,
+                )
+              } />
+          ))}
+        </section>
+      ))}
     </div>
   )
+}
+
+function groupByDate(detail: EncounterDetail): { date: string; records: RecordItem[] }[] {
+  const map = new Map<string, RecordItem[]>()
+  for (const rec of detail.records ?? []) {
+    const date = localDateOf(rec, detail.encounter_date)
+    map.set(date, [...(map.get(date) ?? []), rec])
+  }
+  return [...map.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([date, records]) => ({ date, records }))
 }
 
 /** All scan paths for a record: every entry of source_image_paths, falling

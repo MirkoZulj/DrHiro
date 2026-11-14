@@ -2376,3 +2376,83 @@ button.link:hover { background: none; text-decoration: underline; }
 @media (max-width: 480px) {
   .intake-legend { font-size: 12px; gap: 4px 10px !important; padding: 6px 8px !important; }
 }
+
+/* --- Horizontal records timeline (Part A, 0.12.0-b) ---------------------- */
+:root {
+  --color-primary: var(--color-accent);
+  --kind-lab: #2b6cb0;
+  --kind-visit: #0d7c6b;
+  --kind-rx: #7c3aed;
+  --kind-imaging: #0369a1;
+  --kind-surgery: #b91c1c;
+  --kind-hospital: #d97706;
+  --kind-other: #6b7280;
+}
+.records-timeline-wrap { margin-top: var(--space-3); }
+.records-timeline-header { display: flex; gap: var(--space-3); align-items: center; flex-wrap: wrap; margin-bottom: var(--space-3); }
+.rt-zoom-group { display: inline-flex; border: 1px solid var(--color-border); border-radius: var(--radius-full); overflow: hidden; }
+/* v4: transparent bg + green text (was white-on-white: global `button`
+   sets color:#fff but .rt-zoom overrode only the background, leaving
+   unreadable white text). Hover/active: green fill + white text. */
+.rt-zoom { background: transparent; color: var(--color-accent-text); border: 0; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; min-height: 32px; }
+.rt-zoom:hover, .rt-zoom:focus-visible { background: var(--color-accent-strong); color: #fff; }
+.rt-zoom.active { background: var(--color-accent-strong); color: #fff; }
+.rt-zoom.active:hover, .rt-zoom.active:focus-visible { background: var(--color-accent-strong); color: #fff; }
+.rt-today { background: transparent; color: var(--color-accent-text); border: 1px solid var(--color-accent); border-radius: var(--radius-full); padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; min-height: 32px; }
+.rt-today:hover, .rt-today:focus-visible { background: var(--color-accent-strong); color: #fff; border-color: var(--color-accent-strong); }
+.rt-legend { display: flex; gap: var(--space-3); flex-wrap: wrap; list-style: none; margin: 0; padding: 0; font-size: 12px; color: var(--color-text-secondary); }
+.rt-legend li { display: inline-flex; align-items: center; gap: 4px; }
+.rt-legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.rt-hint { font-size: 13px; color: var(--color-text-muted); margin: 0 0 var(--space-2); }
+.records-timeline-scroller { overflow-x: auto; overflow-y: hidden; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); touch-action: pan-x pan-y; cursor: grab; scrollbar-width: thin; }
+.records-timeline-scroller.dragging { cursor: grabbing; }
+.records-timeline-scroller:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -1px; }
+.rt-chart { position: relative; }
+.rt-svg { display: block; }
+/* Thin axis (reference): 1px light baseline, year gridlines light, decade stronger */
+.rt-baseline { stroke: var(--color-border-strong); stroke-width: 1; }
+.rt-year-grid { stroke: var(--color-border); stroke-width: 1; opacity: .55; }
+.rt-year-grid.decade { stroke: var(--color-border-strong); stroke-width: 1; opacity: .9; }
+.rt-tick { stroke: var(--color-border-strong); stroke-width: 1; }
+.rt-tick.month { opacity: .5; }
+.rt-tick-label { font-size: 10px; fill: var(--color-text-muted); text-anchor: middle; }
+.rt-tick-label.year { font-size: 11px; fill: var(--color-text-secondary); }
+.rt-tick-label.year.decade { font-weight: 700; font-size: 12px; fill: var(--color-text); }
+.rt-tick-label.age { font-size: 9px; }
+.rt-tick-label.month { font-size: 9px; fill: var(--color-text-muted); }
+.rt-tick.quarter { opacity: .8; }
+.rt-marker { stroke: var(--color-accent); stroke-width: 1; stroke-dasharray: 3 3; }
+.rt-marker.today { stroke: var(--color-accent); }
+.rt-marker.born { stroke: var(--color-text-muted); }
+.rt-marker-label { font-size: 10px; font-weight: 700; fill: var(--color-accent-text); text-anchor: middle; }
+/* Dots r=4.5, 1px stems; selected = dark stem + circled dot */
+.rt-stem { stroke: var(--color-border-strong); stroke-width: 1; opacity: .7; }
+.rt-stem.highlighted { stroke: var(--color-primary); stroke-width: 1.5; opacity: 1; }
+.rt-stem.selected { stroke: var(--color-text); stroke-width: 1.5; opacity: 1; }
+/* v5 straight vertical leader: dot (x,dotY) straight up to the popup's
+   bottom edge (x, dotY - TOOLTIP_GAP_PX). x1 == x2 == dotX, no diagonal. */
+.rt-leader { stroke: var(--color-text); stroke-width: 1.5; opacity: 1; pointer-events: none; }
+.rt-dot { stroke: var(--color-surface); stroke-width: 1.5; pointer-events: none; }
+.rt-dot.selected { stroke: var(--color-text); stroke-width: 1.5; }
+.rt-dot-ring { fill: none; stroke: var(--color-text); stroke-width: 1.5; pointer-events: none; }
+/* Invisible r=12 hit area per dot (rendered above the visible dot, carries
+   all pointer/keyboard handlers) — first tap/click selects, second opens. */
+.rt-dot-hit { fill: transparent; stroke: none; cursor: pointer; pointer-events: all; }
+.rt-dot-hit:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+.rt-dot:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+.rt-dot.pre-birth { stroke: var(--color-danger); stroke-dasharray: 2 2; }
+.rt-dot.future { opacity: 0.6; }
+.rt-hull-bg { fill: color-mix(in srgb, var(--color-accent) 8%, transparent); }
+.rt-hull-bg.highlighted { fill: color-mix(in srgb, var(--color-primary) 16%, transparent); }
+.rt-bubble-label { font-size: 10px; font-weight: 700; fill: var(--color-text); text-anchor: middle; }
+/* Selected-event title card floating above the timeline (reference Highlight) */
+.rt-card { position: absolute; top: 2px; width: 228px; max-width: 228px; padding: 6px 10px 7px; background: var(--color-surface); border: 1px solid var(--color-border-strong); border-radius: var(--radius-sm); box-shadow: var(--shadow-md); font-size: 12px; line-height: 1.35; pointer-events: none; z-index: 3; }
+.rt-card::after { content: ''; position: absolute; left: 50%; bottom: -5px; width: 8px; height: 8px; margin-left: -4px; background: var(--color-surface); border-right: 1px solid var(--color-border-strong); border-bottom: 1px solid var(--color-border-strong); transform: rotate(45deg); }
+.rt-card-date { font-weight: 700; color: var(--color-text); }
+.rt-card-title { font-weight: 600; color: var(--color-text); overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.rt-card-sub { color: var(--color-text-secondary); font-size: 11px; }
+.records-detail-header { display: flex; align-items: flex-start; gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-3); }
+.rt-back { text-decoration: none; color: var(--color-accent-text); font-weight: 600; font-size: 14px; align-self: center; }
+.records-date-group { margin-bottom: var(--space-5); }
+.records-date-group.highlighted { background: color-mix(in srgb, var(--color-primary) 8%, transparent); border-radius: var(--radius-md); padding: var(--space-2); transition: background 0.3s; }
+.records-date-heading { font-size: 15px; font-weight: 700; margin-bottom: var(--space-2); }
