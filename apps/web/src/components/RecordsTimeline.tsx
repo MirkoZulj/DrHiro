@@ -426,34 +426,69 @@ export default function RecordsTimeline({ onOpen, restoreKey }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [zoom])
 
-  // Wheel / pinch zoom.
-  const clampZoom = useCallback((next: number) => {
-    // block going below 1y span
-    if (next > vw) return // would mean span < 1y at current vw? pxPerDay cap handles it
-  }, [vw, spanDays])
+  // Drag-to-pan (mouse / pen). Touch keeps native pan via touch-action.
+  const dragRef = useRef<{ pointerId: number; startX: number; startLeft: number } | null>(null)
+  const [dragging, setDragging] = useState(false)
 
-  const onWheel = useCallback((e: React.WheelEvent) => {
-    if (!e.ctrlKey && !e.metaKey) return
-    e.preventDefault()
-    const scroller = scrollerRef.current
-    if (!scroller) return
-    const rect = scroller.getBoundingClientRect()
-    const cx = e.clientX - rect.left + scroller.scrollLeft
-    const factor = e.deltaY < 0 ? 1.1 : 0.9
-    const contentW = scroller.scrollWidth
-    const nextW = contentW * factor
-    if (nextW < vw) return // block <1y span
-    // scale inner svg via transform on a wrapper
-    const wrap = scroller.firstElementChild as HTMLElement | null
-    if (!wrap) return
-    const prevScale = Number(wrap.dataset.scale ?? '1')
-    const nextScale = prevScale * factor
-    wrap.style.transform = `scaleX(${nextScale})`
-    wrap.style.transformOrigin = '0 0'
-    wrap.dataset.scale = String(nextScale)
-    scroller.scrollLeft = cx * factor
-    clampZoom(nextScale)
-  }, [vw, clampZoom])
+  const onPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const el = scrollerRef.current
+    if (!el || e.pointerType === 'touch') return
+    if ((e.target as HTMLElement).closest('button, a')) return
+    dragRef.current = { pointerId: e.pointerId, startX: e.clientX, startLeft: el.scrollLeft }
+    setDragging(true)
+    try { el.setPointerCapture?.(e.pointerId) } catch { /* ignore non-active pointer ids */ }
+  }, [])
+
+  const onPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const el = scrollerRef.current
+    const d = dragRef.current
+    if (!el || !d || d.pointerId !== e.pointerId) return
+    el.scrollLeft = d.startLeft - (e.clientX - d.startX)
+  }, [])
+
+  const endDrag = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current?.pointerId === e.pointerId) dragRef.current = null
+    setDragging(false)
+  }, [])
+
+  const onKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    const el = scrollerRef.current
+    if (!el) return
+    const step = Math.max(80, el.clientWidth / 3)
+    if (e.key === 'ArrowLeft') { el.scrollLeft -= step; e.preventDefault() }
+    else if (e.key === 'ArrowRight') { el.scrollLeft += step; e.preventDefault() }
+  }, [])
+
+  // Wheel: Ctrl/Cmd = pinch zoom (existing); otherwise scroll the strip
+  // horizontally (vertical wheel included) so a plain mouse can pan it.
+  useEffect(() => {
+    const el = scrollerRef.current
+    if (!el) return
+    const onWheelNative = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault()
+        const rect = el.getBoundingClientRect()
+        const cx = e.clientX - rect.left + el.scrollLeft
+        const factor = e.deltaY < 0 ? 1.1 : 0.9
+        const nextW = el.scrollWidth * factor
+        if (nextW < vw) return // block <1y span
+        const wrap = el.firstElementChild as HTMLElement | null
+        if (!wrap) return
+        const prevScale = Number(wrap.dataset.scale ?? '1')
+        const nextScale = prevScale * factor
+        wrap.style.transform = `scaleX(${nextScale})`
+        wrap.style.transformOrigin = '0 0'
+        wrap.dataset.scale = String(nextScale)
+        el.scrollLeft = cx * factor
+        return
+      }
+      e.preventDefault()
+      const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY
+      el.scrollLeft += delta
+    }
+    el.addEventListener('wheel', onWheelNative, { passive: false })
+    return () => el.removeEventListener('wheel', onWheelNative)
+  }, [payload, vw])
 
   // Collision lanes, kept only as the bubble-grouping key (v3: dot heights
   // no longer come from lanes). Series dots are spread (seriesDisplayX) so
@@ -561,9 +596,14 @@ export default function RecordsTimeline({ onOpen, restoreKey }: Props) {
       )}
 
       <div
-        className="records-timeline-scroller"
+        className={dragging ? 'records-timeline-scroller dragging' : 'records-timeline-scroller'}
         ref={scrollerRef}
-        onWheel={onWheel}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onKeyDown={onKeyDown}
+        tabIndex={0}
         aria-label="Medical records timeline"
       >
         <div className="rt-chart" style={{ width: chartW, height: chartH }}>
